@@ -179,6 +179,17 @@
       "catalystConfidence": "NONE",
       "publishedAt": "2026-08-22T13:11:41.797Z",
       "dryRun": true
+    },
+    {
+      "id": null,
+      "title": "VanEck’s Bitcoin ChainCheck – A New Lens for Traders",
+      "topic": "bitcoin",
+      "text": "🚀 Yesterday’s drop in crypto buzz wasn’t about a price swing – it was about a new tool. VanEck just released the Mid‑August 2026 Bitcoin ChainCheck, a deep dive into on‑chain data that could help traders spot early shifts in the market. The report pulls thousands of transactions, wallet activity, and gas fee trends to paint a picture of where Bitcoin’s supply is flowing. Think of it as a radar for the blockchain.\n\nWhy does this matter? In an era where price alone can be misleading, having a clearer view of on‑chain behavior can offer a competitive edge. Whether you’re a day trader or a long‑term holder, understanding wallet concentration, large‑scale movements, and fee spikes can give you context beyond candles and order books.\n\nCurious how these insights might translate into your own strategy? Are on‑chain analytics already a part of your toolkit? Drop your thoughts and let’s discuss!\n\n#Bitcoin #ChainAnalytics #VanEck #CryptoInsights #BinanceSquare\n\nNot financial advice.",
+      "qualityScore": 8,
+      "newsUsed": true,
+      "catalystConfidence": "MEDIUM",
+      "publishedAt": "2026-08-22T13:22:54.648Z",
+      "dryRun": true
     }
   ]
 }
