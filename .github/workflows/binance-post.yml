@@ -2,7 +2,7 @@ name: Binance Square Post Scheduler
 
 on:
   schedule:
-    - cron: "0,40 * * * *"
+    - cron: "0 */2 * * *"
 
   workflow_dispatch:
 
