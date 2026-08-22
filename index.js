@@ -900,24 +900,42 @@ function normalizeGeneratedPost(post) {
 /* =======================================================
    HASHTAGS
 ======================================================= */
-
 function ensureHashtags(content, topic = "crypto") {
+  const MAX_HASHTAGS = 4;
+
   let text = String(content || "").trim();
 
-  const existing = text.match(/#[a-zA-Z0-9_]+/g) || [];
+  /*
+  Extract all hashtags.
+  */
+  const hashtags = text.match(/#[a-zA-Z0-9_]+/g) || [];
 
-  const existingSet = new Set(existing.map((tag) => tag.toLowerCase()));
+  /*
+  Remove ALL hashtags from the original content.
+  We will add back exactly 4.
+  This prevents Binance API error 220094.
+  */
+  text = text
+    .replace(/#[a-zA-Z0-9_]+/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
-  const tagMap = {
+  const defaultTags = {
     bitcoin: ["#Bitcoin", "#BTC", "#Crypto", "#Binance"],
+
+    btc: ["#Bitcoin", "#BTC", "#Crypto", "#Binance"],
 
     ethereum: ["#Ethereum", "#ETH", "#Crypto", "#Binance"],
 
+    eth: ["#Ethereum", "#ETH", "#Crypto", "#Binance"],
+
     bnb: ["#BNB", "#Binance", "#Crypto", "#BSC"],
 
-    solana: ["#Solana", "#SOL", "#Crypto", "#Blockchain"],
+    solana: ["#Solana", "#SOL", "#Crypto", "#Binance"],
 
-    xrp: ["#XRP", "#Ripple", "#Crypto", "#Payments"],
+    sol: ["#Solana", "#SOL", "#Crypto", "#Binance"],
+
+    xrp: ["#XRP", "#Ripple", "#Crypto", "#Binance"],
 
     market: ["#Crypto", "#Market", "#Trading", "#Binance"],
 
@@ -928,76 +946,58 @@ function ensureHashtags(content, topic = "crypto") {
     .toLowerCase()
     .trim();
 
-  const preferred = tagMap[normalizedTopic] || tagMap.crypto;
+  const selectedTags = defaultTags[normalizedTopic] || defaultTags.crypto;
 
-  const tagsToAdd = [];
+  /*
+  Start with the topic-specific hashtags.
+  */
+  const finalTags = [];
 
-  for (const tag of preferred) {
-    if (existingSet.has(tag.toLowerCase())) {
-      continue;
-    }
-
-    if (tagsToAdd.some((x) => x.toLowerCase() === tag.toLowerCase())) {
-      continue;
-    }
-
-    tagsToAdd.push(tag);
-
-    if (existing.length + tagsToAdd.length >= 4) {
+  for (const tag of selectedTags) {
+    if (finalTags.length >= MAX_HASHTAGS) {
       break;
     }
-  }
 
-  if (existing.length + tagsToAdd.length < 4) {
-    const fallback = [
-      "#Crypto",
-      "#Binance",
-      "#MarketUpdate",
-      "#Trading",
-      "#Blockchain",
-    ];
-
-    for (const tag of fallback) {
-      if (existing.length + tagsToAdd.length >= 4) {
-        break;
-      }
-
-      if (existingSet.has(tag.toLowerCase())) {
-        continue;
-      }
-
-      if (tagsToAdd.some((x) => x.toLowerCase() === tag.toLowerCase())) {
-        continue;
-      }
-
-      tagsToAdd.push(tag);
+    if (
+      !finalTags.some(
+        (existing) => existing.toLowerCase() === tag.toLowerCase(),
+      )
+    ) {
+      finalTags.push(tag);
     }
-  }
-
-  if (tagsToAdd.length === 0) {
-    return text;
   }
 
   /*
-  Insert hashtags before the
-  final disclaimer.
+  If somehow fewer than 4 exist,
+  use safe fallback tags.
   */
+  const fallbackTags = ["#Crypto", "#Binance", "#MarketUpdate", "#Blockchain"];
 
-  const disclaimer = "Not financial advice.";
+  for (const tag of fallbackTags) {
+    if (finalTags.length >= MAX_HASHTAGS) {
+      break;
+    }
 
-  const disclaimerIndex = text.lastIndexOf(disclaimer);
-
-  const hashtagsText = tagsToAdd.join(" ");
-
-  if (disclaimerIndex >= 0) {
-    const before = text.slice(0, disclaimerIndex).trimEnd();
-
-    const after = text.slice(disclaimerIndex).trimStart();
-
-    return `${before}\n\n` + `${hashtagsText}\n\n` + `${after}`;
+    if (
+      !finalTags.some(
+        (existing) => existing.toLowerCase() === tag.toLowerCase(),
+      )
+    ) {
+      finalTags.push(tag);
+    }
   }
 
-  return `${text}\n\n` + `${hashtagsText}\n\n` + `${disclaimer}`;
+  /*
+  Put hashtags at the very end.
+
+  Also make sure "Not financial advice."
+  remains the final line.
+  */
+  const disclaimer = "Not financial advice.";
+
+  text = text.replace(/Not financial advice\.\s*$/i, "").trim();
+
+  return `${text}\n\n${finalTags.join(" ")}\n\n${disclaimer}`;
 }
 
 /* =======================================================
