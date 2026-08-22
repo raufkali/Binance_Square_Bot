@@ -4,19 +4,17 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import http from "http"; // For Render health checks
+import http from "http";
 
 dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V2.8.1 – Render‑Ready
+BINANCE SQUARE AI BOT V2.8.2 – Multi‑Endpoint Fix
 =========================================================
-- Random question each cycle (240+ variations)
-- Automatically ensures at least 4 hashtags
-- No rejections – always posts
-- High temperature (0.85) for diversity
-- Built‑in HTTP server for Render health checks
+- Retry Binance API across api.binance.com, api1, api2, api3
+- Added User-Agent header to avoid 451
+- All previous features: random questions, 4+ hashtags, no rejections
 =========================================================
 */
 
@@ -52,8 +50,16 @@ const GENERATION_MAX_TOKENS = 1300;
 const FALLBACK_MAX_TOKENS = 1000;
 const HARD_PROMPT_CHARS = 16000;
 
+// Binance API endpoints to try
+const BINANCE_BASE_URLS = [
+  "https://api.binance.com",
+  "https://api1.binance.com",
+  "https://api2.binance.com",
+  "https://api3.binance.com",
+];
+
 /* =======================================================
-   COINS
+   COINS (unchanged)
 ======================================================= */
 
 const COINS = [
@@ -65,7 +71,7 @@ const COINS = [
 ];
 
 /* =======================================================
-   QUESTION GENERATOR – Thousands of variations
+   QUESTION GENERATOR (unchanged)
 ======================================================= */
 
 const subjects = [
@@ -125,7 +131,7 @@ function generateQuestions() {
   return qs;
 }
 
-const QUESTION_POOL = generateQuestions(); // ~240+
+const QUESTION_POOL = generateQuestions();
 
 /* =======================================================
    VALIDATION
@@ -186,7 +192,7 @@ function resetDailyCounter() {
 }
 
 /* =======================================================
-   HTTP & BINANCE API (unchanged)
+   HTTP & BINANCE API – Multi‑endpoint with retry
 ======================================================= */
 
 async function fetchWithTimeout(
@@ -204,38 +210,58 @@ async function fetchWithTimeout(
 }
 
 async function get24hData(symbol) {
-  const url = `https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`;
-  const response = await fetchWithTimeout(url);
-  if (!response.ok) throw new Error(`Binance 24h API ${response.status}`);
-  const data = await response.json();
-  return {
-    symbol: data.symbol,
-    price: Number(data.lastPrice),
-    open: Number(data.openPrice),
-    high: Number(data.highPrice),
-    low: Number(data.lowPrice),
-    change: Number(data.priceChange),
-    changePercent: Number(data.priceChangePercent),
-    volume: Number(data.volume),
-    quoteVolume: Number(data.quoteVolume),
-    trades: Number(data.count),
-  };
+  for (const base of BINANCE_BASE_URLS) {
+    const url = `${base}/api/v3/ticker/24hr?symbol=${symbol}`;
+    try {
+      const response = await fetchWithTimeout(url, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (response.ok) {
+        const data = await response.json();
+        return {
+          symbol: data.symbol,
+          price: Number(data.lastPrice),
+          open: Number(data.openPrice),
+          high: Number(data.highPrice),
+          low: Number(data.lowPrice),
+          change: Number(data.priceChange),
+          changePercent: Number(data.priceChangePercent),
+          volume: Number(data.volume),
+          quoteVolume: Number(data.quoteVolume),
+          trades: Number(data.count),
+        };
+      }
+    } catch (e) {
+      console.warn(`   ⚠️ 24h endpoint ${base} failed: ${e.message}`);
+    }
+  }
+  throw new Error(`Binance 24h API all endpoints failed for ${symbol}`);
 }
 
 async function getKlines(symbol, interval, limit = 50) {
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const response = await fetchWithTimeout(url);
-  if (!response.ok) throw new Error(`Binance klines ${response.status}`);
-  const raw = await response.json();
-  return raw.map((candle) => ({
-    openTime: Number(candle[0]),
-    open: Number(candle[1]),
-    high: Number(candle[2]),
-    low: Number(candle[3]),
-    close: Number(candle[4]),
-    volume: Number(candle[5]),
-    closeTime: Number(candle[6]),
-  }));
+  for (const base of BINANCE_BASE_URLS) {
+    const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    try {
+      const response = await fetchWithTimeout(url, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+      });
+      if (response.ok) {
+        const raw = await response.json();
+        return raw.map((candle) => ({
+          openTime: Number(candle[0]),
+          open: Number(candle[1]),
+          high: Number(candle[2]),
+          low: Number(candle[3]),
+          close: Number(candle[4]),
+          volume: Number(candle[5]),
+          closeTime: Number(candle[6]),
+        }));
+      }
+    } catch (e) {
+      console.warn(`   ⚠️ Klines endpoint ${base} failed: ${e.message}`);
+    }
+  }
+  throw new Error(`Binance klines all endpoints failed for ${symbol}`);
 }
 
 /* =======================================================
@@ -395,7 +421,7 @@ function getRecentPostMemory() {
 }
 
 /* =======================================================
-   LENIENT JSON PARSING
+   LENIENT JSON PARSING (unchanged)
 ======================================================= */
 
 function extractJSON(raw) {
@@ -412,7 +438,7 @@ function extractJSON(raw) {
 }
 
 /* =======================================================
-   GROQ GENERATION – with random question
+   GROQ GENERATION (unchanged)
 ======================================================= */
 
 async function callGeneration(prompt, maxTokens, retries = 2) {
@@ -458,7 +484,7 @@ async function callGeneration(prompt, maxTokens, retries = 2) {
 }
 
 /* =======================================================
-   HASHTAG ENFORCEMENT – ensures at least 4 hashtags
+   HASHTAG ENFORCEMENT (unchanged)
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto") {
@@ -466,7 +492,6 @@ function ensureHashtags(content, topic = "crypto") {
   const missing = 4 - hashtags.length;
   if (missing <= 0) return content;
 
-  // Default hashtag pool based on topic
   const defaultTags = {
     btc: ["#Bitcoin", "#BTC", "#Crypto", "#Trading"],
     eth: ["#Ethereum", "#ETH", "#Crypto", "#Altcoins"],
@@ -477,44 +502,37 @@ function ensureHashtags(content, topic = "crypto") {
   };
   const tags = defaultTags[topic.toLowerCase()] || defaultTags.market;
 
-  // Add up to 'missing' tags that aren't already present
   const existing = new Set(hashtags.map((t) => t.toLowerCase()));
   const toAdd = tags
     .filter((t) => !existing.has(t.toLowerCase()))
     .slice(0, missing);
 
   if (toAdd.length === 0) {
-    // Fallback generic tags
     const fallback = ["#Crypto", "#Trading", "#MarketUpdate", "#Binance"];
     const addFallback = fallback
       .filter((t) => !existing.has(t.toLowerCase()))
       .slice(0, missing);
     toAdd.push(...addFallback);
   }
-
-  // If still missing, add generic ones
   while (toAdd.length < missing) {
     toAdd.push("#CryptoUpdate");
   }
 
-  // Append to content (before the final disclaimer if any)
   const lines = content.split("\n");
-  // Find the last line that contains "Not financial advice" or the end
   let insertIndex = lines.length;
   for (let i = lines.length - 1; i >= 0; i--) {
     if (lines[i].toLowerCase().includes("not financial advice")) {
-      insertIndex = i; // insert before disclaimer
+      insertIndex = i;
       break;
     }
   }
-  // Insert the missing hashtags as a line
   const hashtagLine = toAdd.join(" ");
   lines.splice(insertIndex, 0, hashtagLine);
   return lines.join("\n");
 }
 
 /* =======================================================
-   GENERATE POST – with random question
+   GENERATE POST (unchanged)
 ======================================================= */
 
 async function generatePost(markets, newsResearch) {
@@ -565,7 +583,6 @@ Return JSON:
 
   try {
     let post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
-    // Enforce hashtags
     post.content = ensureHashtags(post.content, post.topic);
     return post;
   } catch (error) {
@@ -577,7 +594,7 @@ Return JSON:
 }
 
 /* =======================================================
-   FALLBACK – Answers the question with template
+   FALLBACK (unchanged)
 ======================================================= */
 
 function buildFallbackPost(markets, question) {
@@ -637,7 +654,7 @@ Not financial advice.
 }
 
 /* =======================================================
-   VALIDATION – Safety only (no rejections)
+   VALIDATION (unchanged)
 ======================================================= */
 
 function validatePost(post, markets) {
@@ -665,17 +682,15 @@ function validatePost(post, markets) {
     if (lower.includes(phrase)) reasons.push(`forbidden phrase: ${phrase}`);
   }
 
-  // Hashtags – we've already enforced, but count for info
   const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
   if (hashtags.length < 4)
     reasons.push(`hashtags count: ${hashtags.length} (expected 4+)`);
 
-  // We NEVER reject – only warn
   return { valid: true, reasons };
 }
 
 /* =======================================================
-   DUPLICATE – Disabled (we always post)
+   DUPLICATE – Disabled (unchanged)
 ======================================================= */
 
 function isDuplicate(content) {
@@ -763,14 +778,14 @@ async function savePost(post, result) {
 }
 
 /* =======================================================
-   MAIN CYCLE
+   MAIN CYCLE (unchanged)
 ======================================================= */
 
 async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 BINANCE SQUARE AI BOT V2.8.1 (Render‑Ready)");
+  console.log("🚀 BINANCE SQUARE AI BOT V2.8.2 (Multi‑Endpoint)");
   console.log("================================================");
   console.log(`🕐 ${new Date().toLocaleString()}`);
   console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
@@ -831,7 +846,7 @@ async function runCycle() {
 }
 
 /* =======================================================
-   HELPERS
+   HELPERS (unchanged)
 ======================================================= */
 
 function formatNumber(number) {
@@ -845,7 +860,7 @@ function formatPercent(number) {
 }
 
 /* =======================================================
-   SHUTDOWN HANDLERS (now also close server)
+   SHUTDOWN (unchanged)
 ======================================================= */
 
 let shuttingDown = false;
@@ -881,8 +896,8 @@ async function startBotAndServer() {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V2.8.1           ║
-║          (Render‑Ready)                         ║
+║       🤖 BINANCE SQUARE AI BOT V2.8.2           ║
+║          (Multi‑Endpoint Fix)                    ║
 ╚══════════════════════════════════════════════════╝
 `);
 
@@ -891,7 +906,7 @@ async function startBotAndServer() {
   console.log(`⚡ TPM optimization: ENABLED`);
   console.log(`⏱️ Interval: ${POST_INTERVAL_MINUTES} minutes`);
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
-  console.log(`📊 Binance market data: ENABLED`);
+  console.log(`📊 Binance market data: ENABLED (multi‑endpoint)`);
   console.log(`📰 Live news research: DISABLED`);
   console.log(`🛡️ Quality gate: SAFETY ONLY (no rejections)`);
   console.log(`🔎 Duplicate protection: DISABLED`);
@@ -911,7 +926,6 @@ async function startBotAndServer() {
     console.log(`\n⏳ Next cycle in ${POST_INTERVAL_MINUTES} minutes.`);
   }, interval);
 
-  // Start HTTP server for Render health checks
   const PORT = process.env.PORT || 3000;
   httpServer = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
