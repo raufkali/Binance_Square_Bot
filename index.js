@@ -10,44 +10,29 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V3.0.0 – PRODUCTION SAFE
+BINANCE SQUARE AI BOT V3.1.0
+Production Stable Market Data Version
 =========================================================
 
-FIXES:
-- Render production startup fixed
-- HTTP health server starts BEFORE first bot cycle
-- Binance 451 handled automatically
-- CoinGecko bulk market request
-- CoinGecko 429 retry/backoff
-- CoinGecko OHLC failure no longer kills cycle
-- Market-data degradation support
-- Atomic JSON state writes
-- Corrupted/missing state recovery
-- State errors never kill bot
-- Bot remains alive after failed cycles
-- 4+ hashtags
-- Random topics
-- Duplicate protection disabled
-- Safety checks do not reject posts
-- Binance Square publishing preserved
+MARKET DATA FLOW:
 
-FLOW:
+1. Binance API
+   ↓
+2. If Binance = 451 / unavailable
+   ↓
+3. CoinGecko BULK endpoint for 24h market data
+   ↓
+4. Coinbase public candles for technical analysis
+   ↓
+5. If technical data fails, use available ticker data
 
-Render
-  ↓
-Health server starts immediately
-  ↓
-Market data
-  ↓
-Binance
-  ↓
-CoinGecko bulk fallback
-  ↓
-Technical data if available
-  ↓
-Groq
-  ↓
-Binance Square
+IMPORTANT:
+- We DO NOT call CoinGecko once per coin anymore.
+- We DO NOT call CoinGecko OHLC anymore.
+- This dramatically reduces 429 rate-limit problems.
+- Binance 451 is expected on some Render regions.
+- State file is written safely.
+- Bot remains alive if one provider fails.
 =========================================================
 */
 
@@ -59,7 +44,6 @@ const __dirname = path.dirname(__filename);
 ======================================================= */
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-
 const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 
 const BINANCE_SQUARE_OPENAPI_KEY = process.env.BINANCE_SQUARE_OPENAPI_KEY;
@@ -74,7 +58,19 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
 
 const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
 
+/*
+IMPORTANT:
+
+Render's filesystem is ephemeral.
+
+The bot can still use a JSON file during runtime,
+but it should never depend on the JSON file being
+permanently stored after a restart.
+*/
+
 const STATE_FILE = path.join(__dirname, "bot-state.json");
+
+const GENERATION_MAX_TOKENS = 1300;
 
 const SQUARE_SCRIPT = path.join(
   __dirname,
@@ -85,12 +81,8 @@ const SQUARE_SCRIPT = path.join(
   "post-text.mjs",
 );
 
-const GENERATION_MAX_TOKENS = 1300;
-
-const HARD_PROMPT_CHARS = 16000;
-
 /* =======================================================
-   API URLS
+   BINANCE
 ======================================================= */
 
 const BINANCE_BASE_URLS = [
@@ -100,10 +92,52 @@ const BINANCE_BASE_URLS = [
   "https://api3.binance.com",
 ];
 
+/* =======================================================
+   COINGECKO
+======================================================= */
+
 const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
 
+/*
+One CoinGecko request gets ALL required coins.
+*/
+
+const COINGECKO_IDS = {
+  BTCUSDT: "bitcoin",
+  ETHUSDT: "ethereum",
+  BNBUSDT: "binancecoin",
+  SOLUSDT: "solana",
+  XRPUSDT: "ripple",
+};
+
 /* =======================================================
-   COIN MAPPING
+   COINBASE
+=======================================================
+
+Coinbase Exchange public candles.
+
+No API key required for public market candles.
+
+BTC → BTC-USD
+ETH → ETH-USD
+BNB → BNB-USD
+SOL → SOL-USD
+XRP → XRP-USD
+
+======================================================= */
+
+const COINBASE_PRODUCTS = {
+  BTCUSDT: "BTC-USD",
+  ETHUSDT: "ETH-USD",
+  BNBUSDT: "BNB-USD",
+  SOLUSDT: "SOL-USD",
+  XRPUSDT: "XRP-USD",
+};
+
+const COINBASE_BASE = "https://api.exchange.coinbase.com";
+
+/* =======================================================
+   COINS
 ======================================================= */
 
 const COINS = [
@@ -111,31 +145,26 @@ const COINS = [
     symbol: "BTCUSDT",
     name: "Bitcoin",
     short: "BTC",
-    geckoId: "bitcoin",
   },
   {
     symbol: "ETHUSDT",
     name: "Ethereum",
     short: "ETH",
-    geckoId: "ethereum",
   },
   {
     symbol: "BNBUSDT",
     name: "BNB",
     short: "BNB",
-    geckoId: "binancecoin",
   },
   {
     symbol: "SOLUSDT",
     name: "Solana",
     short: "SOL",
-    geckoId: "solana",
   },
   {
     symbol: "XRPUSDT",
     name: "XRP",
     short: "XRP",
-    geckoId: "ripple",
   },
 ];
 
@@ -184,7 +213,7 @@ function generateQuestions() {
     }
   }
 
-  const extras = [
+  qs.push(
     "What is the biggest mover today and why?",
     "Which coin shows the strongest momentum?",
     "What is the market cap dominance of Bitcoin?",
@@ -197,9 +226,7 @@ function generateQuestions() {
     "Which coin is most volatile right now?",
     "What does the volume spike indicate?",
     "Is the market consolidating or trending?",
-  ];
-
-  qs.push(...extras);
+  );
 
   return qs;
 }
@@ -207,7 +234,7 @@ function generateQuestions() {
 const QUESTION_POOL = generateQuestions();
 
 /* =======================================================
-   VALIDATION
+   ENV VALIDATION
 ======================================================= */
 
 if (!GROQ_API_KEY) {
@@ -228,7 +255,7 @@ const groq = new Groq({
    STATE
 ======================================================= */
 
-const DEFAULT_STATE = {
+let state = {
   date: new Date().toISOString().slice(0, 10),
   postsToday: 0,
   totalPosts: 0,
@@ -238,78 +265,35 @@ const DEFAULT_STATE = {
   history: [],
 };
 
-let state = {
-  ...DEFAULT_STATE,
-};
-
 /* =======================================================
-   LOAD STATE
+   SAFE STATE LOADING
 ======================================================= */
 
 async function loadState() {
   try {
     const raw = await fs.readFile(STATE_FILE, "utf8");
 
-    if (!raw.trim()) {
-      console.log("⚠️ State file is empty. Starting fresh.");
-
-      state = {
-        ...DEFAULT_STATE,
-      };
-
-      return;
-    }
-
     const parsed = JSON.parse(raw);
 
-    state = {
-      ...DEFAULT_STATE,
-      ...parsed,
-
-      history: Array.isArray(parsed.history) ? parsed.history : [],
-
-      postsToday: Number.isFinite(Number(parsed.postsToday))
-        ? Number(parsed.postsToday)
-        : 0,
-
-      totalPosts: Number.isFinite(Number(parsed.totalPosts))
-        ? Number(parsed.totalPosts)
-        : 0,
-
-      totalFailures: Number.isFinite(Number(parsed.totalFailures))
-        ? Number(parsed.totalFailures)
-        : 0,
-
-      totalSkipped: Number.isFinite(Number(parsed.totalSkipped))
-        ? Number(parsed.totalSkipped)
-        : 0,
-    };
-
-    console.log("💾 State loaded successfully.");
-    console.log(`   Posts today: ${state.postsToday}`);
-    console.log(`   Total posts: ${state.totalPosts}`);
-    console.log(`   History: ${state.history.length}`);
-  } catch (error) {
-    console.warn(`⚠️ Could not load state file: ${error.message}`);
-
-    console.log("🔄 Starting with fresh in-memory state.");
-
-    state = {
-      ...DEFAULT_STATE,
-    };
-
-    try {
-      await saveState();
-    } catch {
-      console.warn("⚠️ Could not create state file. Continuing in memory.");
+    if (parsed && typeof parsed === "object") {
+      state = {
+        ...state,
+        ...parsed,
+      };
     }
+
+    console.log("💾 State file loaded.");
+  } catch (error) {
+    console.log("ℹ️ No existing state file found. Starting fresh.");
+
+    await saveState();
   }
 
   resetDailyCounter();
 }
 
 /* =======================================================
-   SAVE STATE
+   SAFE STATE SAVING
 ======================================================= */
 
 async function saveState() {
@@ -319,38 +303,19 @@ async function saveState() {
     const data = JSON.stringify(state, null, 2);
 
     /*
-      Atomic write.
+    Write temporary file first.
 
-      Instead of:
-
-      bot-state.json ← overwrite
-
-      we do:
-
-      bot-state.json.tmp ← write
-      ↓
-      rename
-      ↓
-      bot-state.json
+    This prevents a partially written JSON file
+    if the process gets interrupted during writing.
     */
 
     await fs.writeFile(tempFile, data, "utf8");
 
     await fs.rename(tempFile, STATE_FILE);
-
-    return true;
   } catch (error) {
-    console.warn(`⚠️ State persistence failed: ${error.message}`);
-
-    console.warn("⚠️ Bot will continue using in-memory state.");
-
-    return false;
+    console.error("⚠️ Failed to save state:", error.message);
   }
 }
-
-/* =======================================================
-   DAILY RESET
-======================================================= */
 
 function resetDailyCounter() {
   const today = new Date().toISOString().slice(0, 10);
@@ -366,15 +331,7 @@ function resetDailyCounter() {
 }
 
 /* =======================================================
-   SLEEP
-======================================================= */
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/* =======================================================
-   HTTP FETCH WITH TIMEOUT
+   HTTP
 ======================================================= */
 
 async function fetchWithTimeout(
@@ -437,7 +394,7 @@ async function binance24hData(symbol) {
     }
   }
 
-  const error = new Error(`Binance 24h failed for ${symbol}`);
+  const error = new Error(`Binance 24h unavailable for ${symbol}`);
 
   error.lastStatus = lastStatus;
 
@@ -478,11 +435,13 @@ async function binanceKlines(symbol, interval, limit = 50) {
 
       lastStatus = response.status;
     } catch (error) {
-      console.warn(`   ⚠️ Binance klines ${base} failed: ${error.message}`);
+      console.warn(
+        `   ⚠️ Binance ${interval} ${base} failed: ${error.message}`,
+      );
     }
   }
 
-  const error = new Error(`Binance klines failed for ${symbol}`);
+  const error = new Error(`Binance klines unavailable for ${symbol}`);
 
   error.lastStatus = lastStatus;
 
@@ -490,307 +449,263 @@ async function binanceKlines(symbol, interval, limit = 50) {
 }
 
 /* =======================================================
-   COINGECKO REQUEST WITH RETRY
+   COINGECKO BULK MARKET DATA
+=======================================================
+
+ONE REQUEST FOR ALL COINS.
+
+This is the most important production fix.
+
+Before:
+
+BTC → CoinGecko
+ETH → CoinGecko
+BNB → CoinGecko
+SOL → CoinGecko
+XRP → CoinGecko
+
+Now:
+
+ALL 5 COINS → ONE REQUEST
+
 ======================================================= */
 
-async function fetchCoinGecko(url, retries = 3) {
-  let lastError = null;
+let coinGeckoCache = null;
+let coinGeckoCacheTime = 0;
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await fetchWithTimeout(url, {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "Mozilla/5.0 BinanceSquareBot/3.0",
-        },
-      });
+const COINGECKO_CACHE_MS = 5 * 60 * 1000;
 
-      if (response.ok) {
-        return await response.json();
-      }
+async function getCoinGeckoBulk() {
+  const now = Date.now();
 
-      const status = response.status;
-
-      if (status === 429) {
-        const retryAfter = response.headers.get("retry-after");
-
-        let waitMs;
-
-        if (retryAfter) {
-          const seconds = Number(retryAfter);
-
-          waitMs = Number.isFinite(seconds) ? seconds * 1000 : 5000;
-        } else {
-          waitMs = Math.min(15000, 2000 * Math.pow(2, attempt - 1));
-        }
-
-        console.warn(
-          `   ⚠️ CoinGecko rate limited (429). Waiting ${Math.ceil(
-            waitMs / 1000,
-          )}s...`,
-        );
-
-        await sleep(waitMs);
-
-        continue;
-      }
-
-      throw new Error(`CoinGecko HTTP ${status}`);
-    } catch (error) {
-      lastError = error;
-
-      if (attempt < retries) {
-        const waitMs = 1500 * attempt;
-
-        console.warn(`   ⚠️ CoinGecko request failed: ${error.message}`);
-
-        await sleep(waitMs);
-      }
-    }
+  if (coinGeckoCache && now - coinGeckoCacheTime < COINGECKO_CACHE_MS) {
+    return coinGeckoCache;
   }
 
-  throw lastError || new Error("CoinGecko request failed");
-}
-
-/* =======================================================
-   COINGECKO BULK 24H DATA
-======================================================= */
-
-async function coingeckoBulk24hData() {
-  const ids = COINS.map((coin) => coin.geckoId).join(",");
+  const ids = Object.values(COINGECKO_IDS).join(",");
 
   const url =
     `${COINGECKO_BASE}/coins/markets` +
     `?vs_currency=usd` +
-    `&ids=${encodeURIComponent(ids)}` +
-    `&order=market_cap_desc` +
+    `&ids=${ids}` +
+    `&price_change_percentage=24h` +
     `&per_page=10` +
-    `&page=1` +
-    `&sparkline=false` +
-    `&price_change_percentage=24h`;
+    `&page=1`;
 
-  console.log("\n   🌐 CoinGecko bulk request...");
+  console.log("   🌐 CoinGecko bulk request...");
 
-  const data = await fetchCoinGecko(url, 3);
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0",
+    },
+  });
 
-  if (!Array.isArray(data) || !data.length) {
-    throw new Error("CoinGecko returned no market data");
+  if (response.status === 429) {
+    throw new Error("CoinGecko rate limited (429)");
   }
 
-  const result = new Map();
-
-  for (const item of data) {
-    const coin = COINS.find((c) => c.geckoId === item.id);
-
-    if (!coin) continue;
-
-    const price = Number(item.current_price || 0);
-
-    const changePercent = Number(item.price_change_percentage_24h || 0);
-
-    const change = price * (changePercent / 100);
-
-    const open = price - change;
-
-    result.set(coin.symbol, {
-      symbol: coin.symbol,
-      price,
-      open,
-      high: Number(item.high_24h || price),
-      low: Number(item.low_24h || price),
-      change,
-      changePercent,
-      volume: Number(item.total_volume || 0),
-      quoteVolume: Number(item.total_volume || 0),
-      trades: 0,
-    });
+  if (!response.ok) {
+    throw new Error(`CoinGecko API failed: ${response.status}`);
   }
 
-  return result;
+  const raw = await response.json();
+
+  const map = {};
+
+  for (const coin of raw) {
+    map[coin.id] = coin;
+  }
+
+  coinGeckoCache = map;
+
+  coinGeckoCacheTime = now;
+
+  return map;
 }
 
 /* =======================================================
-   COINGECKO OHLC
+   COINGECKO SINGLE TICKER FROM BULK CACHE
 ======================================================= */
 
-async function coingeckoKlines(symbol, interval, limit = 50) {
-  const coin = COINS.find((c) => c.symbol === symbol);
+async function coingecko24hData(symbol) {
+  const id = COINGECKO_IDS[symbol];
 
-  if (!coin) {
+  if (!id) {
     throw new Error(`No CoinGecko mapping for ${symbol}`);
   }
 
-  /*
-    CoinGecko public OHLC:
-    days=1 gives higher-resolution recent data.
-    days=7 gives lower-resolution data.
+  const dataMap = await getCoinGeckoBulk();
 
-    We use:
-      1h → 1 day
-      4h → 7 days
-  */
+  const data = dataMap[id];
 
-  const days = interval === "1h" ? 1 : 7;
-
-  const url =
-    `${COINGECKO_BASE}/coins/${coin.geckoId}/ohlc` +
-    `?vs_currency=usd&days=${days}`;
-
-  const raw = await fetchCoinGecko(url, 2);
-
-  if (!Array.isArray(raw) || !raw.length) {
-    throw new Error(`CoinGecko returned no OHLC for ${symbol}`);
+  if (!data) {
+    throw new Error(`CoinGecko returned no data for ${symbol}`);
   }
 
-  const candles = raw.map((candle) => ({
-    openTime: Number(candle[0]),
-    open: Number(candle[1]),
-    high: Number(candle[2]),
-    low: Number(candle[3]),
-    close: Number(candle[4]),
-    volume: 0,
-    closeTime: Number(candle[0]),
-  }));
+  const price = Number(data.current_price);
 
-  return candles.slice(-limit);
+  const change = Number(data.price_change_24h ?? 0);
+
+  const changePercent = Number(data.price_change_percentage_24h ?? 0);
+
+  return {
+    symbol,
+    price,
+    open: price - change,
+    high: Number(data.high_24h ?? price),
+    low: Number(data.low_24h ?? price),
+    change,
+    changePercent,
+    volume: Number(data.total_volume ?? 0),
+    quoteVolume: Number(data.total_volume ?? 0),
+    trades: 0,
+  };
 }
 
 /* =======================================================
-   TECHNICAL DATA FALLBACK
+   COINBASE CANDLES
 ======================================================= */
 
-function buildFallbackCandles(ticker) {
-  /*
-    These are NOT fake historical candles.
+async function coinbaseKlines(symbol, interval, limit = 50) {
+  const product = COINBASE_PRODUCTS[symbol];
 
-    We create a minimal single observation
-    so the rest of the application can continue
-    without pretending historical technical data
-    exists.
+  if (!product) {
+    throw new Error(`No Coinbase product for ${symbol}`);
+  }
+
+  let granularity;
+
+  if (interval === "1h") {
+    granularity = 3600;
+  } else if (interval === "4h") {
+    granularity = 14400;
+  } else {
+    granularity = 3600;
+  }
+
+  /*
+  Coinbase maximum candle request
+  is limited, so 50 is safe.
   */
 
-  return [
-    {
-      openTime: Date.now(),
-      open: ticker.open,
-      high: ticker.high,
-      low: ticker.low,
-      close: ticker.price,
-      volume: ticker.volume,
-      closeTime: Date.now(),
+  const url =
+    `${COINBASE_BASE}/products/${product}/candles` +
+    `?granularity=${granularity}`;
+
+  const response = await fetchWithTimeout(url, {
+    headers: {
+      Accept: "application/json",
+      "User-Agent": "Mozilla/5.0",
     },
-  ];
+  });
+
+  if (!response.ok) {
+    throw new Error(`Coinbase ${interval} API failed: ${response.status}`);
+  }
+
+  const raw = await response.json();
+
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error(`Coinbase returned no ${interval} candles for ${symbol}`);
+  }
+
+  /*
+  Coinbase format:
+
+  [
+    time,
+    low,
+    high,
+    open,
+    close,
+    volume
+  ]
+
+  Coinbase returns newest first,
+  so reverse it.
+  */
+
+  return raw
+    .slice(0, limit)
+    .reverse()
+    .map((candle) => ({
+      openTime: Number(candle[0]) * 1000,
+
+      low: Number(candle[1]),
+
+      high: Number(candle[2]),
+
+      open: Number(candle[3]),
+
+      close: Number(candle[4]),
+
+      volume: Number(candle[5]),
+
+      closeTime: Number(candle[0]) * 1000,
+    }));
 }
 
 /* =======================================================
    UNIFIED 24H DATA
 ======================================================= */
 
-let coinGeckoBulkCache = null;
-let coinGeckoBulkCacheTime = 0;
-
-const COINGECKO_CACHE_MS = 5 * 60 * 1000;
-
 async function get24hData(symbol) {
-  /*
-    First try Binance.
-
-    Render may receive HTTP 451,
-    so we automatically switch to
-    CoinGecko.
-  */
-
   try {
     return await binance24hData(symbol);
   } catch (error) {
     console.warn(
       `   ↪️ Binance unavailable for ${symbol} (${error.lastStatus || error.message})`,
     );
-  }
 
-  /*
-    CoinGecko bulk cache.
-
-    This prevents five separate
-    CoinGecko requests.
-  */
-
-  const now = Date.now();
-
-  if (
-    !coinGeckoBulkCache ||
-    now - coinGeckoBulkCacheTime > COINGECKO_CACHE_MS
-  ) {
     try {
-      coinGeckoBulkCache = await coingeckoBulk24hData();
+      const data = await coingecko24hData(symbol);
 
-      coinGeckoBulkCacheTime = now;
-    } catch (error) {
-      console.warn(`   ❌ CoinGecko bulk request failed: ${error.message}`);
+      console.log(`      ✅ CoinGecko bulk fallback succeeded for ${symbol}`);
 
-      throw new Error(
-        `Binance and CoinGecko unavailable for ${symbol}: ${error.message}`,
+      return data;
+    } catch (fallbackError) {
+      console.warn(
+        `      ⚠️ CoinGecko fallback failed for ${symbol}: ${fallbackError.message}`,
       );
+
+      throw new Error(`All 24h providers failed for ${symbol}`);
     }
   }
-
-  const ticker = coinGeckoBulkCache.get(symbol);
-
-  if (!ticker) {
-    throw new Error(`No CoinGecko data for ${symbol}`);
-  }
-
-  console.log(`      ✅ CoinGecko bulk fallback succeeded for ${symbol}`);
-
-  return ticker;
 }
 
 /* =======================================================
    UNIFIED KLINES
 ======================================================= */
 
-async function getKlines(symbol, interval, limit = 50, ticker = null) {
+async function getKlines(symbol, interval, limit = 50) {
   try {
     return await binanceKlines(symbol, interval, limit);
   } catch (error) {
     console.warn(
       `   ↪️ Binance ${interval} klines unavailable for ${symbol} (${error.lastStatus || error.message})`,
     );
-  }
 
-  /*
-    Try CoinGecko OHLC.
+    try {
+      const data = await coinbaseKlines(symbol, interval, limit);
 
-    If CoinGecko is rate limited,
-    we don't kill the entire cycle.
-  */
+      console.log(`      ✅ Coinbase ${interval} data succeeded for ${symbol}`);
 
-  try {
-    const data = await coingeckoKlines(symbol, interval, limit);
+      return data;
+    } catch (fallbackError) {
+      console.warn(
+        `      ⚠️ Coinbase ${interval} failed for ${symbol}: ${fallbackError.message}`,
+      );
 
-    console.log(`      ✅ CoinGecko ${interval} data succeeded for ${symbol}`);
+      /*
+      Do NOT kill the entire coin.
 
-    return data;
-  } catch (error) {
-    console.warn(
-      `      ⚠️ CoinGecko ${interval} unavailable for ${symbol}: ${error.message}`,
-    );
+      Return empty data.
+      The bot will use ticker data.
+      */
 
-    /*
-      Graceful degradation.
-
-      The bot can still generate
-      a market post using current
-      ticker data.
-    */
-
-    if (ticker) {
-      console.log(`      ↪️ Using current market snapshot for ${symbol}`);
-
-      return buildFallbackCandles(ticker);
+      return [];
     }
-
-    return [];
   }
 }
 
@@ -799,7 +714,7 @@ async function getKlines(symbol, interval, limit = 50, ticker = null) {
 ======================================================= */
 
 function calculateSMA(candles, period) {
-  if (!candles || candles.length < period) {
+  if (candles.length < period) {
     return null;
   }
 
@@ -809,7 +724,7 @@ function calculateSMA(candles, period) {
 }
 
 function calculateRange(candles) {
-  if (!candles || !candles.length) {
+  if (!candles.length) {
     return null;
   }
 
@@ -825,7 +740,7 @@ function calculateRange(candles) {
 }
 
 function calculateMomentum(candles, lookback = 10) {
-  if (!candles || candles.length <= lookback) {
+  if (candles.length <= lookback) {
     return null;
   }
 
@@ -841,7 +756,7 @@ function calculateMomentum(candles, lookback = 10) {
 }
 
 function calculateVolumeRatio(candles, period = 20) {
-  if (!candles || candles.length <= period) {
+  if (candles.length <= period) {
     return null;
   }
 
@@ -859,21 +774,16 @@ function calculateVolumeRatio(candles, period = 20) {
   return current / average;
 }
 
-/* =======================================================
-   ANALYZE CANDLES
-======================================================= */
-
-function analyzeCandles(candles) {
-  if (!candles || !candles.length) {
+function analyzeCandles(candles, fallbackPrice) {
+  if (!candles || candles.length < 5) {
     return {
-      latestClose: null,
+      latestClose: fallbackPrice,
       sma20: null,
       sma50: null,
       momentum: null,
       volumeRatio: null,
       recent20Range: null,
-      trend: "neutral",
-      dataAvailable: false,
+      trend: "unknown",
     };
   }
 
@@ -907,15 +817,16 @@ function analyzeCandles(candles) {
     latestClose: latest.close,
 
     sma20,
+
     sma50,
+
     momentum,
+
     volumeRatio,
 
     recent20Range: range,
 
     trend,
-
-    dataAvailable: candles.length > 1,
   };
 }
 
@@ -928,34 +839,64 @@ async function getMarketData() {
 
   const markets = [];
 
+  /*
+  IMPORTANT:
+
+  Warm up CoinGecko once.
+
+  If Binance is blocked, all coins
+  will share this one request.
+  */
+
+  let coinGeckoReady = false;
+
+  try {
+    await getCoinGeckoBulk();
+
+    coinGeckoReady = true;
+
+    console.log("   🌐 CoinGecko bulk cache ready.");
+  } catch (error) {
+    console.warn(`   ⚠️ CoinGecko bulk unavailable: ${error.message}`);
+  }
+
   for (const coin of COINS) {
     try {
       console.log(`\n   🔎 ${coin.name}`);
 
-      /*
-        24h ticker.
+      let ticker;
 
-        Binance first.
-        CoinGecko bulk fallback second.
-      */
+      try {
+        ticker = await get24hData(coin.symbol);
+      } catch (error) {
+        console.error(`      ❌ Ticker failed: ${error.message}`);
 
-      const ticker = await get24hData(coin.symbol);
+        /*
+        If one coin fails, continue
+        with the next coin.
+        */
 
-      /*
-        Technical data.
+        continue;
+      }
 
-        Binance first.
-        CoinGecko second.
-        Current snapshot fallback third.
-      */
+      let candles1h = [];
+      let candles4h = [];
 
-      const candles1h = await getKlines(coin.symbol, "1h", 50, ticker);
+      try {
+        candles1h = await getKlines(coin.symbol, "1h", 50);
+      } catch (error) {
+        console.warn(`      ⚠️ 1h data unavailable`);
+      }
 
-      const candles4h = await getKlines(coin.symbol, "4h", 50, ticker);
+      try {
+        candles4h = await getKlines(coin.symbol, "4h", 50);
+      } catch (error) {
+        console.warn(`      ⚠️ 4h data unavailable`);
+      }
 
-      const technical1h = analyzeCandles(candles1h);
+      const technical1h = analyzeCandles(candles1h, ticker.price);
 
-      const technical4h = analyzeCandles(candles4h);
+      const technical4h = analyzeCandles(candles4h, ticker.price);
 
       const market = {
         ...coin,
@@ -982,34 +923,26 @@ async function getMarketData() {
       console.log(`      4h momentum: ${formatPercent(technical4h.momentum)}`);
 
       console.log(
-        `      Technical data: ${
-          technical4h.dataAvailable ? "AVAILABLE" : "LIMITED"
-        }`,
+        `      Technical data: ${candles4h.length ? "AVAILABLE" : "LIMITED"}`,
       );
     } catch (error) {
-      console.error(`      ❌ Failed: ${error.message}`);
+      console.error(`      ❌ Failed ${coin.symbol}: ${error.message}`);
     }
   }
 
   /*
-    IMPORTANT:
-
-    Previously the entire cycle failed
-    when no market data was collected.
-
-    We still require at least one coin,
-    but one failed API should not kill
-    everything.
+  Do not fail the cycle unless absolutely
+  no market data was obtained.
   */
 
-  if (!markets.length) {
+  if (markets.length === 0) {
     throw new Error(
-      "No market data could be collected from Binance or CoinGecko.",
+      "No market data could be collected from Binance, CoinGecko, or Coinbase.",
     );
   }
 
   console.log(
-    `\n📊 Market data collected for ${markets.length}/${COINS.length} coins.`,
+    `\n📊 Successfully collected ${markets.length}/${COINS.length} markets.`,
   );
 
   return markets;
@@ -1030,35 +963,20 @@ function buildCompactMarketData(markets) {
 
       return [
         `${coin.short} ${coin.name}`,
-
         `price=${t.price}`,
-
         `24h=${t.changePercent}%`,
-
         `high=${t.high}`,
-
         `low=${t.low}`,
-
         `volume=${t.volume}`,
-
         `quoteVol=${t.quoteVolume}`,
-
         `1h=${o.trend}`,
-
         `1hMom=${o.momentum?.toFixed(2) ?? "NA"}%`,
-
         `4h=${h.trend}`,
-
         `4hMom=${h.momentum?.toFixed(2) ?? "NA"}%`,
-
         `4hVolRatio=${h.volumeRatio?.toFixed(2) ?? "NA"}x`,
-
         `4hSMA20=${h.sma20 ?? "NA"}`,
-
         `4hSMA50=${h.sma50 ?? "NA"}`,
-
         `rangeHigh=${h.recent20Range?.high ?? "NA"}`,
-
         `rangeLow=${h.recent20Range?.low ?? "NA"}`,
       ].join(" | ");
     })
@@ -1066,7 +984,7 @@ function buildCompactMarketData(markets) {
 }
 
 /* =======================================================
-   NEWS RESEARCH
+   NEWS
 ======================================================= */
 
 async function researchNews(markets) {
@@ -1074,24 +992,20 @@ async function researchNews(markets) {
 
   return (
     "No external news research performed. " +
-    "All analysis is based on available market data."
+    "All analysis based on current market data."
   );
 }
 
 /* =======================================================
-   RECENT POST MEMORY
+   POST MEMORY
 ======================================================= */
 
 function getRecentPostMemory() {
-  if (!Array.isArray(state.history)) {
-    return "";
-  }
-
   return state.history
     .slice(-12)
     .map(
       (post) =>
-        `${post.topic}: ${String(post.text || "")
+        `${post.topic}: ${String(post.text)
           .replace(/\s+/g, " ")
           .slice(0, 180)}`,
     )
@@ -1107,7 +1021,7 @@ function extractJSON(raw) {
     return JSON.parse(raw);
   } catch {}
 
-  const match = String(raw).match(/\{[\s\S]*\}/);
+  const match = raw.match(/\{[\s\S]*\}/);
 
   if (match) {
     try {
@@ -1119,28 +1033,28 @@ function extractJSON(raw) {
 }
 
 /* =======================================================
-   GROQ GENERATION
+   GROQ
 ======================================================= */
 
 async function callGeneration(prompt, maxTokens, retries = 3) {
   const system = `
-You are a crypto journalist creating casual Binance Square content.
+You are a crypto journalist creating Binance Square posts.
 
-Output ONLY valid JSON with:
+Return ONLY valid JSON.
 
-title,
-topic,
-content,
-qualityScore,
-newsUsed,
-catalystConfidence,
-skip,
-skipReason.
+Required fields:
+title
+topic
+content
+qualityScore
+newsUsed
+catalystConfidence
+skip
+skipReason
 
 Do not invent market data.
-Do not claim unverified news as fact.
-If a catalyst is unknown, say:
-"No confirmed catalyst found."
+Do not make guaranteed profit claims.
+Do not give direct financial advice.
 `.trim();
 
   for (let attempt = 1; attempt <= retries; attempt++) {
@@ -1177,7 +1091,7 @@ If a catalyst is unknown, say:
       const parsed = extractJSON(raw);
 
       if (!parsed) {
-        throw new Error("Groq returned invalid JSON");
+        throw new Error("Invalid JSON from Groq");
       }
 
       return {
@@ -1205,7 +1119,7 @@ If a catalyst is unknown, say:
         throw error;
       }
 
-      await sleep(1500 * attempt);
+      await new Promise((resolve) => setTimeout(resolve, 1500));
     }
   }
 }
@@ -1215,7 +1129,7 @@ If a catalyst is unknown, say:
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto") {
-  const hashtags = String(content).match(/#[a-zA-Z0-9_]+/g) || [];
+  const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
 
   const missing = 4 - hashtags.length;
 
@@ -1245,38 +1159,11 @@ function ensureHashtags(content, topic = "crypto") {
     .filter((tag) => !existing.has(tag.toLowerCase()))
     .slice(0, missing);
 
-  if (toAdd.length < missing) {
-    const fallback = ["#Crypto", "#Trading", "#MarketUpdate", "#Binance"];
-
-    const additional = fallback
-      .filter(
-        (tag) =>
-          !existing.has(tag.toLowerCase()) &&
-          !toAdd.some((x) => x.toLowerCase() === tag.toLowerCase()),
-      )
-      .slice(0, missing - toAdd.length);
-
-    toAdd.push(...additional);
-  }
-
   while (toAdd.length < missing) {
     toAdd.push("#CryptoUpdate");
   }
 
-  const lines = String(content).split("\n");
-
-  let insertIndex = lines.length;
-
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].toLowerCase().includes("not financial advice")) {
-      insertIndex = i;
-      break;
-    }
-  }
-
-  lines.splice(insertIndex, 0, toAdd.join(" "));
-
-  return lines.join("\n");
+  return content.trim() + "\n\n" + toAdd.join(" ");
 }
 
 /* =======================================================
@@ -1304,7 +1191,7 @@ ${question}
 MARKET DATA:
 ${marketData}
 
-NEWS RESEARCH:
+NEWS:
 ${compactNews}
 
 RECENT POSTS:
@@ -1314,19 +1201,18 @@ Create a Binance Square post that directly answers the question.
 
 Rules:
 
-- Use only the supplied market data.
+- Use only the provided market data.
 - Do not invent news.
-- If no catalyst is known, say "No confirmed catalyst found."
-- Do not give direct buy/sell instructions.
-- Do not promise profits.
-- End with "Not financial advice."
+- If no catalyst exists, say "No confirmed catalyst found."
+- No buy/sell commands.
+- No profit promises.
+- No guaranteed returns.
 - Use at least 4 relevant hashtags.
-- Keep the post readable and engaging.
-- Target approximately 900-1600 characters.
-- Casual crypto-community style is acceptable.
+- Keep the post around 900-1600 characters.
+- Make it natural and engaging.
 - Ask a simple question at the end to encourage comments.
 
-Return JSON:
+Return:
 
 {
   "title": "short title",
@@ -1338,18 +1224,18 @@ Return JSON:
   "skip": false,
   "skipReason": ""
 }
-`.slice(0, HARD_PROMPT_CHARS);
+`;
 
   try {
-    let post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
+    const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
 
     post.content = ensureHashtags(post.content, post.topic);
 
     return post;
   } catch (error) {
-    console.error("⚠️ Generation failed. Building fallback post.");
+    console.error("⚠️ Groq generation failed. Building fallback post.");
 
-    let post = buildFallbackPost(markets, question);
+    const post = buildFallbackPost(markets, question);
 
     post.content = ensureHashtags(post.content, post.topic);
 
@@ -1373,24 +1259,19 @@ function buildFallbackPost(markets, question) {
 
   const change = top.ticker.changePercent;
 
-  const name = top.name;
-
-  const symbol = top.short;
-
-  const intros = [
-    `Here's my take on "${question}" based on the latest market data.`,
-    `Let's look at "${question}" using the latest numbers.`,
+  const introOptions = [
+    `Here's a quick look at "${question}" using the latest market data.`,
+    `Let's break down "${question}" using the current numbers.`,
     `Quick market check: "${question}"`,
-    `Answering "${question}" with the current market snapshot.`,
+    `Looking at "${question}" through the latest crypto data.`,
   ];
 
-  const intro = intros[Math.floor(Math.random() * intros.length)];
+  const intro = introOptions[Math.floor(Math.random() * introOptions.length)];
 
   const content = `
 📊 ${intro}
 
-Top mover:
-${name} (${symbol}) is currently around $${formatNumber(
+${top.name} (${top.short}) is currently trading around $${formatNumber(
     price,
   )}, with a 24h move of ${change >= 0 ? "+" : ""}${change.toFixed(2)}%.
 
@@ -1405,7 +1286,7 @@ ${markets
   )
   .join("\n")}
 
-4h trend snapshot:
+4h trend overview:
 
 ${markets
   .map((coin) => {
@@ -1419,20 +1300,21 @@ ${markets
   })
   .join("\n")}
 
-⚠️ Important:
-Market conditions can change quickly. Watch price structure, momentum and volume rather than relying on one indicator.
+No confirmed catalyst found.
 
-What's your view on the market right now?
+The key thing to watch is whether current momentum continues or fades as price approaches recent levels.
+
+What's your view on the market?
 
 Not financial advice.
-`.trim();
+`;
 
   return {
-    title: `Market Update: ${question.slice(0, 50)}`,
+    title: `Market Update: ${top.short}`,
 
-    topic: symbol.toLowerCase(),
+    topic: top.short.toLowerCase(),
 
-    content,
+    content: content.trim(),
 
     qualityScore: 7,
 
@@ -1450,7 +1332,7 @@ Not financial advice.
    VALIDATION
 ======================================================= */
 
-function validatePost(post, markets) {
+function validatePost(post) {
   const reasons = [];
 
   if (!post) {
@@ -1463,7 +1345,7 @@ function validatePost(post, markets) {
   const content = String(post.content || "").trim();
 
   if (content.length < 50) {
-    reasons.push("post is too short (<50 chars)");
+    reasons.push("post too short");
   }
 
   const lower = content.toLowerCase();
@@ -1491,7 +1373,7 @@ function validatePost(post, markets) {
   const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
 
   if (hashtags.length < 4) {
-    reasons.push(`hashtags count: ${hashtags.length} (expected 4+)`);
+    reasons.push(`hashtags count: ${hashtags.length}`);
   }
 
   return {
@@ -1501,7 +1383,7 @@ function validatePost(post, markets) {
 }
 
 /* =======================================================
-   DUPLICATE
+   DUPLICATE CHECK
 ======================================================= */
 
 function isDuplicate(content) {
@@ -1600,10 +1482,6 @@ function publishToSquare(content) {
 ======================================================= */
 
 async function savePost(post, result) {
-  if (!Array.isArray(state.history)) {
-    state.history = [];
-  }
-
   state.history.push({
     id: result.id || null,
 
@@ -1630,7 +1508,9 @@ async function savePost(post, result) {
 
   if (!result.dryRun) {
     state.postsToday++;
+
     state.totalPosts++;
+
     state.lastPostAt = new Date().toISOString();
   }
 
@@ -1646,7 +1526,7 @@ async function runCycle() {
 
   console.log("\n================================================");
 
-  console.log("🚀 BINANCE SQUARE AI BOT V3.0.0");
+  console.log("🚀 BINANCE SQUARE AI BOT V3.1.0");
 
   console.log("================================================");
 
@@ -1663,15 +1543,17 @@ async function runCycle() {
   try {
     const markets = await getMarketData();
 
+    console.log("\n📰 Researching...");
+
     const news = await researchNews(markets);
 
-    console.log("\n📰 Research summary received.");
+    console.log("📰 Research summary received.");
 
     const post = await generatePost(markets, news);
 
     console.log("\n📝 Topic:", post.topic);
 
-    console.log("⭐ Quality:", `${post.qualityScore}/10`);
+    console.log("⭐ Quality:", post.qualityScore + "/10");
 
     console.log("📰 News used:", post.newsUsed);
 
@@ -1689,21 +1571,33 @@ async function runCycle() {
       return;
     }
 
-    console.log("\n🛡️ Running basic safety check...");
+    console.log("\n🛡️ Running safety check...");
 
-    const validation = validatePost(post, markets);
+    const validation = validatePost(post);
 
     if (validation.reasons.length > 0) {
-      console.log("⚠️ Warnings (but we'll still post):");
+      console.log("⚠️ Warnings:");
 
       for (const reason of validation.reasons) {
         console.log(`   • ${reason}`);
       }
+
+      /*
+      We intentionally don't reject.
+      */
     } else {
-      console.log("   ✓ All safety checks passed.");
+      console.log("   ✓ Safety checks passed.");
     }
 
-    console.log("   ✓ Duplicate check disabled – posting.");
+    const duplicate = isDuplicate(post.content);
+
+    if (duplicate.duplicate) {
+      console.log(
+        "⚠️ Duplicate detected, but duplicate protection is disabled.",
+      );
+    }
+
+    console.log("   ✓ Duplicate protection disabled.");
 
     const result = await publishToSquare(post.content);
 
@@ -1766,7 +1660,6 @@ function formatPercent(number) {
 ======================================================= */
 
 let shuttingDown = false;
-
 let httpServer = null;
 
 async function shutdown(signal) {
@@ -1788,20 +1681,6 @@ async function shutdown(signal) {
 
       process.exit(0);
     });
-
-    /*
-      Safety timeout.
-
-      If the HTTP server refuses
-      to close, don't keep the
-      process hanging forever.
-    */
-
-    setTimeout(() => {
-      console.log("👋 Force stopping process.");
-
-      process.exit(0);
-    }, 5000);
   } else {
     console.log("👋 Bot stopped safely.");
 
@@ -1814,7 +1693,43 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 /* =======================================================
-   START – BOT + HTTP SERVER
+   HEALTH SERVER
+======================================================= */
+
+function startHealthServer() {
+  const PORT = process.env.PORT || 3000;
+
+  httpServer = http.createServer((req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        status: "alive",
+
+        postsToday: state.postsToday,
+
+        totalPosts: state.totalPosts,
+
+        totalFailures: state.totalFailures,
+
+        uptime: process.uptime(),
+
+        timestamp: new Date().toISOString(),
+      }),
+    );
+  });
+
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(`🟢 Health server running on port ${PORT}`);
+
+    console.log("🚀 Production server is ready.");
+  });
+}
+
+/* =======================================================
+   START
 ======================================================= */
 
 async function startBotAndServer() {
@@ -1823,9 +1738,9 @@ async function startBotAndServer() {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V3.0.0           ║
+║       🤖 BINANCE SQUARE AI BOT V3.1.0           ║
 ║                                                  ║
-║       PRODUCTION SAFE                            ║
+║     Binance → CoinGecko → Coinbase fallback     ║
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
 `);
@@ -1834,15 +1749,17 @@ async function startBotAndServer() {
 
   console.log(`🧠 Model: ${GROQ_MODEL}`);
 
-  console.log(`⚡ TPM optimization: ENABLED`);
+  console.log(`⚡ Production fallback: ENABLED`);
 
   console.log(`⏱️ Interval: ${POST_INTERVAL_MINUTES} minutes`);
 
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
 
-  console.log(`📊 Binance: multi-endpoint`);
+  console.log(`📊 Binance market data: PRIMARY`);
 
-  console.log(`🔄 CoinGecko: bulk fallback + retry`);
+  console.log(`🌐 CoinGecko: BULK FALLBACK`);
+
+  console.log(`📈 Coinbase candles: TECHNICAL FALLBACK`);
 
   console.log(`📰 Live news research: DISABLED`);
 
@@ -1856,79 +1773,25 @@ async function startBotAndServer() {
 
   console.log(`❓ Question pool size: ${QUESTION_POOL.length}`);
 
-  /* =====================================================
-     HEALTH SERVER FIRST
-  ===================================================== */
+  /*
+  START HEALTH SERVER FIRST.
 
-  const PORT = Number(process.env.PORT) || 3000;
+  This is important on Render.
 
-  httpServer = http.createServer((req, res) => {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
+  Render sees the service as healthy
+  even if market-data collection takes
+  some time.
+  */
 
-      "Cache-Control": "no-cache",
-    });
-
-    res.end(
-      JSON.stringify({
-        status: "alive",
-
-        postsToday: state.postsToday,
-
-        totalPosts: state.totalPosts,
-
-        totalFailures: state.totalFailures,
-
-        totalSkipped: state.totalSkipped,
-
-        uptime: process.uptime(),
-
-        timestamp: new Date().toISOString(),
-      }),
-    );
-  });
-
-  httpServer.on("error", (error) => {
-    console.error("❌ HTTP server error:", error.message);
-  });
-
-  await new Promise((resolve, reject) => {
-    httpServer.once("error", reject);
-
-    httpServer.listen(PORT, "0.0.0.0", () => {
-      console.log(`🟢 Health server running on port ${PORT}`);
-
-      resolve();
-    });
-  });
-
-  /* =====================================================
-     SERVER READY
-  ===================================================== */
-
-  console.log("\n🚀 Production server is ready.");
+  startHealthServer();
 
   console.log("🚀 Starting first cycle...");
 
   /*
-    IMPORTANT:
-
-    Do NOT await the first cycle here.
-
-    Render already sees the HTTP server.
+  Do NOT block startup forever.
   */
 
-  runCycle()
-    .then(() => {
-      console.log(`\n⏳ Next cycle in ${POST_INTERVAL_MINUTES} minutes.`);
-    })
-    .catch((error) => {
-      console.error("❌ First cycle failed:", error.message);
-    });
-
-  /* =====================================================
-     CONTINUOUS LOOP
-  ===================================================== */
+  await runCycle();
 
   const interval = POST_INTERVAL_MINUTES * 60 * 1000;
 
@@ -1941,26 +1804,22 @@ async function startBotAndServer() {
       return;
     }
 
-    try {
-      await runCycle();
-    } catch (error) {
-      console.error("❌ Scheduled cycle failed:", error.message);
-    }
+    await runCycle();
 
-    console.log(`\n⏳ Next cycle in ${POST_INTERVAL_MINUTES} minutes.`);
+    console.log(
+      `\n⏳ Next scheduled cycle in ${POST_INTERVAL_MINUTES} minutes.`,
+    );
   }, interval);
 }
 
 /* =======================================================
-   START
+   BOOT
 ======================================================= */
 
 startBotAndServer().catch(async (error) => {
   console.error("💥 Fatal startup error:", error);
 
-  try {
-    await saveState();
-  } catch {}
+  await saveState();
 
   process.exit(1);
 });
