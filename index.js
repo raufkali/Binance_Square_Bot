@@ -10,10 +10,12 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V2.8.2 – Multi‑Endpoint Fix
+BINANCE SQUARE AI BOT V2.9.0 – CoinGecko Fallback
 =========================================================
 - Retry Binance API across api.binance.com, api1, api2, api3
-- Added User-Agent header to avoid 451
+- NEW: If Binance returns HTTP 451 (geo-blocked, common on
+  Render/AWS US regions) on ALL endpoints, automatically
+  fall back to CoinGecko's public API for market data.
 - All previous features: random questions, 4+ hashtags, no rejections
 =========================================================
 */
@@ -57,6 +59,16 @@ const BINANCE_BASE_URLS = [
   "https://api2.binance.com",
   "https://api3.binance.com",
 ];
+
+// CoinGecko fallback (used only if every Binance endpoint 451s / fails)
+const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
+const COINGECKO_IDS = {
+  BTCUSDT: "bitcoin",
+  ETHUSDT: "ethereum",
+  BNBUSDT: "binancecoin",
+  SOLUSDT: "solana",
+  XRPUSDT: "ripple",
+};
 
 /* =======================================================
    COINS (unchanged)
@@ -192,7 +204,7 @@ function resetDailyCounter() {
 }
 
 /* =======================================================
-   HTTP & BINANCE API – Multi‑endpoint with retry
+   HTTP HELPERS
 ======================================================= */
 
 async function fetchWithTimeout(
@@ -209,7 +221,12 @@ async function fetchWithTimeout(
   }
 }
 
-async function get24hData(symbol) {
+/* =======================================================
+   BINANCE API – Multi‑endpoint with retry
+======================================================= */
+
+async function binance24hData(symbol) {
+  let lastStatus = null;
   for (const base of BINANCE_BASE_URLS) {
     const url = `${base}/api/v3/ticker/24hr?symbol=${symbol}`;
     try {
@@ -231,14 +248,18 @@ async function get24hData(symbol) {
           trades: Number(data.count),
         };
       }
+      lastStatus = response.status;
     } catch (e) {
       console.warn(`   ⚠️ 24h endpoint ${base} failed: ${e.message}`);
     }
   }
-  throw new Error(`Binance 24h API all endpoints failed for ${symbol}`);
+  const err = new Error(`Binance 24h API all endpoints failed for ${symbol}`);
+  err.lastStatus = lastStatus;
+  throw err;
 }
 
-async function getKlines(symbol, interval, limit = 50) {
+async function binanceKlines(symbol, interval, limit = 50) {
+  let lastStatus = null;
   for (const base of BINANCE_BASE_URLS) {
     const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
     try {
@@ -257,11 +278,127 @@ async function getKlines(symbol, interval, limit = 50) {
           closeTime: Number(candle[6]),
         }));
       }
+      lastStatus = response.status;
     } catch (e) {
       console.warn(`   ⚠️ Klines endpoint ${base} failed: ${e.message}`);
     }
   }
-  throw new Error(`Binance klines all endpoints failed for ${symbol}`);
+  const err = new Error(`Binance klines all endpoints failed for ${symbol}`);
+  err.lastStatus = lastStatus;
+  throw err;
+}
+
+/* =======================================================
+   COINGECKO FALLBACK
+   Used automatically when every Binance endpoint fails
+   (e.g. HTTP 451 geo-block on Render / AWS US regions).
+   No API key required for basic public endpoints.
+======================================================= */
+
+async function coingecko24hData(symbol) {
+  const id = COINGECKO_IDS[symbol];
+  if (!id) throw new Error(`No CoinGecko mapping for ${symbol}`);
+
+  const url = `${COINGECKO_BASE}/coins/markets?vs_currency=usd&ids=${id}&price_change_percentage=24h`;
+  const response = await fetchWithTimeout(url, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(
+      `CoinGecko 24h API failed for ${symbol}: ${response.status}`,
+    );
+  }
+  const [data] = await response.json();
+  if (!data) throw new Error(`CoinGecko returned no data for ${symbol}`);
+
+  const changePercent = data.price_change_percentage_24h ?? 0;
+  const price = Number(data.current_price);
+  const open =
+    data.price_change_24h != null ? price - data.price_change_24h : price;
+
+  return {
+    symbol,
+    price,
+    open,
+    high: Number(data.high_24h ?? price),
+    low: Number(data.low_24h ?? price),
+    change: Number(data.price_change_24h ?? 0),
+    changePercent: Number(changePercent),
+    volume: Number(data.total_volume ?? 0),
+    quoteVolume: Number(data.total_volume ?? 0),
+    trades: 0, // not available from CoinGecko
+  };
+}
+
+async function coingeckoKlines(symbol, interval, limit = 50) {
+  const id = COINGECKO_IDS[symbol];
+  if (!id) throw new Error(`No CoinGecko mapping for ${symbol}`);
+
+  // CoinGecko auto-buckets granularity by `days`:
+  // days=1 -> ~30min candles, days=7 -> ~4h candles
+  const days = interval === "1h" ? 1 : 7;
+  const url = `${COINGECKO_BASE}/coins/${id}/ohlc?vs_currency=usd&days=${days}`;
+  const response = await fetchWithTimeout(url, {
+    headers: { Accept: "application/json" },
+  });
+  if (!response.ok) {
+    throw new Error(
+      `CoinGecko OHLC API failed for ${symbol}: ${response.status}`,
+    );
+  }
+  const raw = await response.json();
+  const candles = raw.map(([time, open, high, low, close]) => ({
+    openTime: Number(time),
+    open: Number(open),
+    high: Number(high),
+    low: Number(low),
+    close: Number(close),
+    volume: 0, // CoinGecko OHLC endpoint doesn't include volume
+    closeTime: Number(time),
+  }));
+  return candles.slice(-limit);
+}
+
+/* =======================================================
+   UNIFIED FETCHERS (Binance -> CoinGecko fallback)
+======================================================= */
+
+async function get24hData(symbol) {
+  try {
+    return await binance24hData(symbol);
+  } catch (error) {
+    console.warn(
+      `   ↪️ Binance unavailable for ${symbol} (${error.lastStatus || error.message}), trying CoinGecko fallback...`,
+    );
+    try {
+      const data = await coingecko24hData(symbol);
+      console.log(`      ✅ CoinGecko fallback succeeded for ${symbol}`);
+      return data;
+    } catch (fallbackError) {
+      throw new Error(
+        `Binance and CoinGecko both failed for ${symbol}: ${fallbackError.message}`,
+      );
+    }
+  }
+}
+
+async function getKlines(symbol, interval, limit = 50) {
+  try {
+    return await binanceKlines(symbol, interval, limit);
+  } catch (error) {
+    console.warn(
+      `   ↪️ Binance klines unavailable for ${symbol} (${error.lastStatus || error.message}), trying CoinGecko fallback...`,
+    );
+    try {
+      const data = await coingeckoKlines(symbol, interval, limit);
+      console.log(`      ✅ CoinGecko fallback succeeded for ${symbol} klines`);
+      return data;
+    } catch (fallbackError) {
+      throw new Error(
+        `Binance and CoinGecko both failed for ${symbol} klines: ${fallbackError.message}`,
+      );
+    }
+  }
 }
 
 /* =======================================================
@@ -785,7 +922,7 @@ async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 BINANCE SQUARE AI BOT V2.8.2 (Multi‑Endpoint)");
+  console.log("🚀 BINANCE SQUARE AI BOT V2.9.0 (CoinGecko Fallback)");
   console.log("================================================");
   console.log(`🕐 ${new Date().toLocaleString()}`);
   console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
@@ -896,8 +1033,8 @@ async function startBotAndServer() {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V2.8.2           ║
-║          (Multi‑Endpoint Fix)                    ║
+║       🤖 BINANCE SQUARE AI BOT V2.9.0           ║
+║        (CoinGecko Fallback Enabled)              ║
 ╚══════════════════════════════════════════════════╝
 `);
 
@@ -906,7 +1043,9 @@ async function startBotAndServer() {
   console.log(`⚡ TPM optimization: ENABLED`);
   console.log(`⏱️ Interval: ${POST_INTERVAL_MINUTES} minutes`);
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
-  console.log(`📊 Binance market data: ENABLED (multi‑endpoint)`);
+  console.log(
+    `📊 Binance market data: ENABLED (multi‑endpoint + CoinGecko fallback)`,
+  );
   console.log(`📰 Live news research: DISABLED`);
   console.log(`🛡️ Quality gate: SAFETY ONLY (no rejections)`);
   console.log(`🔎 Duplicate protection: DISABLED`);
