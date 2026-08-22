@@ -10,28 +10,46 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V4.0.0
+BINANCE SQUARE AI BOT V5.0.0
 =========================================================
 
 NEW ARCHITECTURE
 ----------------
-Instead of depending on Binance/CoinGecko market APIs:
 
-    Google News RSS
-          ↓
-    Fresh crypto topics
-          ↓
-        Groq AI
-          ↓
-    Binance Square post
+The bot NO LONGER uses setInterval().
 
-If web research fails:
+Instead:
 
-    Predefined crypto topic pool
-          ↓
-        Groq AI
-          ↓
-    Binance Square post
+External Scheduler
+        ↓
+POST /post
+        ↓
+Render wakes the service
+        ↓
+Google News RSS
+        ↓
+Groq AI
+        ↓
+Safety validation
+        ↓
+Binance Square
+        ↓
+Save state
+        ↓
+Return response
+
+Render can sleep while there are no requests.
+
+The external scheduler should trigger:
+
+01:00
+01:40
+02:20
+03:00
+03:40
+...
+
+The Node process does NOT wait for the next post.
 
 FEATURES
 --------
@@ -44,12 +62,15 @@ FEATURES
 - Random topic fallback
 - 4+ hashtags
 - 36 posts/day
-- 40-minute interval
+- Fixed external scheduling
 - Persistent state
 - Duplicate protection disabled
 - Safety-only validation
 - Dry-run support
-- Render-compatible HTTP health server
+- Render-compatible HTTP server
+- Secure POST trigger
+- No setInterval
+- No 40-minute internal timer
 =========================================================
 */
 
@@ -61,30 +82,51 @@ const __dirname = path.dirname(__filename);
 ======================================================= */
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 
-const BINANCE_SQUARE_OPENAPI_KEY = process.env.BINANCE_SQUARE_OPENAPI_KEY;
+const GROQ_MODEL =
+  process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 
-const POST_INTERVAL_MINUTES = Number(process.env.POST_INTERVAL_MINUTES || 40);
+const BINANCE_SQUARE_OPENAPI_KEY =
+  process.env.BINANCE_SQUARE_OPENAPI_KEY;
 
-const MAX_POSTS_PER_DAY = Number(process.env.MAX_POSTS_PER_DAY || 36);
+/*
+Secret used by the external scheduler.
 
-const MAX_HISTORY = Number(process.env.MAX_HISTORY || 200);
+Example:
 
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+POST_TRIGGER_SECRET=my-super-secret-value
+*/
 
-const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
+const POST_TRIGGER_SECRET =
+  process.env.POST_TRIGGER_SECRET;
 
-const STATE_FILE = path.join(__dirname, "bot-state.json");
+const MAX_POSTS_PER_DAY =
+  Number(process.env.MAX_POSTS_PER_DAY || 36);
 
-const SQUARE_SCRIPT = path.join(
-  __dirname,
-  ".agents",
-  "skills",
-  "square-post",
-  "scripts",
-  "post-text.mjs",
-);
+const MAX_HISTORY =
+  Number(process.env.MAX_HISTORY || 200);
+
+const REQUEST_TIMEOUT_MS =
+  Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+
+const DRY_RUN =
+  String(process.env.DRY_RUN || "true").toLowerCase() === "true";
+
+const PORT =
+  Number(process.env.PORT || 3000);
+
+const STATE_FILE =
+  path.join(__dirname, "bot-state.json");
+
+const SQUARE_SCRIPT =
+  path.join(
+    __dirname,
+    ".agents",
+    "skills",
+    "square-post",
+    "scripts",
+    "post-text.mjs",
+  );
 
 const GENERATION_MAX_TOKENS = 1300;
 
@@ -92,6 +134,7 @@ const GENERATION_MAX_TOKENS = 1300;
 Google News RSS.
 No API key required.
 */
+
 const GOOGLE_NEWS_URL =
   "https://news.google.com/rss/search?q=crypto%20OR%20bitcoin%20OR%20ethereum%20OR%20binance%20OR%20solana&hl=en-US&gl=US&ceid=US:en";
 
@@ -105,7 +148,21 @@ if (!GROQ_API_KEY) {
 }
 
 if (!BINANCE_SQUARE_OPENAPI_KEY) {
-  console.error("❌ BINANCE_SQUARE_OPENAPI_KEY is missing.");
+  console.error(
+    "❌ BINANCE_SQUARE_OPENAPI_KEY is missing.",
+  );
+  process.exit(1);
+}
+
+if (!POST_TRIGGER_SECRET) {
+  console.error(
+    "❌ POST_TRIGGER_SECRET is missing.",
+  );
+
+  console.error(
+    "   Add POST_TRIGGER_SECRET to your environment variables.",
+  );
+
   process.exit(1);
 }
 
@@ -176,17 +233,34 @@ const TOPICS = [
 
 let state = {
   date: new Date().toISOString().slice(0, 10),
+
   postsToday: 0,
+
   totalPosts: 0,
+
   totalFailures: 0,
+
   totalSkipped: 0,
+
   lastPostAt: null,
+
+  lastTriggerAt: null,
+
+  lastTriggerResult: null,
+
   history: [],
 };
 
+/* =======================================================
+   LOAD STATE
+======================================================= */
+
 async function loadState() {
   try {
-    const raw = await fs.readFile(STATE_FILE, "utf8");
+    const raw = await fs.readFile(
+      STATE_FILE,
+      "utf8",
+    );
 
     const parsed = JSON.parse(raw);
 
@@ -195,9 +269,6 @@ async function loadState() {
       ...parsed,
     };
 
-    /*
-    Protect against corrupted/invalid state.
-    */
     if (!Array.isArray(state.history)) {
       state.history = [];
     }
@@ -217,8 +288,11 @@ async function loadState() {
     if (!Number.isFinite(state.totalSkipped)) {
       state.totalSkipped = 0;
     }
+
   } catch (error) {
-    console.log("ℹ️ No valid state file found. Creating fresh state.");
+    console.log(
+      "ℹ️ No valid state file found. Creating fresh state.",
+    );
 
     await saveState();
   }
@@ -226,35 +300,48 @@ async function loadState() {
   resetDailyCounter();
 }
 
+/* =======================================================
+   SAVE STATE
+======================================================= */
+
 async function saveState() {
   try {
-    /*
-    Write atomically.
-
-    Instead of writing directly to bot-state.json,
-    write a temporary file first and then rename it.
-
-    This greatly reduces the chance of a corrupted
-    JSON file if the process is terminated while saving.
-    */
-
     const tempFile = `${STATE_FILE}.tmp`;
 
-    await fs.writeFile(tempFile, JSON.stringify(state, null, 2), "utf8");
+    await fs.writeFile(
+      tempFile,
+      JSON.stringify(state, null, 2),
+      "utf8",
+    );
 
-    await fs.rename(tempFile, STATE_FILE);
+    await fs.rename(
+      tempFile,
+      STATE_FILE,
+    );
+
   } catch (error) {
-    console.error("⚠️ Failed to save state:", error.message);
+    console.error(
+      "⚠️ Failed to save state:",
+      error.message,
+    );
   }
 }
 
+/* =======================================================
+   DAILY RESET
+======================================================= */
+
 function resetDailyCounter() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today =
+    new Date().toISOString().slice(0, 10);
 
   if (state.date !== today) {
-    console.log("📅 New day detected. Resetting daily counter.");
+    console.log(
+      "📅 New day detected. Resetting daily counter.",
+    );
 
     state.date = today;
+
     state.postsToday = 0;
 
     saveState().catch(() => {});
@@ -262,7 +349,7 @@ function resetDailyCounter() {
 }
 
 /* =======================================================
-   HTTP HELPERS
+   HTTP FETCH WITH TIMEOUT
 ======================================================= */
 
 async function fetchWithTimeout(
@@ -272,13 +359,17 @@ async function fetchWithTimeout(
 ) {
   const controller = new AbortController();
 
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(
+    () => controller.abort(),
+    timeout,
+  );
 
   try {
     return await fetch(url, {
       ...options,
       signal: controller.signal,
     });
+
   } finally {
     clearTimeout(timer);
   }
@@ -310,86 +401,143 @@ function stripHtml(value) {
 ======================================================= */
 
 async function researchWeb() {
-  console.log("\n🌐 Searching the web for fresh crypto topics...");
+  console.log(
+    "\n🌐 Searching the web for fresh crypto topics...",
+  );
 
   try {
-    const response = await fetchWithTimeout(
-      GOOGLE_NEWS_URL,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 CryptoResearchBot/4.0",
-          Accept: "application/rss+xml, application/xml, text/xml",
+    const response =
+      await fetchWithTimeout(
+        GOOGLE_NEWS_URL,
+        {
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 CryptoResearchBot/5.0",
+
+            Accept:
+              "application/rss+xml, application/xml, text/xml",
+          },
         },
-      },
-      REQUEST_TIMEOUT_MS,
-    );
+        REQUEST_TIMEOUT_MS,
+      );
 
     if (!response.ok) {
-      throw new Error(`Google News returned HTTP ${response.status}`);
+      throw new Error(
+        `Google News returned HTTP ${response.status}`,
+      );
     }
 
-    const xml = await response.text();
+    const xml =
+      await response.text();
 
-    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
+    const items = [
+      ...xml.matchAll(
+        /<item>([\s\S]*?)<\/item>/gi,
+      ),
+    ];
 
     if (!items.length) {
-      throw new Error("No news items found in RSS response");
+      throw new Error(
+        "No news items found in RSS response",
+      );
     }
 
     const news = [];
 
-    for (const itemMatch of items.slice(0, 15)) {
+    for (
+      const itemMatch of items.slice(0, 15)
+    ) {
       const item = itemMatch[1];
 
-      const titleMatch = item.match(/<title>([\s\S]*?)<\/title>/i);
+      const titleMatch =
+        item.match(
+          /<title>([\s\S]*?)<\/title>/i,
+        );
 
-      const descriptionMatch = item.match(
-        /<description>([\s\S]*?)<\/description>/i,
-      );
+      const descriptionMatch =
+        item.match(
+          /<description>([\s\S]*?)<\/description>/i,
+        );
 
-      const pubDateMatch = item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+      const pubDateMatch =
+        item.match(
+          /<pubDate>([\s\S]*?)<\/pubDate>/i,
+        );
 
-      if (!titleMatch) continue;
+      if (!titleMatch) {
+        continue;
+      }
 
-      const title = decodeXml(stripHtml(titleMatch[1]));
+      const title =
+        decodeXml(
+          stripHtml(titleMatch[1]),
+        );
 
-      const description = descriptionMatch
-        ? decodeXml(stripHtml(descriptionMatch[1]))
-        : "";
+      const description =
+        descriptionMatch
+          ? decodeXml(
+              stripHtml(
+                descriptionMatch[1],
+              ),
+            )
+          : "";
 
-      const pubDate = pubDateMatch ? decodeXml(pubDateMatch[1]).trim() : "";
+      const pubDate =
+        pubDateMatch
+          ? decodeXml(
+              pubDateMatch[1],
+            ).trim()
+          : "";
 
-      if (!title) continue;
+      if (!title) {
+        continue;
+      }
 
       news.push({
         title,
-        description: description.slice(0, 500),
+
+        description:
+          description.slice(0, 500),
+
         publishedAt: pubDate,
       });
     }
 
     if (!news.length) {
-      throw new Error("RSS contained no usable articles");
+      throw new Error(
+        "RSS contained no usable articles",
+      );
     }
 
-    console.log(`   ✅ Found ${news.length} fresh crypto topics.`);
+    console.log(
+      `   ✅ Found ${news.length} fresh crypto topics.`,
+    );
 
     return news;
-  } catch (error) {
-    console.warn(`   ⚠️ Web research unavailable: ${error.message}`);
 
-    console.log("   ↪️ Using internal crypto topic pool.");
+  } catch (error) {
+    console.warn(
+      `   ⚠️ Web research unavailable: ${error.message}`,
+    );
+
+    console.log(
+      "   ↪️ Using internal crypto topic pool.",
+    );
 
     return [];
   }
 }
 
 /* =======================================================
-   RANDOM TOPIC FALLBACK
+   RANDOM TOPIC
 ======================================================= */
 
 function getRandomTopic() {
-  return TOPICS[Math.floor(Math.random() * TOPICS.length)];
+  return TOPICS[
+    Math.floor(
+      Math.random() * TOPICS.length,
+    )
+  ];
 }
 
 /* =======================================================
@@ -401,9 +549,11 @@ function getRecentPostMemory() {
     .slice(-12)
     .map(
       (post) =>
-        `${post.topic}: ${String(post.text || "")
+        `${post.topic}: ${String(
+          post.text || "",
+        )
           .replace(/\s+/g, " ")
-          .slice(0, 180)}`,
+          .slice(0, 180)`,
     )
     .join("\n");
 }
@@ -417,7 +567,10 @@ function extractJSON(raw) {
     return JSON.parse(raw);
   } catch {}
 
-  const match = String(raw || "").match(/\{[\s\S]*\}/);
+  const match =
+    String(raw || "").match(
+      /\{[\s\S]*\}/,
+    );
 
   if (match) {
     try {
@@ -432,7 +585,11 @@ function extractJSON(raw) {
    GROQ GENERATION
 ======================================================= */
 
-async function callGeneration(prompt, maxTokens, retries = 3) {
+async function callGeneration(
+  prompt,
+  maxTokens,
+  retries = 3,
+) {
   const system = `
 You are an engaging crypto content creator writing for Binance Square.
 
@@ -455,9 +612,11 @@ You can discuss:
 - general crypto discussions
 
 IMPORTANT:
+
 You do NOT have guaranteed real-time market data.
 
 Therefore:
+
 - Do not invent exact current prices.
 - Do not invent exact percentage movements.
 - Do not claim a specific breaking event happened unless it appears in the supplied research.
@@ -467,75 +626,110 @@ Therefore:
 - Do not provide financial advice.
 - Do not promise profits.
 - Do not use "buy now" or "sell now".
+- Do not use guaranteed-profit language.
 
 The post should feel like a real Binance Square creator wrote it.
 
 Output ONLY valid JSON.
 `;
 
-  for (let attempt = 1; attempt <= retries; attempt++) {
+  for (
+    let attempt = 1;
+    attempt <= retries;
+    attempt++
+  ) {
     try {
-      const response = await groq.chat.completions.create({
-        model: GROQ_MODEL,
+      const response =
+        await groq.chat.completions.create({
+          model: GROQ_MODEL,
 
-        messages: [
-          {
-            role: "system",
-            content: system,
+          messages: [
+            {
+              role: "system",
+              content: system,
+            },
+
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+
+          temperature: 0.9,
+
+          max_completion_tokens:
+            maxTokens,
+
+          response_format: {
+            type: "json_object",
           },
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+        });
 
-        temperature: 0.9,
-
-        max_completion_tokens: maxTokens,
-
-        response_format: {
-          type: "json_object",
-        },
-      });
-
-      const raw = response.choices?.[0]?.message?.content;
+      const raw =
+        response.choices?.[0]
+          ?.message?.content;
 
       if (!raw) {
-        throw new Error("Groq returned an empty response");
+        throw new Error(
+          "Groq returned an empty response",
+        );
       }
 
-      const parsed = extractJSON(raw);
+      const parsed =
+        extractJSON(raw);
 
       if (!parsed) {
-        throw new Error("Groq returned invalid JSON");
+        throw new Error(
+          "Groq returned invalid JSON",
+        );
       }
 
       return {
-        title: parsed.title || "Crypto Market Update",
+        title:
+          parsed.title ||
+          "Crypto Market Update",
 
-        topic: parsed.topic || "crypto",
+        topic:
+          parsed.topic ||
+          "crypto",
 
-        content: parsed.content || "Crypto market discussion.",
+        content:
+          parsed.content ||
+          "Crypto market discussion.",
 
         qualityScore:
-          typeof parsed.qualityScore === "number" ? parsed.qualityScore : 8,
+          typeof parsed.qualityScore ===
+          "number"
+            ? parsed.qualityScore
+            : 8,
 
-        newsUsed: Boolean(parsed.newsUsed),
+        newsUsed:
+          Boolean(parsed.newsUsed),
 
-        catalystConfidence: parsed.catalystConfidence || "NONE",
+        catalystConfidence:
+          parsed.catalystConfidence ||
+          "NONE",
 
-        skip: Boolean(parsed.skip),
+        skip:
+          Boolean(parsed.skip),
 
-        skipReason: parsed.skipReason || "",
+        skipReason:
+          parsed.skipReason || "",
       };
+
     } catch (error) {
-      console.warn(`   ⚠️ Groq attempt ${attempt} failed: ${error.message}`);
+      console.warn(
+        `   ⚠️ Groq attempt ${attempt} failed: ${error.message}`,
+      );
 
       if (attempt === retries) {
         throw error;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await new Promise(
+        (resolve) =>
+          setTimeout(resolve, 1500),
+      );
     }
   }
 }
@@ -544,49 +738,120 @@ Output ONLY valid JSON.
    HASHTAGS
 ======================================================= */
 
-function ensureHashtags(content, topic = "crypto") {
-  const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
+function ensureHashtags(
+  content,
+  topic = "crypto",
+) {
+  const hashtags =
+    content.match(
+      /#[a-zA-Z0-9_]+/g,
+    ) || [];
 
   const required = 4;
 
-  const missing = required - hashtags.length;
+  const missing =
+    required - hashtags.length;
 
   if (missing <= 0) {
     return content;
   }
 
   const defaultTags = {
-    bitcoin: ["#Bitcoin", "#BTC", "#Crypto", "#Binance"],
+    bitcoin: [
+      "#Bitcoin",
+      "#BTC",
+      "#Crypto",
+      "#Binance",
+    ],
 
-    btc: ["#Bitcoin", "#BTC", "#Crypto", "#Trading"],
+    btc: [
+      "#Bitcoin",
+      "#BTC",
+      "#Crypto",
+      "#Trading",
+    ],
 
-    ethereum: ["#Ethereum", "#ETH", "#Crypto", "#Binance"],
+    ethereum: [
+      "#Ethereum",
+      "#ETH",
+      "#Crypto",
+      "#Binance",
+    ],
 
-    eth: ["#Ethereum", "#ETH", "#Crypto", "#Altcoins"],
+    eth: [
+      "#Ethereum",
+      "#ETH",
+      "#Crypto",
+      "#Altcoins",
+    ],
 
-    bnb: ["#BNB", "#Binance", "#Crypto", "#BSC"],
+    bnb: [
+      "#BNB",
+      "#Binance",
+      "#Crypto",
+      "#BSC",
+    ],
 
-    solana: ["#Solana", "#SOL", "#Crypto", "#Blockchain"],
+    solana: [
+      "#Solana",
+      "#SOL",
+      "#Crypto",
+      "#Blockchain",
+    ],
 
-    sol: ["#Solana", "#SOL", "#Crypto", "#Blockchain"],
+    sol: [
+      "#Solana",
+      "#SOL",
+      "#Crypto",
+      "#Blockchain",
+    ],
 
-    xrp: ["#XRP", "#Ripple", "#Crypto", "#Payments"],
+    xrp: [
+      "#XRP",
+      "#Ripple",
+      "#Crypto",
+      "#Payments",
+    ],
 
-    market: ["#Crypto", "#Market", "#Trading", "#Binance"],
+    market: [
+      "#Crypto",
+      "#Market",
+      "#Trading",
+      "#Binance",
+    ],
 
-    crypto: ["#Crypto", "#Binance", "#Trading", "#Blockchain"],
+    crypto: [
+      "#Crypto",
+      "#Binance",
+      "#Trading",
+      "#Blockchain",
+    ],
   };
 
-  const normalizedTopic = String(topic || "crypto")
-    .toLowerCase()
-    .trim();
+  const normalizedTopic =
+    String(topic || "crypto")
+      .toLowerCase()
+      .trim();
 
-  const tags = defaultTags[normalizedTopic] || defaultTags.crypto;
+  const tags =
+    defaultTags[normalizedTopic] ||
+    defaultTags.crypto;
 
-  const existing = new Set(hashtags.map((tag) => tag.toLowerCase()));
+  const existing =
+    new Set(
+      hashtags.map(
+        (tag) =>
+          tag.toLowerCase(),
+      ),
+    );
 
   const toAdd = tags
-    .filter((tag) => !existing.has(tag.toLowerCase()))
+    .filter(
+      (tag) =>
+        !existing.has(
+          tag.toLowerCase(),
+        ),
+    )
     .slice(0, missing);
 
   const fallback = [
@@ -603,25 +868,47 @@ function ensureHashtags(content, topic = "crypto") {
     }
 
     if (
-      !existing.has(tag.toLowerCase()) &&
-      !toAdd.some((x) => x.toLowerCase() === tag.toLowerCase())
+      !existing.has(
+        tag.toLowerCase(),
+      ) &&
+      !toAdd.some(
+        (x) =>
+          x.toLowerCase() ===
+          tag.toLowerCase(),
+      )
     ) {
       toAdd.push(tag);
     }
   }
 
-  const lines = String(content).split("\n");
+  const lines =
+    String(content).split("\n");
 
-  let insertIndex = lines.length;
+  let insertIndex =
+    lines.length;
 
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (lines[i].toLowerCase().includes("not financial advice")) {
+  for (
+    let i = lines.length - 1;
+    i >= 0;
+    i--
+  ) {
+    if (
+      lines[i]
+        .toLowerCase()
+        .includes(
+          "not financial advice",
+        )
+    ) {
       insertIndex = i;
       break;
     }
   }
 
-  lines.splice(insertIndex, 0, toAdd.join(" "));
+  lines.splice(
+    insertIndex,
+    0,
+    toAdd.join(" "),
+  );
 
   return lines.join("\n");
 }
@@ -630,29 +917,40 @@ function ensureHashtags(content, topic = "crypto") {
    GENERATE POST
 ======================================================= */
 
-async function generatePost(newsResearch) {
-  const recentPosts = getRecentPostMemory();
+async function generatePost(
+  newsResearch,
+) {
+  const recentPosts =
+    getRecentPostMemory();
 
   let selectedNews = null;
 
-  if (Array.isArray(newsResearch) && newsResearch.length > 0) {
-    /*
-    Randomly choose one of the recent topics
-    rather than always using the first result.
-    */
-
+  if (
+    Array.isArray(newsResearch) &&
+    newsResearch.length > 0
+  ) {
     selectedNews =
-      newsResearch[Math.floor(Math.random() * newsResearch.length)];
+      newsResearch[
+        Math.floor(
+          Math.random() *
+            newsResearch.length,
+        )
+      ];
   }
 
-  const fallbackTopic = getRandomTopic();
+  const fallbackTopic =
+    getRandomTopic();
 
   console.log("\n🎯 Selected topic:");
 
   if (selectedNews) {
-    console.log(`   📰 ${selectedNews.title}`);
+    console.log(
+      `   📰 ${selectedNews.title}`,
+    );
   } else {
-    console.log(`   💡 ${fallbackTopic}`);
+    console.log(
+      `   💡 ${fallbackTopic}`,
+    );
   }
 
   let researchBlock = "NONE";
@@ -719,17 +1017,32 @@ Return:
 `;
 
   try {
-    let post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
+    const post =
+      await callGeneration(
+        prompt,
+        GENERATION_MAX_TOKENS,
+        3,
+      );
 
-    post.content = ensureHashtags(post.content, post.topic);
+    post.content =
+      ensureHashtags(
+        post.content,
+        post.topic,
+      );
 
     return post;
+
   } catch (error) {
-    console.error("⚠️ Generation failed.");
+    console.error(
+      "⚠️ Generation failed.",
+    );
 
     console.error(error.message);
 
-    return buildFallbackPost(selectedNews, fallbackTopic);
+    return buildFallbackPost(
+      selectedNews,
+      fallbackTopic,
+    );
   }
 }
 
@@ -737,8 +1050,13 @@ Return:
    FALLBACK POST
 ======================================================= */
 
-function buildFallbackPost(selectedNews, fallbackTopic) {
-  const topic = selectedNews?.title || fallbackTopic;
+function buildFallbackPost(
+  selectedNews,
+  fallbackTopic,
+) {
+  const topic =
+    selectedNews?.title ||
+    fallbackTopic;
 
   const templates = [
     `🚀 Crypto is always moving, but the interesting part isn't just the price.
@@ -780,20 +1098,37 @@ Drop your opinion below 👇
 Not financial advice.`,
   ];
 
-  const content = templates[Math.floor(Math.random() * templates.length)];
+  const content =
+    templates[
+      Math.floor(
+        Math.random() *
+          templates.length,
+      )
+    ];
 
   return {
-    title: `Crypto Talk: ${String(topic).slice(0, 55)}`,
+    title:
+      `Crypto Talk: ${String(
+        topic,
+      ).slice(0, 55)}`,
 
     topic: "crypto",
 
-    content: ensureHashtags(content, "crypto"),
+    content:
+      ensureHashtags(
+        content,
+        "crypto",
+      ),
 
     qualityScore: 7,
 
-    newsUsed: Boolean(selectedNews),
+    newsUsed:
+      Boolean(selectedNews),
 
-    catalystConfidence: selectedNews ? "LOW" : "NONE",
+    catalystConfidence:
+      selectedNews
+        ? "LOW"
+        : "NONE",
 
     skip: false,
 
@@ -815,13 +1150,19 @@ function validatePost(post) {
     };
   }
 
-  const content = String(post.content || "").trim();
+  const content =
+    String(
+      post.content || "",
+    ).trim();
 
   if (content.length < 50) {
-    reasons.push("post is too short");
+    reasons.push(
+      "post is too short",
+    );
   }
 
-  const lower = content.toLowerCase();
+  const lower =
+    content.toLowerCase();
 
   const forbidden = [
     "guaranteed profit",
@@ -838,19 +1179,28 @@ function validatePost(post) {
   ];
 
   for (const phrase of forbidden) {
-    if (lower.includes(phrase)) {
-      reasons.push(`forbidden phrase: ${phrase}`);
+    if (
+      lower.includes(phrase)
+    ) {
+      reasons.push(
+        `forbidden phrase: ${phrase}`,
+      );
     }
   }
 
-  const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
+  const hashtags =
+    content.match(
+      /#[a-zA-Z0-9_]+/g,
+    ) || [];
 
   if (hashtags.length < 4) {
-    reasons.push(`hashtags count: ${hashtags.length}`);
+    reasons.push(
+      `hashtags count: ${hashtags.length}`,
+    );
   }
 
   return {
-    valid: true,
+    valid: reasons.length === 0,
     reasons,
   };
 }
@@ -870,252 +1220,834 @@ function isDuplicate() {
    PUBLISH TO BINANCE SQUARE
 ======================================================= */
 
-function publishToSquare(content) {
-  return new Promise((resolve, reject) => {
-    console.log("\n📡 Publishing to Binance Square...");
+function publishToSquare(
+  content,
+) {
+  return new Promise(
+    (resolve, reject) => {
+      console.log(
+        "\n📡 Publishing to Binance Square...",
+      );
 
-    if (DRY_RUN) {
-      console.log("🧪 DRY_RUN=true");
-
-      console.log("   No real publication will occur.");
-
-      console.log("\n----- GENERATED POST -----\n");
-
-      console.log(content);
-
-      console.log("\n--------------------------\n");
-
-      resolve({
-        success: true,
-        dryRun: true,
-      });
-
-      return;
-    }
-
-    const child = spawn("node", [SQUARE_SCRIPT, "--text", content], {
-      cwd: path.join(__dirname, ".agents", "skills", "square-post"),
-
-      env: {
-        ...process.env,
-        BINANCE_SQUARE_OPENAPI_KEY,
-      },
-
-      shell: false,
-
-      windowsHide: true,
-    });
-
-    let stdout = "";
-    let stderr = "";
-
-    child.stdout.on("data", (data) => {
-      const text = data.toString();
-
-      stdout += text;
-
-      process.stdout.write(text);
-    });
-
-    child.stderr.on("data", (data) => {
-      const text = data.toString();
-
-      stderr += text;
-
-      process.stderr.write(text);
-    });
-
-    child.on("error", reject);
-
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(
-          new Error(`Square publisher exited with code ${code}\n${stderr}`),
+      if (DRY_RUN) {
+        console.log(
+          "🧪 DRY_RUN=true",
         );
+
+        console.log(
+          "   No real publication will occur.",
+        );
+
+        console.log(
+          "\n----- GENERATED POST -----\n",
+        );
+
+        console.log(content);
+
+        console.log(
+          "\n--------------------------\n",
+        );
+
+        resolve({
+          success: true,
+          dryRun: true,
+        });
 
         return;
       }
 
-      const id = stdout.match(/ID:\s*(.+)/i)?.[1]?.trim() || null;
+      const child =
+        spawn(
+          "node",
+          [
+            SQUARE_SCRIPT,
+            "--text",
+            content,
+          ],
+          {
+            cwd: path.join(
+              __dirname,
+              ".agents",
+              "skills",
+              "square-post",
+            ),
 
-      const link = stdout.match(/Link:\s*(.+)/i)?.[1]?.trim() || null;
+            env: {
+              ...process.env,
+              BINANCE_SQUARE_OPENAPI_KEY,
+            },
 
-      resolve({
-        success: true,
-        id,
-        link,
-        stdout,
-      });
-    });
-  });
+            shell: false,
+
+            windowsHide: true,
+          },
+        );
+
+      let stdout = "";
+
+      let stderr = "";
+
+      child.stdout.on(
+        "data",
+        (data) => {
+          const text =
+            data.toString();
+
+          stdout += text;
+
+          process.stdout.write(
+            text,
+          );
+        },
+      );
+
+      child.stderr.on(
+        "data",
+        (data) => {
+          const text =
+            data.toString();
+
+          stderr += text;
+
+          process.stderr.write(
+            text,
+          );
+        },
+      );
+
+      child.on(
+        "error",
+        reject,
+      );
+
+      child.on(
+        "close",
+        (code) => {
+          if (code !== 0) {
+            reject(
+              new Error(
+                `Square publisher exited with code ${code}\n${stderr}`,
+              ),
+            );
+
+            return;
+          }
+
+          const id =
+            stdout.match(
+              /ID:\s*(.+)/i,
+            )?.[1]?.trim() ||
+            null;
+
+          const link =
+            stdout.match(
+              /Link:\s*(.+)/i,
+            )?.[1]?.trim() ||
+            null;
+
+          resolve({
+            success: true,
+            id,
+            link,
+            stdout,
+          });
+        },
+      );
+    },
+  );
 }
 
 /* =======================================================
    SAVE POST
 ======================================================= */
 
-async function savePost(post, result) {
+async function savePost(
+  post,
+  result,
+) {
   state.history.push({
-    id: result.id || null,
+    id:
+      result.id || null,
 
-    title: post.title || null,
+    title:
+      post.title || null,
 
-    topic: post.topic || "crypto",
+    topic:
+      post.topic || "crypto",
 
-    text: post.content,
+    text:
+      post.content,
 
-    qualityScore: post.qualityScore,
+    qualityScore:
+      post.qualityScore,
 
-    newsUsed: Boolean(post.newsUsed),
+    newsUsed:
+      Boolean(post.newsUsed),
 
-    catalystConfidence: post.catalystConfidence,
+    catalystConfidence:
+      post.catalystConfidence,
 
-    publishedAt: new Date().toISOString(),
+    publishedAt:
+      new Date().toISOString(),
 
-    dryRun: Boolean(result.dryRun),
+    dryRun:
+      Boolean(result.dryRun),
   });
 
-  if (state.history.length > MAX_HISTORY) {
-    state.history = state.history.slice(-MAX_HISTORY);
+  if (
+    state.history.length >
+    MAX_HISTORY
+  ) {
+    state.history =
+      state.history.slice(
+        -MAX_HISTORY,
+      );
   }
 
   if (!result.dryRun) {
     state.postsToday++;
+
     state.totalPosts++;
-    state.lastPostAt = new Date().toISOString();
+
+    state.lastPostAt =
+      new Date().toISOString();
   }
 
   await saveState();
 }
 
 /* =======================================================
-   MAIN CYCLE
+   MAIN POST CYCLE
 ======================================================= */
 
 async function runCycle() {
   resetDailyCounter();
 
-  console.log("\n================================================");
+  console.log(
+    "\n================================================",
+  );
 
-  console.log("🚀 BINANCE SQUARE AI BOT V4.0.0");
+  console.log(
+    "🚀 BINANCE SQUARE AI BOT V5.0.0",
+  );
 
-  console.log("================================================");
+  console.log(
+    "================================================",
+  );
 
-  console.log(`🕐 ${new Date().toLocaleString()}`);
+  console.log(
+    `🕐 ${new Date().toLocaleString()}`,
+  );
 
-  console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
+  console.log(
+    `📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`,
+  );
 
-  if (state.postsToday >= MAX_POSTS_PER_DAY) {
-    console.log("\n🛑 Daily limit reached.");
+  if (
+    state.postsToday >=
+    MAX_POSTS_PER_DAY
+  ) {
+    console.log(
+      "\n🛑 Daily limit reached.",
+    );
 
-    return;
+    return {
+      success: false,
+      skipped: true,
+      reason: "daily_limit",
+    };
   }
 
   try {
-    /*
-    ==============================================
-    WEB RESEARCH
-    ==============================================
-    */
+    /* ==============================================
+       WEB RESEARCH
+       ============================================== */
 
-    const news = await researchWeb();
+    const news =
+      await researchWeb();
 
-    console.log(`\n📰 Research items available: ${news.length}`);
+    console.log(
+      `\n📰 Research items available: ${news.length}`,
+    );
 
-    /*
-    ==============================================
-    AI GENERATION
-    ==============================================
-    */
+    /* ==============================================
+       AI GENERATION
+       ============================================== */
 
-    const post = await generatePost(news);
+    const post =
+      await generatePost(news);
 
-    console.log("\n📝 Topic:", post.topic);
+    console.log(
+      "\n📝 Topic:",
+      post.topic,
+    );
 
-    console.log("⭐ Quality:", `${post.qualityScore}/10`);
+    console.log(
+      "⭐ Quality:",
+      `${post.qualityScore}/10`,
+    );
 
-    console.log("📰 Web research used:", post.newsUsed);
+    console.log(
+      "📰 Web research used:",
+      post.newsUsed,
+    );
 
-    console.log("🎯 Catalyst confidence:", post.catalystConfidence);
+    console.log(
+      "🎯 Catalyst confidence:",
+      post.catalystConfidence,
+    );
 
     if (post.skip) {
-      console.log("\n⏭️ AI skipped this cycle.");
+      console.log(
+        "\n⏭️ AI skipped this cycle.",
+      );
 
-      console.log("Reason:", post.skipReason);
+      console.log(
+        "Reason:",
+        post.skipReason,
+      );
 
       state.totalSkipped++;
 
       await saveState();
 
-      return;
+      return {
+        success: false,
+        skipped: true,
+        reason:
+          post.skipReason ||
+          "ai_skip",
+      };
     }
 
-    /*
-    ==============================================
-    SAFETY CHECK
-    ==============================================
-    */
+    /* ==============================================
+       SAFETY CHECK
+       ============================================== */
 
-    console.log("\n🛡️ Running basic safety check...");
+    console.log(
+      "\n🛡️ Running basic safety check...",
+    );
 
-    const validation = validatePost(post);
+    const validation =
+      validatePost(post);
 
-    if (validation.reasons.length > 0) {
-      console.log("⚠️ Warnings (posting anyway):");
+    if (
+      validation.reasons.length > 0
+    ) {
+      console.log(
+        "⚠️ Warnings (posting anyway):",
+      );
 
-      for (const reason of validation.reasons) {
-        console.log(`   • ${reason}`);
+      for (
+        const reason of validation.reasons
+      ) {
+        console.log(
+          `   • ${reason}`,
+        );
       }
     } else {
-      console.log("   ✓ Safety checks passed.");
+      console.log(
+        "   ✓ Safety checks passed.",
+      );
     }
 
-    /*
-    ==============================================
-    DUPLICATE CHECK
-    ==============================================
-    */
+    /* ==============================================
+       DUPLICATE CHECK
+       ============================================== */
 
-    console.log("   ✓ Duplicate protection disabled.");
+    console.log(
+      "   ✓ Duplicate protection disabled.",
+    );
 
-    /*
-    ==============================================
-    PUBLISH
-    ==============================================
-    */
+    /* ==============================================
+       PUBLISH
+       ============================================== */
 
-    const result = await publishToSquare(post.content);
+    const result =
+      await publishToSquare(
+        post.content,
+      );
 
-    await savePost(post, result);
+    await savePost(
+      post,
+      result,
+    );
 
-    console.log("\n╔══════════════════════════════════════════╗");
+    console.log(
+      "\n╔══════════════════════════════════════════╗",
+    );
 
-    console.log("║        ✅ CYCLE COMPLETED               ║");
+    console.log(
+      "║        ✅ CYCLE COMPLETED               ║",
+    );
 
-    console.log("╚══════════════════════════════════════════╝");
+    console.log(
+      "╚══════════════════════════════════════════╝",
+    );
 
     if (result.id) {
-      console.log(`🆔 ID: ${result.id}`);
+      console.log(
+        `🆔 ID: ${result.id}`,
+      );
     }
 
     if (result.link) {
-      console.log(`🔗 ${result.link}`);
+      console.log(
+        `🔗 ${result.link}`,
+      );
     }
 
     if (result.dryRun) {
-      console.log("🧪 DRY RUN — not published.");
+      console.log(
+        "🧪 DRY RUN — not published.",
+      );
     }
+
+    return {
+      success: true,
+      id: result.id || null,
+      link: result.link || null,
+      dryRun:
+        Boolean(result.dryRun),
+    };
+
   } catch (error) {
     state.totalFailures++;
 
     await saveState();
 
-    console.error("\n❌ Cycle error:");
+    console.error(
+      "\n❌ Cycle error:",
+    );
 
-    console.error(error?.message || error);
+    console.error(
+      error?.message || error,
+    );
 
-    console.log("🛡️ Bot remains alive.");
+    return {
+      success: false,
+      error:
+        error?.message ||
+        "Unknown cycle error",
+    };
   }
+}
+
+/* =======================================================
+   SAFE CYCLE WRAPPER
+======================================================= */
+
+let cycleRunning = false;
+
+async function safeRunCycle() {
+  if (cycleRunning) {
+    console.log(
+      "⚠️ Previous cycle is still running.",
+    );
+
+    return {
+      success: false,
+      error:
+        "A post cycle is already running.",
+    };
+  }
+
+  cycleRunning = true;
+
+  try {
+    return await runCycle();
+
+  } catch (error) {
+    console.error(
+      "❌ Unexpected cycle error:",
+      error.message,
+    );
+
+    return {
+      success: false,
+      error: error.message,
+    };
+
+  } finally {
+    cycleRunning = false;
+  }
+}
+
+/* =======================================================
+   AUTHORIZATION
+======================================================= */
+
+function isAuthorized(req) {
+  const authorization =
+    req.headers.authorization;
+
+  if (!authorization) {
+    return false;
+  }
+
+  const expected =
+    `Bearer ${POST_TRIGGER_SECRET}`;
+
+  return authorization === expected;
+}
+
+/* =======================================================
+   REQUEST BODY
+======================================================= */
+
+async function readRequestBody(
+  req,
+) {
+  return new Promise(
+    (resolve, reject) => {
+      let body = "";
+
+      req.on(
+        "data",
+        (chunk) => {
+          body += chunk.toString();
+
+          /*
+          Protect against unnecessarily
+          large request bodies.
+          */
+
+          if (body.length > 10000) {
+            reject(
+              new Error(
+                "Request body too large.",
+              ),
+            );
+
+            req.destroy();
+          }
+        },
+      );
+
+      req.on(
+        "end",
+        () => {
+          resolve(body);
+        },
+      );
+
+      req.on(
+        "error",
+        reject,
+      );
+    },
+  );
+}
+
+/* =======================================================
+   JSON RESPONSE
+======================================================= */
+
+function sendJSON(
+  res,
+  statusCode,
+  data,
+) {
+  res.writeHead(
+    statusCode,
+    {
+      "Content-Type":
+        "application/json; charset=utf-8",
+
+      "Cache-Control":
+        "no-store",
+    },
+  );
+
+  res.end(
+    JSON.stringify(
+      data,
+      null,
+      2,
+    ),
+  );
+}
+
+/* =======================================================
+   HTTP SERVER
+======================================================= */
+
+let httpServer = null;
+
+async function startServer() {
+  httpServer =
+    http.createServer(
+      async (req, res) => {
+        try {
+          /* ==========================================
+             HEALTH / ROOT
+             ========================================== */
+
+          if (
+            req.method === "GET" &&
+            (req.url === "/" ||
+              req.url === "/health")
+          ) {
+            resetDailyCounter();
+
+            return sendJSON(
+              res,
+              200,
+              {
+                status: "alive",
+
+                service:
+                  "binance-square-ai-bot",
+
+                version:
+                  "5.0.0",
+
+                postsToday:
+                  state.postsToday,
+
+                maxPostsPerDay:
+                  MAX_POSTS_PER_DAY,
+
+                totalPosts:
+                  state.totalPosts,
+
+                totalFailures:
+                  state.totalFailures,
+
+                totalSkipped:
+                  state.totalSkipped,
+
+                uptime:
+                  process.uptime(),
+
+                lastPostAt:
+                  state.lastPostAt,
+
+                lastTriggerAt:
+                  state.lastTriggerAt,
+
+                lastTriggerResult:
+                  state.lastTriggerResult,
+
+                cycleRunning,
+              },
+            );
+          }
+
+          /* ==========================================
+             POST TRIGGER
+             ========================================== */
+
+          if (
+            req.method === "POST" &&
+            req.url === "/post"
+          ) {
+            console.log(
+              "\n📥 POST trigger received.",
+            );
+
+            /* ------------------------------------------
+               AUTH
+               ------------------------------------------ */
+
+            if (!isAuthorized(req)) {
+              console.log(
+                "❌ Unauthorized POST trigger.",
+              );
+
+              return sendJSON(
+                res,
+                401,
+                {
+                  success: false,
+                  error:
+                    "Unauthorized.",
+                },
+              );
+            }
+
+            /* ------------------------------------------
+               CONCURRENT PROTECTION
+               ------------------------------------------ */
+
+            if (cycleRunning) {
+              console.log(
+                "⚠️ Post cycle already running.",
+              );
+
+              return sendJSON(
+                res,
+                409,
+                {
+                  success: false,
+                  error:
+                    "A post cycle is already running.",
+                },
+              );
+            }
+
+            /*
+            Read body even though we don't
+            currently require anything from it.
+            This allows schedulers that send
+            JSON bodies to work normally.
+            */
+
+            try {
+              await readRequestBody(req);
+            } catch (error) {
+              console.warn(
+                "⚠️ Request body warning:",
+                error.message,
+              );
+            }
+
+            state.lastTriggerAt =
+              new Date().toISOString();
+
+            await saveState();
+
+            console.log(
+              "🚀 Starting requested post cycle...",
+            );
+
+            const result =
+              await safeRunCycle();
+
+            state.lastTriggerResult =
+              result;
+
+            await saveState();
+
+            if (result.success) {
+              return sendJSON(
+                res,
+                200,
+                {
+                  success: true,
+
+                  message:
+                    "Post cycle completed.",
+
+                  result,
+
+                  postsToday:
+                    state.postsToday,
+
+                  totalPosts:
+                    state.totalPosts,
+
+                  lastPostAt:
+                    state.lastPostAt,
+                },
+              );
+            }
+
+            if (result.skipped) {
+              return sendJSON(
+                res,
+                200,
+                {
+                  success: false,
+
+                  skipped: true,
+
+                  reason:
+                    result.reason,
+
+                  postsToday:
+                    state.postsToday,
+                },
+              );
+            }
+
+            return sendJSON(
+              res,
+              500,
+              {
+                success: false,
+
+                message:
+                  "Post cycle failed.",
+
+                error:
+                  result.error ||
+                  "Unknown error",
+
+                postsToday:
+                  state.postsToday,
+
+                totalFailures:
+                  state.totalFailures,
+              },
+            );
+          }
+
+          /* ==========================================
+             UNKNOWN ROUTE
+             ========================================== */
+
+          return sendJSON(
+            res,
+            404,
+            {
+              success: false,
+
+              error:
+                "Route not found.",
+
+              availableRoutes: [
+                "GET /",
+                "GET /health",
+                "POST /post",
+              ],
+            },
+          );
+
+        } catch (error) {
+          console.error(
+            "❌ HTTP request error:",
+            error,
+          );
+
+          return sendJSON(
+            res,
+            500,
+            {
+              success: false,
+
+              error:
+                "Internal server error.",
+            },
+          );
+        }
+      },
+    );
+
+  await new Promise(
+    (resolve, reject) => {
+      httpServer.once(
+        "error",
+        reject,
+      );
+
+      httpServer.listen(
+        PORT,
+        "0.0.0.0",
+        () => {
+          console.log(
+            `🟢 HTTP server running on port ${PORT}`,
+          );
+
+          console.log(
+            "🚀 Production server is ready.",
+          );
+
+          resolve();
+        },
+      );
+    },
+  );
 }
 
 /* =======================================================
@@ -1123,8 +2055,6 @@ async function runCycle() {
 ======================================================= */
 
 let shuttingDown = false;
-let httpServer = null;
-let cycleRunning = false;
 
 async function shutdown(signal) {
   if (shuttingDown) {
@@ -1133,53 +2063,48 @@ async function shutdown(signal) {
 
   shuttingDown = true;
 
-  console.log(`\n\n🛑 ${signal} received.`);
+  console.log(
+    `\n\n🛑 ${signal} received.`,
+  );
 
-  console.log("💾 Saving state...");
+  console.log(
+    "💾 Saving state...",
+  );
 
   await saveState();
 
   if (httpServer) {
-    httpServer.close(() => {
-      console.log("👋 HTTP server closed.");
+    httpServer.close(
+      () => {
+        console.log(
+          "👋 HTTP server closed.",
+        );
 
-      process.exit(0);
-    });
+        process.exit(0);
+      },
+    );
+
   } else {
-    console.log("👋 Bot stopped safely.");
+    console.log(
+      "👋 Bot stopped safely.",
+    );
 
     process.exit(0);
   }
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT"),
+);
 
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-/* =======================================================
-   SAFE CYCLE WRAPPER
-======================================================= */
-
-async function safeRunCycle() {
-  if (cycleRunning) {
-    console.log("⚠️ Previous cycle is still running. Skipping.");
-
-    return;
-  }
-
-  cycleRunning = true;
-
-  try {
-    await runCycle();
-  } catch (error) {
-    console.error("❌ Unexpected cycle error:", error.message);
-  } finally {
-    cycleRunning = false;
-  }
-}
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM"),
+);
 
 /* =======================================================
-   START BOT + HEALTH SERVER
+   START
 ======================================================= */
 
 async function startBotAndServer() {
@@ -1188,128 +2113,120 @@ async function startBotAndServer() {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V4.0.0           ║
+║       🤖 BINANCE SQUARE AI BOT V5.0.0           ║
 ║                                                  ║
-║          🌐 WEB RESEARCH ARCHITECTURE            ║
+║       ⚡ HTTP TRIGGER ARCHITECTURE               ║
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
 `);
 
-  console.log(`🧠 Provider: Groq`);
+  console.log(
+    `🧠 Provider: Groq`,
+  );
 
-  console.log(`🧠 Model: ${GROQ_MODEL}`);
+  console.log(
+    `🧠 Model: ${GROQ_MODEL}`,
+  );
 
-  console.log(`🌐 Web research: Google News RSS`);
+  console.log(
+    `🌐 Web research: Google News RSS`,
+  );
 
-  console.log(`📊 Binance market API: DISABLED`);
+  console.log(
+    `📊 Binance market API: DISABLED`,
+  );
 
-  console.log(`📈 Technical analysis: DISABLED`);
+  console.log(
+    `📈 Technical analysis: DISABLED`,
+  );
 
-  console.log(`📰 Live news research: ENABLED`);
+  console.log(
+    `📰 Live news research: ENABLED`,
+  );
 
-  console.log(`🛡️ Quality gate: SAFETY ONLY`);
+  console.log(
+    `🛡️ Quality gate: SAFETY ONLY`,
+  );
 
-  console.log(`🔎 Duplicate protection: DISABLED`);
+  console.log(
+    `🔎 Duplicate protection: DISABLED`,
+  );
 
-  console.log(`📡 Binance Square: ENABLED`);
+  console.log(
+    `📡 Binance Square: ENABLED`,
+  );
 
-  console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
+  console.log(
+    `🧪 Dry run: ${
+      DRY_RUN ? "YES" : "NO"
+    }`,
+  );
 
-  console.log(`⏱️ Interval: ${POST_INTERVAL_MINUTES} minutes`);
+  console.log(
+    `🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`,
+  );
 
-  console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
+  console.log(
+    `❓ Topic pool size: ${TOPICS.length}`,
+  );
 
-  console.log(`❓ Topic pool size: ${TOPICS.length}`);
+  console.log(
+    `🔐 POST trigger authentication: ENABLED`,
+  );
 
-  /*
-  ==============================================
-  START HEALTH SERVER FIRST
-  ==============================================
-  */
+  console.log(
+    `⏱️ Internal interval: DISABLED`,
+  );
 
-  const PORT = Number(process.env.PORT || 3000);
-
-  httpServer = http.createServer((req, res) => {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-    });
-
-    res.end(
-      JSON.stringify({
-        status: "alive",
-
-        postsToday: state.postsToday,
-
-        totalPosts: state.totalPosts,
-
-        totalFailures: state.totalFailures,
-
-        uptime: process.uptime(),
-
-        lastPostAt: state.lastPostAt,
-
-        cycleRunning,
-      }),
-    );
-  });
-
-  await new Promise((resolve, reject) => {
-    httpServer.once("error", reject);
-
-    httpServer.listen(PORT, "0.0.0.0", () => {
-      console.log(`🟢 Health server running on port ${PORT}`);
-
-      console.log("🚀 Production server is ready.");
-
-      resolve();
-    });
-  });
+  console.log(
+    `📡 External HTTP scheduling: ENABLED`,
+  );
 
   /*
-  ==============================================
-  FIRST CYCLE
-  ==============================================
+  IMPORTANT:
+
+  There is NO first cycle here.
+
+  The server starts and waits for:
+
+  POST /post
+
+  This prevents Render startup/health checks
+  from accidentally creating a Binance post.
   */
 
-  console.log("\n🚀 Starting first cycle...");
+  await startServer();
 
-  await safeRunCycle();
+  console.log(
+    "\n🟢 Bot is waiting for external triggers.",
+  );
 
-  /*
-  ==============================================
-  SCHEDULE
-  ==============================================
-  */
+  console.log(
+    "📡 POST /post → creates exactly ONE post.",
+  );
 
-  const interval = POST_INTERVAL_MINUTES * 60 * 1000;
+  console.log(
+    "💤 No internal timer is running.",
+  );
 
-  console.log("\n🟢 Bot is running continuously.");
-
-  console.log(`⏳ Next scheduled cycle in ${POST_INTERVAL_MINUTES} minutes.`);
-
-  setInterval(async () => {
-    if (shuttingDown) {
-      return;
-    }
-
-    await safeRunCycle();
-
-    if (!shuttingDown) {
-      console.log(
-        `\n⏳ Next scheduled cycle in ${POST_INTERVAL_MINUTES} minutes.`,
-      );
-    }
-  }, interval);
+  console.log(
+    "⏰ External scheduler controls posting times.",
+  );
 }
 
 /* =======================================================
-   START
+   START APPLICATION
 ======================================================= */
 
-startBotAndServer().catch(async (error) => {
-  console.error("💥 Fatal startup error:", error);
+startBotAndServer().catch(
+  async (error) => {
+    console.error(
+      "💥 Fatal startup error:",
+      error,
+    );
 
-  await saveState();
+    await saveState();
 
-  process.exit(1);
-});
+    process.exit(1);
+  },
+);
