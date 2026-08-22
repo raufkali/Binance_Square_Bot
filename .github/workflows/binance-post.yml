@@ -1,0 +1,27 @@
+name: Binance Square Post Scheduler
+
+on:
+  schedule:
+    - cron: "0,40 * * * *"
+
+  workflow_dispatch:
+
+jobs:
+  trigger-post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger Binance Square Bot
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.POST_TRIGGER_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            --fail \
+            --show-error \
+            --silent \
+            --output response.json \
+            "https://binance-square-bot-loi6.onrender.com/post"
+
+          echo "Response:"
+          cat response.json
