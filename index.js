@@ -1131,8 +1131,8 @@ HARD RULES
 - Do not promise profits.
 - Do not fabricate statistics.
 - Use manipulative urgency.
-- Include exactly 3 hashtags at the very end.
-- Post length: 200-500 characters approximately.
+- Include exactly 4 most relevent hashtags at the very end.
+- Post length: 500‑1000 characters approximately.
 
 ${prompt}
 `,
