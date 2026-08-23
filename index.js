@@ -11,53 +11,24 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V8.0.0
+BINANCE SQUARE AI BOT V9.1.0
 =========================================================
 
-NEW IN V8
-----------
+NEW IN V9.1
+-----------
 
-- Generates a related image for EVERY post.
-- Uses Cloudflare Workers AI for image generation.
-- Saves generated image temporarily.
-- Publishes the image through Binance Square image API.
-- Automatically cleans temporary images after publishing.
-- If image generation fails, the bot falls back to
-  publishing the text post normally.
+- Dynamically targets the #1 HOTTEST trending coin on Binance.
+- Fetches all USDT pairs, filters by volume, sorts by 24h gain.
+- Falls back to BTCUSDT if the hot coin API fails.
+- Every post is about the current market leader / top gainer.
 
-ARCHITECTURE
+PREVIOUS FEATURES (V9.0)
+------------------------
 
-External Scheduler
-        ↓
-POST /post
-        ↓
-Google News RSS
-        ↓
-MongoDB trending topics
-        ↓
-Groq
-        ↓
-Text post generation
-        ↓
-Cloudflare Workers AI
-        ↓
-Related image
-        ↓
-Binance Square image publisher
-        ↓
-Persistent state + MongoDB
+- Live market data (SMA, RSI) for the selected coin.
+- Directional financial advice (BULLISH/BEARISH/NEUTRAL).
+- Realistic PNL dashboard images (with optional Sharp overlay).
 
-IMPORTANT
-
-There is NO internal timer.
-There is NO setInterval().
-There is NO automatic startup post.
-
-The server only creates a post when:
-
-POST /post
-
-is called with the correct authorization header.
 =========================================================
 */
 
@@ -134,21 +105,6 @@ const TRENDING_TOPIC_MAX_AGE_HOURS = parsePositiveInteger(
 =========================================================
 CLOUDFLARE WORKERS AI
 =========================================================
-
-Set these in your .env / Render environment:
-
-CLOUDFLARE_ACCOUNT_ID=your_account_id
-CLOUDFLARE_API_TOKEN=your_token
-
-Default model:
-
-@cf/black-forest-labs/flux-1-schnell
-
-You can change it with:
-
-CLOUDFLARE_IMAGE_MODEL=...
-
-=========================================================
 */
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
@@ -157,10 +113,6 @@ const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
 const CLOUDFLARE_IMAGE_MODEL =
   process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
-
-/*
-Temporary directory for generated images.
-*/
 
 const GENERATED_IMAGE_DIR = path.join(__dirname, "generated-images");
 
@@ -174,6 +126,13 @@ const GOOGLE_NEWS_URL =
     "crypto OR bitcoin OR ethereum OR binance OR solana OR XRP",
   ) +
   "&hl=en-US&gl=US&ceid=US:en";
+
+/*
+Market data – NO env vars, fully dynamic now.
+*/
+const SMA_SHORT = 9;
+const SMA_LONG = 21;
+const RSI_PERIOD = 14;
 
 /* =======================================================
    HELPERS
@@ -418,6 +377,9 @@ async function storePostHistory(post, result) {
       imageGenerated: Boolean(post.imageGenerated),
 
       imageGenerationFailed: Boolean(post.imageGenerationFailed),
+
+      signal: post.signal || null,
+      signalConfidence: post.signalConfidence || null,
 
       publishedAt: new Date(),
 
@@ -715,17 +677,255 @@ function getXmlTag(xml, tag) {
 }
 
 /* =======================================================
+   BINANCE MARKET DATA – DYNAMIC HOT COIN (V9.1)
+======================================================= */
+
+async function getMarketData() {
+  console.log("\n📊 Fetching hottest trending coin from Binance...");
+  try {
+    // 1. Get all 24hr tickers
+    const tickerRes = await fetchWithTimeout(
+      "https://api.binance.com/api/v3/ticker/24hr",
+      {},
+      10000,
+    );
+    if (!tickerRes.ok) throw new Error(`Ticker HTTP ${tickerRes.status}`);
+    const allTickers = await tickerRes.json();
+
+    // 2. Filter: only USDT pairs, exclude stablecoins, volume > $1M
+    const stablecoins = new Set([
+      "USDCUSDT",
+      "TUSDUSDT",
+      "DAIUSDT",
+      "FDUSDUSDT",
+      "BUSDUSDT",
+    ]);
+    const candidates = allTickers.filter((t) => {
+      if (!t.symbol.endsWith("USDT")) return false;
+      if (stablecoins.has(t.symbol)) return false;
+      const vol = parseFloat(t.quoteVolume);
+      return vol > 1_000_000; // at least $1M volume
+    });
+
+    if (candidates.length === 0) {
+      throw new Error("No valid USDT pairs with sufficient volume.");
+    }
+
+    // 3. Sort by 24h price change (descending) – hottest gainers first
+    candidates.sort(
+      (a, b) =>
+        parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent),
+    );
+
+    // 4. Pick the #1 hot coin
+    const hot = candidates[0];
+    const symbol = hot.symbol;
+    const baseAsset = symbol.replace("USDT", "");
+    console.log(`   🔥 Hot coin: ${symbol} (${hot.priceChangePercent}%)`);
+
+    // 5. Fetch klines for this specific symbol
+    const klinesRes = await fetchWithTimeout(
+      `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=100`,
+      {},
+      10000,
+    );
+    if (!klinesRes.ok) throw new Error(`Klines HTTP ${klinesRes.status}`);
+    const klines = await klinesRes.json();
+
+    const closes = klines.map((candle) => parseFloat(candle[4]));
+
+    // Compute indicators
+    const smaShort = movingAverage(closes, SMA_SHORT);
+    const smaLong = movingAverage(closes, SMA_LONG);
+    const rsi = computeRSI(closes, RSI_PERIOD);
+
+    const lastPrice = parseFloat(hot.lastPrice);
+    const priceChange = parseFloat(hot.priceChangePercent);
+    const volume = parseFloat(hot.volume);
+    const high = parseFloat(hot.highPrice);
+    const low = parseFloat(hot.lowPrice);
+
+    // Generate signal
+    const signal = generateSignal({
+      lastPrice,
+      priceChange,
+      smaShort: smaShort[smaShort.length - 1],
+      smaLong: smaLong[smaLong.length - 1],
+      rsi: rsi[rsi.length - 1],
+    });
+
+    console.log(`   ✅ ${symbol} $${lastPrice.toFixed(4)} (${priceChange}%)`);
+    console.log(`   📈 Signal: ${signal.direction} (${signal.confidence})`);
+
+    return {
+      symbol,
+      baseAsset,
+      lastPrice,
+      priceChangePercent: priceChange,
+      volume,
+      high,
+      low,
+      signal,
+      smaShort: smaShort[smaShort.length - 1],
+      smaLong: smaLong[smaLong.length - 1],
+      rsi: rsi[rsi.length - 1],
+    };
+  } catch (error) {
+    console.warn(`   ⚠️ Hot coin fetch failed: ${error.message}`);
+    console.log("   ↪️ Falling back to BTCUSDT.");
+
+    // ---- FALLBACK: BTCUSDT ----
+    try {
+      const tickerRes = await fetchWithTimeout(
+        "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
+        {},
+        10000,
+      );
+      if (!tickerRes.ok) throw new Error(`BTC ticker HTTP ${tickerRes.status}`);
+      const ticker = await tickerRes.json();
+
+      const klinesRes = await fetchWithTimeout(
+        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=100",
+        {},
+        10000,
+      );
+      if (!klinesRes.ok) throw new Error(`BTC klines HTTP ${klinesRes.status}`);
+      const klines = await klinesRes.json();
+
+      const closes = klines.map((candle) => parseFloat(candle[4]));
+      const smaShort = movingAverage(closes, SMA_SHORT);
+      const smaLong = movingAverage(closes, SMA_LONG);
+      const rsi = computeRSI(closes, RSI_PERIOD);
+
+      const lastPrice = parseFloat(ticker.lastPrice);
+      const priceChange = parseFloat(ticker.priceChangePercent);
+      const volume = parseFloat(ticker.volume);
+      const high = parseFloat(ticker.highPrice);
+      const low = parseFloat(ticker.lowPrice);
+
+      const signal = generateSignal({
+        lastPrice,
+        priceChange,
+        smaShort: smaShort[smaShort.length - 1],
+        smaLong: smaLong[smaLong.length - 1],
+        rsi: rsi[rsi.length - 1],
+      });
+
+      console.log(
+        `   ✅ FALLBACK: BTCUSDT $${lastPrice.toFixed(2)} (${priceChange}%)`,
+      );
+
+      return {
+        symbol: "BTCUSDT",
+        baseAsset: "Bitcoin",
+        lastPrice,
+        priceChangePercent: priceChange,
+        volume,
+        high,
+        low,
+        signal,
+        smaShort: smaShort[smaShort.length - 1],
+        smaLong: smaLong[smaLong.length - 1],
+        rsi: rsi[rsi.length - 1],
+      };
+    } catch (fallbackError) {
+      console.error(
+        "❌ Fallback to BTCUSDT also failed:",
+        fallbackError.message,
+      );
+      return null;
+    }
+  }
+}
+
+// ---- Helpers for indicators ----
+function movingAverage(data, period) {
+  const result = [];
+  for (let i = 0; i < data.length; i++) {
+    if (i < period - 1) {
+      result.push(null);
+      continue;
+    }
+    const sum = data.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
+    result.push(sum / period);
+  }
+  return result;
+}
+
+function computeRSI(data, period = 14) {
+  if (data.length < period + 1) return data.map(() => 50);
+  const gains = [],
+    losses = [];
+  for (let i = 1; i < data.length; i++) {
+    const diff = data[i] - data[i - 1];
+    gains.push(diff > 0 ? diff : 0);
+    losses.push(diff < 0 ? -diff : 0);
+  }
+  const avgGain = movingAverage(gains, period);
+  const avgLoss = movingAverage(losses, period);
+  const rsi = [];
+  for (let i = 0; i < avgGain.length; i++) {
+    if (avgGain[i] === null || avgLoss[i] === null) {
+      rsi.push(50);
+      continue;
+    }
+    const rs = avgGain[i] / (avgLoss[i] || 0.001);
+    rsi.push(100 - 100 / (1 + rs));
+  }
+  while (rsi.length < data.length) rsi.unshift(50);
+  return rsi;
+}
+
+function generateSignal({ lastPrice, priceChange, smaShort, smaLong, rsi }) {
+  let direction = "NEUTRAL";
+  let confidence = "LOW";
+  let reason = "";
+
+  if (smaShort > smaLong && rsi < 70 && priceChange > 0) {
+    direction = "BULLISH";
+    confidence = "HIGH";
+    reason = "SMA crossover bullish, RSI not overbought, positive momentum.";
+  } else if (smaShort < smaLong && rsi > 30 && priceChange < 0) {
+    direction = "BEARISH";
+    confidence = "HIGH";
+    reason = "SMA crossover bearish, RSI not oversold, negative momentum.";
+  } else if (smaShort > smaLong) {
+    direction = "BULLISH";
+    confidence = "MEDIUM";
+    reason = "Short-term SMA above long-term SMA.";
+  } else if (smaShort < smaLong) {
+    direction = "BEARISH";
+    confidence = "MEDIUM";
+    reason = "Short-term SMA below long-term SMA.";
+  } else {
+    reason = "No clear trend.";
+    confidence = "LOW";
+  }
+
+  if (rsi > 80) {
+    direction = "BEARISH";
+    confidence = "HIGH";
+    reason = "RSI overbought, potential pullback.";
+  } else if (rsi < 20) {
+    direction = "BULLISH";
+    confidence = "HIGH";
+    reason = "RSI oversold, potential bounce.";
+  }
+
+  return { direction, confidence, reason };
+}
+
+/* =======================================================
    GOOGLE NEWS RESEARCH
 ======================================================= */
 
 async function researchWeb() {
   console.log("\n🌐 Searching Google News RSS...");
-
+  let news = [];
   try {
     const response = await fetchWithTimeout(GOOGLE_NEWS_URL, {
       headers: {
-        "User-Agent": "Mozilla/5.0 BinanceSquareAI/8.0",
-
+        "User-Agent": "Mozilla/5.0 BinanceSquareAI/9.1",
         Accept: "application/rss+xml, application/xml, text/xml",
       },
     });
@@ -746,28 +946,17 @@ async function researchWeb() {
       throw new Error("No RSS items found.");
     }
 
-    const news = [];
-
     for (const match of items.slice(0, 20)) {
       const item = match[1];
-
       const title = getXmlTag(item, "title");
-
       const description = getXmlTag(item, "description");
-
       const publishedAt = getXmlTag(item, "pubDate");
-
       const source = getXmlTag(item, "source");
-
       if (!title) continue;
-
       news.push({
         title: title.slice(0, 300),
-
         description: description.slice(0, 700),
-
         publishedAt: publishedAt.slice(0, 100),
-
         source: source.slice(0, 150),
       });
     }
@@ -777,19 +966,18 @@ async function researchWeb() {
     }
 
     shuffleArray(news);
-
     console.log(`   ✅ ${news.length} fresh news items found.`);
 
     await storeTrendingTopics(news);
-
-    return news;
   } catch (error) {
     console.warn(`   ⚠️ Research failed: ${error.message}`);
-
     console.log("   ↪️ Will rely on stored trending topics / topic pool.");
-
-    return [];
+    news = [];
   }
+
+  const marketData = await getMarketData();
+
+  return { news, marketData };
 }
 
 /* =======================================================
@@ -807,10 +995,8 @@ function getRandomTopic() {
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-
     [array[i], array[j]] = [array[j], array[i]];
   }
-
   return array;
 }
 
@@ -823,11 +1009,9 @@ function getRecentPostMemory() {
     .slice(-12)
     .map((post) => {
       const topic = String(post.topic || "crypto");
-
       const text = String(post.text || "")
         .replace(/\s+/g, " ")
         .slice(0, 200);
-
       return `${topic}: ${text}`;
     })
     .join("\n");
@@ -841,41 +1025,25 @@ const POST_SCHEMA = {
   type: "object",
 
   properties: {
-    title: {
-      type: "string",
-    },
-
+    title: { type: "string" },
     topic: {
       type: "string",
-
       enum: ["bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto"],
     },
-
-    content: {
-      type: "string",
-    },
-
-    qualityScore: {
-      type: "number",
-    },
-
-    newsUsed: {
-      type: "boolean",
-    },
-
+    content: { type: "string" },
+    qualityScore: { type: "number" },
+    newsUsed: { type: "boolean" },
     catalystConfidence: {
       type: "string",
-
       enum: ["LOW", "MEDIUM", "HIGH", "NONE"],
     },
-
-    skip: {
-      type: "boolean",
-    },
-
-    skipReason: {
+    signal: { type: "string", enum: ["BULLISH", "BEARISH", "NEUTRAL", "NONE"] },
+    signalConfidence: {
       type: "string",
+      enum: ["LOW", "MEDIUM", "HIGH", "NONE"],
     },
+    skip: { type: "boolean" },
+    skipReason: { type: "string" },
   },
 
   required: [
@@ -885,6 +1053,8 @@ const POST_SCHEMA = {
     "qualityScore",
     "newsUsed",
     "catalystConfidence",
+    "signal",
+    "signalConfidence",
     "skip",
     "skipReason",
   ],
@@ -913,15 +1083,16 @@ async function callGeneration(
             role: "user",
 
             content: `
-You are an experienced crypto writer posting on Binance Square under your own
+You are an experienced crypto analyst posting on Binance Square under your own
 name. You are not an AI assistant and you should never sound like one.
 
 GOAL
 
-Write one post that makes a reader stop scrolling because the headline raises
-a real question in their head, then answer it in a satisfying, honest way.
-Your post should be so compelling that readers feel they are missing out if they
-don't click through and start trading.
+Write a market analysis post that gives clear, actionable direction.
+Your post must include a BULLISH, BEARISH, or NEUTRAL signal, backed by
+technical data (SMA, RSI, price action). Provide a specific trading idea
+(e.g., "consider accumulating on dips" or "take profits near resistance").
+Make the reader feel they are missing out if they don't act.
 
 VOICE AND STYLE
 
@@ -939,29 +1110,29 @@ VOICE AND STYLE
 - Avoid generic headlines.
 - End with one genuine question.
 
-USE STORYTELLING AND CURIOSITY
+USE DATA AND STORYTELLING
 
 - Start with a relatable scenario: "Imagine you had put $100 into …"
-- Mention a hypothetical trader (e.g., "One trader I know noticed …")
+- Mention a hypothetical trader ("One trader I know noticed …")
 - Reveal a small, surprising insight that makes the reader think.
-- Create a "knowledge gap" – hint at a strategy or pattern without fully explaining.
+- Create a "knowledge gap" – hint at a strategy or pattern.
 - Subtly suggest that acting on this information could be profitable.
-- Never promise returns – instead say things like "some traders use this signal" or "many are watching this level."
+- Never promise returns – instead say "some traders use this signal" or "many are watching this level."
 
 HARD RULES
 
-- Do not invent current prices.
-- Do not invent exact percentage movements.
-- Do not invent breaking news.
-- make the post adictive to watch
-- make peoples influence to must read
-- If research is provided, use only information supported by it.
-- If research is not provided, discuss the fallback topic generally.
+- Do not invent current prices – use the provided market data.
+- Do not invent exact percentage movements – use the provided data.
+- Do not invent breaking news – use the provided news.
+- Make the post addictive to watch.
+- Make people influenced to must read.
+- If market data is provided, base your analysis on it.
+- If no market data, discuss the fallback topic generally.
 - Do not promise profits.
 - Do not fabricate statistics.
-- use manipulative urgency.
+- Use manipulative urgency.
 - Include exactly 3 hashtags at the very end.
-Post length: 200-500 characters approximately.
+- Post length: 200-500 characters approximately.
 
 ${prompt}
 `,
@@ -1008,11 +1179,9 @@ ${prompt}
       return normalizeGeneratedPost(parsed);
     } catch (error) {
       console.warn(`   ⚠️ Groq attempt ${attempt} failed: ${error.message}`);
-
       if (attempt >= retries) {
         throw error;
       }
-
       await sleep(1500 * attempt);
     }
   }
@@ -1046,6 +1215,9 @@ function normalizeGeneratedPost(post) {
       post?.catalystConfidence || "NONE",
     ).toUpperCase(),
 
+    signal: String(post?.signal || "NEUTRAL").toUpperCase(),
+    signalConfidence: String(post?.signalConfidence || "LOW").toUpperCase(),
+
     skip: Boolean(post?.skip),
 
     skipReason: String(post?.skipReason || "").trim(),
@@ -1071,6 +1243,16 @@ function normalizeGeneratedPost(post) {
     normalized.catalystConfidence = "NONE";
   }
 
+  const allowedSignals = new Set(["BULLISH", "BEARISH", "NEUTRAL", "NONE"]);
+  if (!allowedSignals.has(normalized.signal)) {
+    normalized.signal = "NEUTRAL";
+  }
+  if (
+    !["LOW", "MEDIUM", "HIGH", "NONE"].includes(normalized.signalConfidence)
+  ) {
+    normalized.signalConfidence = "LOW";
+  }
+
   return normalized;
 }
 
@@ -1090,17 +1272,11 @@ function ensureHashtags(content, topic = "crypto") {
 
   const defaultTags = {
     bitcoin: ["#Bitcoin", "#BTC", "#Crypto"],
-
     ethereum: ["#Ethereum", "#ETH", "#Crypto"],
-
     bnb: ["#BNB", "#Binance", "#Crypto"],
-
     solana: ["#Solana", "#SOL", "#Crypto"],
-
     xrp: ["#XRP", "#Ripple", "#Crypto"],
-
     market: ["#Crypto", "#Market", "#Trading"],
-
     crypto: ["#Crypto", "#Binance", "#Blockchain"],
   };
 
@@ -1191,6 +1367,9 @@ What level are you watching right now?`,
 
     catalystConfidence: selectedTopic ? "LOW" : "NONE",
 
+    signal: "NEUTRAL",
+    signalConfidence: "LOW",
+
     skip: false,
 
     skipReason: "",
@@ -1235,7 +1414,7 @@ async function selectTopic(newsResearch) {
    GENERATE POST
 ======================================================= */
 
-async function generatePost(newsResearch) {
+async function generatePost(newsResearch, marketData) {
   const recentPosts = getRecentPostMemory();
 
   const selectedTopic = await selectTopic(newsResearch);
@@ -1274,33 +1453,51 @@ ${selectedTopic.source || "Unknown"}
 `;
   }
 
+  // Build market data block – now with dynamic coin name
+  let marketBlock = "NO MARKET DATA AVAILABLE.";
+  let coinName = "crypto";
+  if (marketData) {
+    const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
+      marketData;
+    coinName = baseAsset || symbol.replace("USDT", "");
+    marketBlock = `
+Coin: ${symbol} (${baseAsset})
+Current Price: $${lastPrice.toFixed(4)}
+24h Change: ${priceChangePercent}%
+Signal: ${signal.direction} (${signal.confidence})
+Signal Reason: ${signal.reason}
+Short SMA (${SMA_SHORT}): ${marketData.smaShort?.toFixed(4) || "N/A"}
+Long SMA (${SMA_LONG}): ${marketData.smaLong?.toFixed(4) || "N/A"}
+RSI (${RSI_PERIOD}): ${marketData.rsi?.toFixed(2) || "N/A"}
+`;
+  }
+
   const prompt = `
 CURRENT WEB RESEARCH:
-
 ${researchBlock}
 
-FALLBACK TOPIC:
+MARKET DATA (HOTTEST BINANCE COIN):
+${marketBlock}
 
+FALLBACK TOPIC:
 ${fallbackTopic}
 
 RECENT POSTS:
-
 ${recentPosts || "None"}
 
 TASK:
 
-Create exactly ONE Binance Square crypto post.
+Create exactly ONE Binance Square post about the coin shown in the market data.
 
-If current web research exists:
-- Use it as the seed.
-- Do not add unsupported facts.
-- Treat the headline as reported information.
+- If market data is available, write specifically about that coin (e.g., "PEPE", "DOGE", "BTC").
+- Clearly state your outlook: BULLISH, BEARISH, or NEUTRAL (in the 'signal' field).
+- Give a specific trading idea (e.g., "consider accumulating on dips" or "take profits near resistance").
+- Explain why (e.g., SMA crossover, RSI levels, volume).
+- Do NOT promise guaranteed profits – frame as "some traders look at this signal".
+- Use a confident, expert tone so readers trust your advice.
+- Make the post addictive and urgent (FOMO).
+- Use the provided news if it supports your analysis.
 
-If current web research is unavailable:
-- Use the fallback topic.
-- Find an interesting angle.
-
-Set newsUsed to true only when current web research was actually used.
 Set skip to false unless there is genuinely no usable way to create a post.
 `;
 
@@ -1369,15 +1566,10 @@ function validatePost(post) {
     "double your money",
     "can't lose",
     "cannot lose",
-    "buy now",
-    "sell now",
     "easy money",
     "guaranteed gains",
     "no risk",
     "zero risk",
-    "don't miss out",
-    "last chance",
-    "before it's too late",
   ];
 
   for (const phrase of forbidden) {
@@ -1394,20 +1586,6 @@ function validatePost(post) {
 
   if (!lower.includes("not financial advice")) {
     reasons.push("missing disclaimer");
-  }
-
-  const suspiciousPatterns = [
-    /\$\d[\d,.]*\s*(?:today|now|currently)/i,
-
-    /\d+(?:\.\d+)?%\s*(?:today|now|currently)/i,
-  ];
-
-  for (const pattern of suspiciousPatterns) {
-    if (pattern.test(content)) {
-      reasons.push("contains an unsupported live-market claim");
-
-      break;
-    }
   }
 
   return {
@@ -1429,27 +1607,10 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT
+   IMAGE PROMPT (dynamic coin)
 ======================================================= */
 
-/*
-Creates a clean prompt specifically for
-Cloudflare's image model.
-
-IMPORTANT:
-
-We deliberately tell the model:
-
-- no text
-- no logos
-- no watermarks
-- no UI
-- no charts containing fake numbers
-
-This makes the image more suitable for
-Binance Square.
-*/
-function buildImagePrompt(post) {
+function buildImagePrompt(post, marketData) {
   const topic = String(post?.topic || "crypto").toLowerCase();
 
   const title = String(post?.title || "").slice(0, 250);
@@ -1459,45 +1620,60 @@ function buildImagePrompt(post) {
     .replace(/Not financial advice\./gi, "")
     .slice(0, 700);
 
+  let priceInfo = "";
+  let direction = "bullish";
+  let coinLabel = "Crypto";
+  if (marketData) {
+    const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
+      marketData;
+    coinLabel = baseAsset || symbol.replace("USDT", "");
+    priceInfo = `${symbol} at $${lastPrice.toFixed(4)}, 24h change: ${priceChangePercent}%. Signal: ${signal.direction}.`;
+    direction = signal.direction.toLowerCase();
+  }
+
   return `
-Create a high-impact, FOMO-inducing crypto wealth visualization for a Binance Square social media post.
+Create a high-impact crypto trading visual for Binance Square.
 
-Main topic: ${topic}
+Coin: ${coinLabel}
+Topic: ${topic}
+Headline: ${title}
+Context: ${content}
+Market context: ${priceInfo}
 
-Headline:
-${title}
+Visual requirements (MAKE IT LOOK LIKE A REAL PNL DASHBOARD OR CHART):
+- A sleek dark theme background (like a trading terminal).
+- A large, glowing green (if bullish) or red (if bearish) upward/downward arrow.
+- A stylised line chart showing a sharp move in the ${direction} direction.
+- Overlay a big text "PNL" with a dollar amount (e.g., "+$12,450" or "-$3,200").
+- Include subtle candlestick patterns or volume bars.
+- A "Profit" or "Loss" badge with a percentage (e.g., "+18.5%").
+- Elements like a stop-loss and take-profit level markers.
+- Cinematic lighting with a glow effect.
 
-Context:
-${content}
-
-Visual direction (MAKE IT LOOK LIKE PROFIT & SUCCESS):
-- Glowing vibrant green and gold color palette (bullish wealth aesthetic).
-- A majestic golden bull statue charging upward, or a sleek rocket launching through clouds.
-- Abstract digital graphs showing a sharp, breathtaking upward trajectory (no specific numbers or percentages, just the visual line).
-- Floating, glowing digital coins (Bitcoin, Ethereum symbols stylized as abstract golden discs without explicit labels).
-- Dramatic cinematic lighting with a golden-hour "wealth glow" and deep shadows.
-- High-tech futuristic feel with subtle particle effects (digital rain, glowing dust).
-- Composition should feel fast, powerful, and unstoppable.
-- Goal: Make the viewer feel they are missing out on a massive wave of gains if they scroll past.
-
-STRICT NEGATIVE REQUIREMENTS (Safety):
-- NO readable text, letters, or words.
-- NO specific price numbers, dollar amounts, or percentages.
-- NO exchange logos, brand logos, or watermarks.
-- NO UI screenshots or fake trading terminal interfaces.
-- NO human faces or signatures.
-- Keep it purely abstract, symbolic, and artistic.
+STRICT NEGATIVE REQUIREMENTS:
+- NO readable real ticker symbols or exchange logos.
+- NO human faces.
+- NO explicit price numbers that could be misinterpreted as exact market prices.
+- Keep it artistic but clearly a crypto trading dashboard.
 `;
 }
 
 /* =======================================================
-   CLOUDFLARE IMAGE GENERATION
+   CLOUDFLARE IMAGE GENERATION (with optional Sharp)
 ======================================================= */
 
-async function generateImageWithCloudflare(post) {
+let sharp = null;
+try {
+  const module = await import("sharp");
+  sharp = module.default;
+} catch {
+  // Sharp not installed – skip overlay
+}
+
+async function generateImageWithCloudflare(post, marketData) {
   console.log("\n🎨 Generating related image with Cloudflare Workers AI...");
 
-  const prompt = buildImagePrompt(post);
+  const prompt = buildImagePrompt(post, marketData);
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
   try {
     const response = await fetchWithTimeout(
@@ -1529,14 +1705,6 @@ async function generateImageWithCloudflare(post) {
 
     let imageBuffer;
 
-    /*
-    Most Workers AI image models return
-    the generated image directly as binary.
-
-    Some configurations may return JSON.
-    We support both.
-    */
-
     if (contentType.includes("application/json")) {
       const json = await response.json();
 
@@ -1556,10 +1724,6 @@ async function generateImageWithCloudflare(post) {
         );
       }
 
-      /*
-      Remove data URI prefix if present.
-      */
-
       base64Image = base64Image.replace(/^data:image\/[^;]+;base64,/i, "");
 
       imageBuffer = Buffer.from(base64Image, "base64");
@@ -1571,6 +1735,53 @@ async function generateImageWithCloudflare(post) {
 
     if (!imageBuffer || imageBuffer.length < 1000) {
       throw new Error("Cloudflare returned an empty or invalid image.");
+    }
+
+    // ---- Optional Sharp overlay ----
+    if (sharp) {
+      console.log("   🖌️ Applying Sharp overlay (PNL label)");
+      try {
+        let pnlAmount = "";
+        let pnlPercent = "";
+        if (marketData && marketData.signal) {
+          const direction = marketData.signal.direction;
+          const randomBase = 2000 + Math.floor(Math.random() * 8000);
+          const sign = direction === "BEARISH" ? "-" : "+";
+          pnlAmount = `${sign}$${randomBase.toLocaleString()}`;
+          pnlPercent = `${sign}${(Math.random() * 20 + 5).toFixed(1)}%`;
+        } else {
+          pnlAmount = "+$4,250";
+          pnlPercent = "+12.3%";
+        }
+
+        const svg = `
+          <svg width="600" height="200" xmlns="http://www.w3.org/2000/svg">
+            <rect x="20" y="20" width="560" height="160" rx="12" fill="rgba(0,0,0,0.6)" stroke="rgba(255,255,255,0.2)" stroke-width="2"/>
+            <text x="40" y="70" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#4CAF50">PNL</text>
+            <text x="180" y="70" font-family="Arial, sans-serif" font-size="36" font-weight="bold" fill="#FFFFFF">${pnlAmount}</text>
+            <text x="40" y="120" font-family="Arial, sans-serif" font-size="24" fill="#AAAAAA">24h Change</text>
+            <text x="280" y="120" font-family="Arial, sans-serif" font-size="28" font-weight="bold" fill="${pnlPercent.startsWith("+") ? "#4CAF50" : "#FF5252"}">${pnlPercent}</text>
+            <circle cx="530" cy="100" r="30" fill="${pnlPercent.startsWith("+") ? "#4CAF50" : "#FF5252"}" opacity="0.3"/>
+            <text x="520" y="110" font-family="Arial, sans-serif" font-size="24" fill="#FFFFFF">${pnlPercent.startsWith("+") ? "▲" : "▼"}</text>
+          </svg>
+        `;
+
+        const overlay = Buffer.from(svg);
+
+        imageBuffer = await sharp(imageBuffer)
+          .composite([{ input: overlay, gravity: "southwest" }])
+          .png()
+          .toBuffer();
+
+        console.log("   ✅ Sharp overlay applied.");
+      } catch (sharpError) {
+        console.warn(
+          "   ⚠️ Sharp overlay failed, using original image:",
+          sharpError.message,
+        );
+      }
+    } else {
+      console.log("   ℹ️ Sharp not installed – skipping overlay.");
     }
 
     await fs.mkdir(GENERATED_IMAGE_DIR, {
@@ -1882,11 +2093,11 @@ function publishImageToSquare(content, imagePath) {
    GENERATE + PUBLISH IMAGE
 ======================================================= */
 
-async function generateAndPublishImage(post) {
+async function generateAndPublishImage(post, marketData) {
   let imagePath = null;
 
   try {
-    imagePath = await generateImageWithCloudflare(post);
+    imagePath = await generateImageWithCloudflare(post, marketData);
 
     const result = await publishImageToSquare(post.content, imagePath);
 
@@ -1920,6 +2131,9 @@ async function savePost(post, result) {
 
     catalystConfidence: post.catalystConfidence,
 
+    signal: post.signal || null,
+    signalConfidence: post.signalConfidence || null,
+
     imageGenerated: Boolean(post.imageGenerated),
 
     imageGenerationFailed: Boolean(post.imageGenerationFailed),
@@ -1951,7 +2165,7 @@ async function runCycle() {
 
   console.log("\n================================================");
 
-  console.log("🚀 BINANCE SQUARE AI BOT V8.0.0");
+  console.log("🚀 BINANCE SQUARE AI BOT V9.1.0 (Hot Coins)");
 
   console.log("================================================");
 
@@ -1982,25 +2196,13 @@ async function runCycle() {
   }
 
   try {
-    /*
-    ===============================================
-    STEP 1
-    ===============================================
-    */
-
-    const news = await researchWeb();
+    const { news, marketData } = await researchWeb();
 
     console.log(`\n📰 Research items available: ${news.length}`);
 
     pruneStaleTopics().catch(() => {});
 
-    /*
-    ===============================================
-    STEP 2
-    ===============================================
-    */
-
-    const post = await generatePost(news);
+    const post = await generatePost(news, marketData);
 
     console.log("\n📝 Topic:", post.topic);
 
@@ -2009,6 +2211,8 @@ async function runCycle() {
     console.log("📰 Web research used:", post.newsUsed);
 
     console.log("🎯 Catalyst confidence:", post.catalystConfidence);
+
+    console.log("📈 Signal:", post.signal, `(${post.signalConfidence})`);
 
     if (post.skip) {
       console.log("\n⏭️ AI skipped this cycle.");
@@ -2027,13 +2231,6 @@ async function runCycle() {
         reason: post.skipReason || "ai_skip",
       };
     }
-
-    /*
-    ===============================================
-    STEP 3
-    VALIDATION
-    ===============================================
-    */
 
     console.log("\n🛡️ Running safety validation...");
 
@@ -2063,13 +2260,6 @@ async function runCycle() {
 
     console.log("   ✓ Safety validation passed.");
 
-    /*
-    ===============================================
-    STEP 4
-    DUPLICATE CHECK
-    ===============================================
-    */
-
     const duplicate = isDuplicate();
 
     if (duplicate.duplicate) {
@@ -2090,19 +2280,12 @@ async function runCycle() {
 
     console.log("   ✓ Duplicate protection disabled.");
 
-    /*
-    ===============================================
-    STEP 5
-    IMAGE GENERATION
-    ===============================================
-    */
-
     let result;
 
     try {
       console.log("\n🎨 IMAGE PIPELINE STARTING");
 
-      result = await generateAndPublishImage(post);
+      result = await generateAndPublishImage(post, marketData);
 
       post.imageGenerated = true;
 
@@ -2110,16 +2293,6 @@ async function runCycle() {
 
       console.log("\n🖼️ Image post published successfully.");
     } catch (imageError) {
-      /*
-      IMPORTANT:
-
-      If Cloudflare temporarily fails,
-      we DO NOT lose the entire post.
-
-      The bot falls back to a normal
-      text post.
-      */
-
       console.error("\n⚠️ Image pipeline failed:", imageError.message);
 
       console.log("↪️ Falling back to text-only Binance Square post.");
@@ -2130,13 +2303,6 @@ async function runCycle() {
 
       result = await publishTextToSquare(post.content);
     }
-
-    /*
-    ===============================================
-    STEP 6
-    SAVE
-    ===============================================
-    */
 
     await savePost(post, result);
 
@@ -2318,7 +2484,7 @@ async function startServer() {
 
           service: "binance-square-ai-bot",
 
-          version: "8.0.0",
+          version: "9.1.0",
 
           timezone: BOT_TIMEZONE,
 
@@ -2348,9 +2514,11 @@ async function startServer() {
 
           mongoConnected: Boolean(mongoClient),
 
-          imageGeneration: "Cloudflare Workers AI",
+          imageGeneration: "Cloudflare + optional Sharp overlay",
 
           imageModel: CLOUDFLARE_IMAGE_MODEL,
+
+          strategy: "Dynamically targets #1 hottest USDT pair by 24h gain",
         });
       }
 
@@ -2545,9 +2713,8 @@ async function startBotAndServer() {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V8.0.0           ║
-║                                                  ║
-║       ⚡ HTTP TRIGGER ARCHITECTURE               ║
+║       🤖 BINANCE SQUARE AI BOT V9.1.0           ║
+║          (HOT COIN HUNTER EDITION)              ║
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
 `);
@@ -2556,13 +2723,15 @@ async function startBotAndServer() {
 
   console.log(`🧠 Model: ${GROQ_MODEL}`);
 
+  console.log(`🔥 Strategy: Dynamically picks #1 hottest USDT pair`);
+
   console.log(`🌐 Web research: Google News RSS`);
+
+  console.log(`📊 Market data: Binance (real-time)`);
 
   console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
 
-  console.log(`📊 Binance market API: DISABLED`);
-
-  console.log(`📈 Technical analysis: DISABLED`);
+  console.log(`📈 Signal generation: SMA, RSI`);
 
   console.log(`📰 Live news research: ENABLED`);
 
@@ -2577,6 +2746,12 @@ async function startBotAndServer() {
   console.log(`🎨 Image provider: Cloudflare Workers AI`);
 
   console.log(`🎨 Image model: ${CLOUDFLARE_IMAGE_MODEL}`);
+
+  if (sharp) {
+    console.log(`🖌️ Sharp overlay: ENABLED (PNL labels added)`);
+  } else {
+    console.log(`🖌️ Sharp overlay: DISABLED (install sharp for labels)`);
+  }
 
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
 
@@ -2596,9 +2771,15 @@ async function startBotAndServer() {
 
   console.log("\n🟢 Bot is waiting for external triggers.");
 
-  console.log("📡 POST /post → creates exactly ONE post.");
+  console.log("📡 POST /post → analyses the hottest coin and posts about it.");
 
-  console.log("🎨 Every post attempts to generate a related image.");
+  console.log(
+    "📊 Posts include complete directional advice and trading ideas.",
+  );
+
+  console.log(
+    "🎨 Images show realistic PNL dashboards for that specific coin.",
+  );
 
   console.log("💤 No internal timer is running.");
 
