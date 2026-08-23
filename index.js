@@ -942,19 +942,15 @@ HARD RULES
 - Do not invent current prices.
 - Do not invent exact percentage movements.
 - Do not invent breaking news.
+- make the post adictive to watch
+- make peoples influence to must read
 - If research is provided, use only information supported by it.
 - If research is not provided, discuss the fallback topic generally.
-- Do not give financial advice.
-- Do not tell anyone to buy or sell.
 - Do not promise profits.
 - Do not fabricate statistics.
-- Do not use manipulative urgency.
+- use manipulative urgency.
 - Include exactly 3 hashtags at the very end.
-- End with exactly:
-
-Not financial advice.
-
-Post length: 700-1400 characters approximately.
+Post length: 200-500 characters approximately.
 
 ${prompt}
 `,
