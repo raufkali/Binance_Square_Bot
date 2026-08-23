@@ -1096,7 +1096,7 @@ Make the reader feel they are missing out if they don't act.
 
 VOICE AND STYLE
 
-- Plain, everyday language.
+- use English B2 or Easy.
 - Short sentences.
 - Short paragraphs.
 - No emojis.
