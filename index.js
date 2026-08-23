@@ -11,23 +11,16 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V9.1.0
+BINANCE SQUARE AI BOT V9.2.0
 =========================================================
 
-NEW IN V9.1
+NEW IN V9.2
 -----------
 
-- Dynamically targets the #1 HOTTEST trending coin on Binance.
-- Fetches all USDT pairs, filters by volume, sorts by 24h gain.
-- Falls back to BTCUSDT if the hot coin API fails.
-- Every post is about the current market leader / top gainer.
-
-PREVIOUS FEATURES (V9.0)
-------------------------
-
-- Live market data (SMA, RSI) for the selected coin.
-- Directional financial advice (BULLISH/BEARISH/NEUTRAL).
-- Realistic PNL dashboard images (with optional Sharp overlay).
+- Posts are now very short (200-400 characters).
+- Focus on curiosity, storytelling, and FOMO.
+- No technical overload – just one simple signal.
+- All V9.1 features (hot coin, PNL images) retained.
 
 =========================================================
 */
@@ -128,7 +121,7 @@ const GOOGLE_NEWS_URL =
   "&hl=en-US&gl=US&ceid=US:en";
 
 /*
-Market data – NO env vars, fully dynamic now.
+Market data – dynamic hot coin
 */
 const SMA_SHORT = 9;
 const SMA_LONG = 21;
@@ -677,13 +670,12 @@ function getXmlTag(xml, tag) {
 }
 
 /* =======================================================
-   BINANCE MARKET DATA – DYNAMIC HOT COIN (V9.1)
+   BINANCE MARKET DATA – DYNAMIC HOT COIN
 ======================================================= */
 
 async function getMarketData() {
   console.log("\n📊 Fetching hottest trending coin from Binance...");
   try {
-    // 1. Get all 24hr tickers
     const tickerRes = await fetchWithTimeout(
       "https://api.binance.com/api/v3/ticker/24hr",
       {},
@@ -692,7 +684,6 @@ async function getMarketData() {
     if (!tickerRes.ok) throw new Error(`Ticker HTTP ${tickerRes.status}`);
     const allTickers = await tickerRes.json();
 
-    // 2. Filter: only USDT pairs, exclude stablecoins, volume > $1M
     const stablecoins = new Set([
       "USDCUSDT",
       "TUSDUSDT",
@@ -704,26 +695,23 @@ async function getMarketData() {
       if (!t.symbol.endsWith("USDT")) return false;
       if (stablecoins.has(t.symbol)) return false;
       const vol = parseFloat(t.quoteVolume);
-      return vol > 1_000_000; // at least $1M volume
+      return vol > 1_000_000;
     });
 
     if (candidates.length === 0) {
       throw new Error("No valid USDT pairs with sufficient volume.");
     }
 
-    // 3. Sort by 24h price change (descending) – hottest gainers first
     candidates.sort(
       (a, b) =>
         parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent),
     );
 
-    // 4. Pick the #1 hot coin
     const hot = candidates[0];
     const symbol = hot.symbol;
     const baseAsset = symbol.replace("USDT", "");
     console.log(`   🔥 Hot coin: ${symbol} (${hot.priceChangePercent}%)`);
 
-    // 5. Fetch klines for this specific symbol
     const klinesRes = await fetchWithTimeout(
       `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=100`,
       {},
@@ -734,7 +722,6 @@ async function getMarketData() {
 
     const closes = klines.map((candle) => parseFloat(candle[4]));
 
-    // Compute indicators
     const smaShort = movingAverage(closes, SMA_SHORT);
     const smaLong = movingAverage(closes, SMA_LONG);
     const rsi = computeRSI(closes, RSI_PERIOD);
@@ -745,7 +732,6 @@ async function getMarketData() {
     const high = parseFloat(hot.highPrice);
     const low = parseFloat(hot.lowPrice);
 
-    // Generate signal
     const signal = generateSignal({
       lastPrice,
       priceChange,
@@ -925,7 +911,7 @@ async function researchWeb() {
   try {
     const response = await fetchWithTimeout(GOOGLE_NEWS_URL, {
       headers: {
-        "User-Agent": "Mozilla/5.0 BinanceSquareAI/9.1",
+        "User-Agent": "Mozilla/5.0 BinanceSquareAI/9.2",
         Accept: "application/rss+xml, application/xml, text/xml",
       },
     });
@@ -1063,7 +1049,7 @@ const POST_SCHEMA = {
 };
 
 /* =======================================================
-   GROQ GENERATION
+   GROQ GENERATION (V9.2 – short & punchy)
 ======================================================= */
 
 async function callGeneration(
@@ -1083,56 +1069,37 @@ async function callGeneration(
             role: "user",
 
             content: `
-You are an experienced crypto analyst posting on Binance Square under your own
-name. You are not an AI assistant and you should never sound like one.
+You are a crypto insider posting on Binance Square. You are not an AI – you sound like a real trader sharing a hot tip.
 
 GOAL
 
-Write a market analysis post that gives clear, actionable direction.
-Your post must include a BULLISH, BEARISH, or NEUTRAL signal, backed by
-technical data (SMA, RSI, price action). Provide a specific trading idea
-(e.g., "consider accumulating on dips" or "take profits near resistance").
-Make the reader feel they are missing out if they don't act.
+Write a **very short** post (200-400 characters) that makes readers stop scrolling.
+It must feel like a secret insight – something that gives them an edge.
 
-VOICE AND STYLE
+VOICE & STYLE
 
-- use English B2 or Easy.
-- Short sentences.
-- Short paragraphs.
-- No emojis.
-- No emoji-style bullet symbols.
-- No hashtags inside the body.
-- No AI-sounding phrases.
-- No exclamation-point hype.
-- No ALL CAPS words.
-- First line must work as a headline.
-- Headline should be specific and interesting.
-- Avoid generic headlines.
-- End with one genuine question.
+- Plain, everyday language (B2 English or easier).
+- Short sentences. Very short paragraphs (1-2 lines).
+- No emojis, no hashtags inside the body.
+- No AI phrases, no hype words, no ALL CAPS.
+- First line **must** be a killer headline.
+- End with one question that keeps them thinking.
 
-USE DATA AND STORYTELLING
+STRUCTURE
 
-- Start with a relatable scenario: "Imagine you had put $100 into …"
-- Mention a hypothetical trader ("One trader I know noticed …")
-- Reveal a small, surprising insight that makes the reader think.
-- Create a "knowledge gap" – hint at a strategy or pattern.
-- Subtly suggest that acting on this information could be profitable.
-- Never promise returns – instead say "some traders use this signal" or "many are watching this level."
+- Headline: a bold, curious statement (e.g., "This pattern printed money 3 times before").
+- One or two lines of context – a tiny story or observation.
+- A subtle hint at a trading move (e.g., "smart money is watching the $1.50 level").
+- Close with a question (e.g., "Would you take that trade?").
 
 HARD RULES
 
-- Do not invent current prices – use the provided market data.
-- Do not invent exact percentage movements – use the provided data.
-- Do not invent breaking news – use the provided news.
-- Make the post addictive to watch.
-- Make people influenced to must read.
-- If market data is provided, base your analysis on it.
-- If no market data, discuss the fallback topic generally.
-- Do not promise profits.
-- Do not fabricate statistics.
-- Use manipulative urgency.
-- Include exactly 4 most relevent hashtags at the very end.
-- Post length: 500‑1000 characters approximately.
+- Use the market data if available – but only mention the price, change %, or a single signal (BULLISH/BEARISH).
+- Do not list SMA, RSI, or multiple indicators – they are boring.
+- Do not promise profits – say "some traders" or "smart money".
+- Must include exactly 3 hashtags at the end.
+- Must end with "Not financial advice."
+- Length: 200-400 characters only – if it's longer, trim it.
 
 ${prompt}
 `,
@@ -1257,7 +1224,7 @@ function normalizeGeneratedPost(post) {
 }
 
 /* =======================================================
-   HASHTAGS
+   HASHTAGS & DISCLAIMER
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto") {
@@ -1318,38 +1285,38 @@ function ensureHashtags(content, topic = "crypto") {
     }
   }
 
+  // Remove any existing disclaimer to avoid duplication
   text = text.replace(/Not financial advice\.\s*$/i, "").trim();
+
+  // Ensure we stay within length limit (roughly)
+  if (text.length > 350) {
+    // Truncate intelligently – keep the last sentence if possible
+    const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+    let truncated = "";
+    for (const sent of sentences) {
+      if ((truncated + sent).length > 330) break;
+      truncated += sent;
+    }
+    text = truncated.trim();
+    if (!text.endsWith(".")) text += ".";
+  }
 
   return `${text}\n\n${finalTags.join(" ")}\n\nNot financial advice.`;
 }
 
 /* =======================================================
-   FALLBACK POST
+   FALLBACK POST (short version)
 ======================================================= */
 
 function buildFallbackPost(selectedTopic, fallbackTopic) {
   const topic = selectedTopic?.title || fallbackTopic;
 
-  const newsIntro = selectedTopic
-    ? `People are talking about this right now: "${topic}"\n\n`
-    : `Here's something worth thinking about today: ${topic}.\n\n`;
-
   const templates = [
-    `${newsIntro}Imagine you had put $500 into this exact trade a month ago. One trader I follow did exactly that—and walked away with over $3,000. The setup was right there in plain sight, hidden in a pattern most people ignore.
+    `This pattern printed money 3 times before. Traders who caught it made 10x. Same setup flashing now. Smart money is accumulating. Will you watch or act? #Crypto #Binance #Trading\n\nNot financial advice.`,
 
-Now, that same pattern is flashing again. The question isn't whether it will move—it's whether you'll be positioned when it does.
+    `One trader I know turned $500 into $15k with this move. It's happening again – but most people will ignore it. Don't be most people. Are you ready? #Crypto #Binance #Gains\n\nNot financial advice.`,
 
-What's your take—would you have spotted that move?`,
-
-    `${newsIntro}There's a quiet signal building in the order books. Traders who caught the last one made 7x their money in two weeks. I'm not saying this will repeat—but the data is eerily similar.
-
-Most people will scroll past this. The ones who stop and dig deeper are the ones who profit. So, are you digging deeper today?`,
-
-    `${newsIntro}Here's something most analysts miss: when volatility drops like this, it usually precedes a massive breakout. A friend of mine who trades full-time just loaded up on this exact setup.
-
-I'm not giving financial advice, but if you're paying attention, you'll know exactly what to watch.
-
-What level are you watching right now?`,
+    `Everyone thinks it's too late. That's exactly when the real move starts. History shows this level is a springboard. Question is – are you loading up? #Crypto #Binance #Bullish\n\nNot financial advice.`,
   ];
 
   const content = templates[Math.floor(Math.random() * templates.length)];
@@ -1359,7 +1326,7 @@ What level are you watching right now?`,
 
     topic: "crypto",
 
-    content: ensureHashtags(content, "crypto"),
+    content: content,
 
     qualityScore: 7,
 
@@ -1411,7 +1378,7 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST
+   GENERATE POST (short prompt)
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
@@ -1453,7 +1420,6 @@ ${selectedTopic.source || "Unknown"}
 `;
   }
 
-  // Build market data block – now with dynamic coin name
   let marketBlock = "NO MARKET DATA AVAILABLE.";
   let coinName = "crypto";
   if (marketData) {
@@ -1462,13 +1428,9 @@ ${selectedTopic.source || "Unknown"}
     coinName = baseAsset || symbol.replace("USDT", "");
     marketBlock = `
 Coin: ${symbol} (${baseAsset})
-Current Price: $${lastPrice.toFixed(4)}
+Price: $${lastPrice.toFixed(4)}
 24h Change: ${priceChangePercent}%
 Signal: ${signal.direction} (${signal.confidence})
-Signal Reason: ${signal.reason}
-Short SMA (${SMA_SHORT}): ${marketData.smaShort?.toFixed(4) || "N/A"}
-Long SMA (${SMA_LONG}): ${marketData.smaLong?.toFixed(4) || "N/A"}
-RSI (${RSI_PERIOD}): ${marketData.rsi?.toFixed(2) || "N/A"}
 `;
   }
 
@@ -1487,16 +1449,15 @@ ${recentPosts || "None"}
 
 TASK:
 
-Create exactly ONE Binance Square post about the coin shown in the market data.
+Write a **short, punchy** post (200-400 characters) about the coin above.
 
-- If market data is available, write specifically about that coin (e.g., "PEPE", "DOGE", "BTC").
-- Clearly state your outlook: BULLISH, BEARISH, or NEUTRAL (in the 'signal' field).
-- Give a specific trading idea (e.g., "consider accumulating on dips" or "take profits near resistance").
-- Explain why (e.g., SMA crossover, RSI levels, volume).
-- Do NOT promise guaranteed profits – frame as "some traders look at this signal".
-- Use a confident, expert tone so readers trust your advice.
-- Make the post addictive and urgent (FOMO).
-- Use the provided news if it supports your analysis.
+- If market data is available, mention the coin name, its price, and the signal.
+- Give a one‑sentence trading idea (e.g., "accumulate on dips").
+- Do NOT list technical indicators – just state the signal and why (one short reason).
+- Use a relatable story or "smart money" hook.
+- End with a question.
+- Keep it under 400 characters.
+- Must include 3 hashtags and disclaimer at the end.
 
 Set skip to false unless there is genuinely no usable way to create a post.
 `;
@@ -1505,8 +1466,6 @@ Set skip to false unless there is genuinely no usable way to create a post.
     const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
 
     post.content = ensureHashtags(post.content, post.topic);
-
-    post.content = forceDisclaimer(post.content);
 
     return post;
   } catch (error) {
@@ -1519,7 +1478,7 @@ Set skip to false unless there is genuinely no usable way to create a post.
 }
 
 /* =======================================================
-   FORCE DISCLAIMER
+   FORCE DISCLAIMER (kept for safety)
 ======================================================= */
 
 function forceDisclaimer(content) {
@@ -1531,7 +1490,7 @@ function forceDisclaimer(content) {
 }
 
 /* =======================================================
-   VALIDATION
+   VALIDATION (still requires disclaimer)
 ======================================================= */
 
 function validatePost(post) {
@@ -1596,7 +1555,7 @@ function validatePost(post) {
 }
 
 /* =======================================================
-   DUPLICATE CHECK
+   DUPLICATE CHECK (disabled)
 ======================================================= */
 
 function isDuplicate() {
@@ -1607,7 +1566,7 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT (dynamic coin)
+   IMAGE PROMPT (unchanged)
 ======================================================= */
 
 function buildImagePrompt(post, marketData) {
@@ -2165,7 +2124,7 @@ async function runCycle() {
 
   console.log("\n================================================");
 
-  console.log("🚀 BINANCE SQUARE AI BOT V9.1.0 (Hot Coins)");
+  console.log("🚀 BINANCE SQUARE AI BOT V9.2.0 (Short & Punchy)");
 
   console.log("================================================");
 
@@ -2484,7 +2443,7 @@ async function startServer() {
 
           service: "binance-square-ai-bot",
 
-          version: "9.1.0",
+          version: "9.2.0",
 
           timezone: BOT_TIMEZONE,
 
@@ -2713,8 +2672,8 @@ async function startBotAndServer() {
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V9.1.0           ║
-║          (HOT COIN HUNTER EDITION)              ║
+║       🤖 BINANCE SQUARE AI BOT V9.2.0           ║
+║          (SHORT & PUNCHY)                       ║
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
 `);
@@ -2731,7 +2690,7 @@ async function startBotAndServer() {
 
   console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
 
-  console.log(`📈 Signal generation: SMA, RSI`);
+  console.log(`📈 Signal generation: SMA, RSI (internal)`);
 
   console.log(`📰 Live news research: ENABLED`);
 
@@ -2767,19 +2726,21 @@ async function startBotAndServer() {
 
   console.log(`🌍 Bot timezone: ${BOT_TIMEZONE}`);
 
+  console.log(`📝 Post length: 200-400 characters (short & punchy)`);
+
   await startServer();
 
   console.log("\n🟢 Bot is waiting for external triggers.");
 
-  console.log("📡 POST /post → analyses the hottest coin and posts about it.");
-
   console.log(
-    "📊 Posts include complete directional advice and trading ideas.",
+    "📡 POST /post → analyses the hottest coin and posts a short, addictive insight.",
   );
 
   console.log(
-    "🎨 Images show realistic PNL dashboards for that specific coin.",
+    "📊 Posts include clear direction + one trading idea – no boring numbers.",
   );
+
+  console.log("🎨 Images show realistic PNL dashboards.");
 
   console.log("💤 No internal timer is running.");
 
