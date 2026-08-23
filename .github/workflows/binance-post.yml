@@ -1,8 +1,10 @@
 name: Binance Square Post Scheduler
 
 on:
+  # Fires at a clean 3-hour cadence (00:00, 03:00, 06:00 ... UTC).
+  # The actual trigger time is randomized inside the job below.
   schedule:
-    - cron: "0,40 * * * *"
+    - cron: "0 */3 * * *"
 
   workflow_dispatch:
 
@@ -11,6 +13,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Random pre-trigger delay
+        run: |
+          # Random delay between 1 and 6 minutes, in seconds.
+          # Keeps the visible trigger time off the exact hour mark
+          # and different every run, without spending much runner time.
+          DELAY=$(( (RANDOM % 300) + 60 ))
+
+          MINUTES=$((DELAY / 60))
+          SECONDS=$((DELAY % 60))
+
+          echo "Sleeping ${MINUTES}m ${SECONDS}s before triggering..."
+
+          sleep "$DELAY"
+
       - name: Trigger Binance Square Bot
         run: |
           curl -X POST \
