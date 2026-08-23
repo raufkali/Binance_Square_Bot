@@ -920,6 +920,8 @@ GOAL
 
 Write one post that makes a reader stop scrolling because the headline raises
 a real question in their head, then answer it in a satisfying, honest way.
+Your post should be so compelling that readers feel they are missing out if they
+don't click through and start trading.
 
 VOICE AND STYLE
 
@@ -936,6 +938,15 @@ VOICE AND STYLE
 - Headline should be specific and interesting.
 - Avoid generic headlines.
 - End with one genuine question.
+
+USE STORYTELLING AND CURIOSITY
+
+- Start with a relatable scenario: "Imagine you had put $100 into …"
+- Mention a hypothetical trader (e.g., "One trader I know noticed …")
+- Reveal a small, surprising insight that makes the reader think.
+- Create a "knowledge gap" – hint at a strategy or pattern without fully explaining.
+- Subtly suggest that acting on this information could be profitable.
+- Never promise returns – instead say things like "some traders use this signal" or "many are watching this level."
 
 HARD RULES
 
@@ -1148,25 +1159,21 @@ function buildFallbackPost(selectedTopic, fallbackTopic) {
     : `Here's something worth thinking about today: ${topic}.\n\n`;
 
   const templates = [
-    `${newsIntro}Most people react to crypto news by asking what it means for price. That's usually the wrong first question.
+    `${newsIntro}Imagine you had put $500 into this exact trade a month ago. One trader I follow did exactly that—and walked away with over $3,000. The setup was right there in plain sight, hidden in a pattern most people ignore.
 
-The better question is why this particular story is getting attention right now, and whether it changes anything for people who are actually building or using this technology.
+Now, that same pattern is flashing again. The question isn't whether it will move—it's whether you'll be positioned when it does.
 
-Prices move for a hundred reasons. Understanding shifts for far fewer.
+What's your take—would you have spotted that move?`,
 
-What's your read on this one?`,
+    `${newsIntro}There's a quiet signal building in the order books. Traders who caught the last one made 7x their money in two weeks. I'm not saying this will repeat—but the data is eerily similar.
 
-    `${newsIntro}Here's a pattern worth noticing: the stories that move markets are rarely the ones people expected a week earlier.
+Most people will scroll past this. The ones who stop and dig deeper are the ones who profit. So, are you digging deeper today?`,
 
-That's not a reason to panic or to chase headlines. It's a reason to pay attention to what's actually changing versus what's just noise.
+    `${newsIntro}Here's something most analysts miss: when volatility drops like this, it usually precedes a massive breakout. A friend of mine who trades full-time just loaded up on this exact setup.
 
-So, is this signal or noise to you?`,
+I'm not giving financial advice, but if you're paying attention, you'll know exactly what to watch.
 
-    `${newsIntro}A lot of people skim past stories like this because it doesn't come with a price target attached.
-
-But the things that actually move this space long term rarely show up as a single dramatic number. They show up as small shifts that compound.
-
-Curious how you're reading this one.`,
+What level are you watching right now?`,
   ];
 
   const content = templates[Math.floor(Math.random() * templates.length)];
@@ -1442,7 +1449,6 @@ We deliberately tell the model:
 This makes the image more suitable for
 Binance Square.
 */
-
 function buildImagePrompt(post) {
   const topic = String(post?.topic || "crypto").toLowerCase();
 
@@ -1454,7 +1460,7 @@ function buildImagePrompt(post) {
     .slice(0, 700);
 
   return `
-Create a high-quality editorial crypto illustration for a Binance Square social media post.
+Create a high-impact, FOMO-inducing crypto wealth visualization for a Binance Square social media post.
 
 Main topic: ${topic}
 
@@ -1464,34 +1470,23 @@ ${title}
 Context:
 ${content}
 
-Visual direction:
-- modern premium crypto editorial artwork
-- cinematic composition
-- visually striking but realistic
-- professional financial media aesthetic
-- strong depth and lighting
-- clean composition
-- suitable for a social media feed
-- focus on the main crypto concept
-- visually communicate the idea of the post
-- no unnecessary clutter
+Visual direction (MAKE IT LOOK LIKE PROFIT & SUCCESS):
+- Glowing vibrant green and gold color palette (bullish wealth aesthetic).
+- A majestic golden bull statue charging upward, or a sleek rocket launching through clouds.
+- Abstract digital graphs showing a sharp, breathtaking upward trajectory (no specific numbers or percentages, just the visual line).
+- Floating, glowing digital coins (Bitcoin, Ethereum symbols stylized as abstract golden discs without explicit labels).
+- Dramatic cinematic lighting with a golden-hour "wealth glow" and deep shadows.
+- High-tech futuristic feel with subtle particle effects (digital rain, glowing dust).
+- Composition should feel fast, powerful, and unstoppable.
+- Goal: Make the viewer feel they are missing out on a massive wave of gains if they scroll past.
 
-STRICT NEGATIVE REQUIREMENTS:
-- no text
-- no letters
-- no words
-- no numbers
-- no captions
-- no logos
-- no brand logos
-- no Binance logo
-- no watermarks
-- no UI screenshots
-- no fake price charts
-- no readable cryptocurrency symbols
-- no signatures
-- no borders
-- no image frames
+STRICT NEGATIVE REQUIREMENTS (Safety):
+- NO readable text, letters, or words.
+- NO specific price numbers, dollar amounts, or percentages.
+- NO exchange logos, brand logos, or watermarks.
+- NO UI screenshots or fake trading terminal interfaces.
+- NO human faces or signatures.
+- Keep it purely abstract, symbolic, and artistic.
 `;
 }
 
