@@ -11,46 +11,43 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V7.0.0
+BINANCE SQUARE AI BOT V8.0.0
 =========================================================
 
-WHAT CHANGED FROM V6
----------------------
+NEW IN V8
+----------
 
-- Trending topics are now researched, scored, and stored
-  in MongoDB instead of being used once and thrown away.
-- Each cycle pulls the freshest unused trending topic
-  from the database (falling back to fresh RSS research,
-  then to the static topic pool).
-- Post generation now aims for a curiosity-driven,
-  plain-language headline and body instead of generic
-  "market update" style content. No emojis. No AI-sounding
-  filler phrases.
-- Hashtags reduced from 4 to exactly 3.
+- Generates a related image for EVERY post.
+- Uses Cloudflare Workers AI for image generation.
+- Saves generated image temporarily.
+- Publishes the image through Binance Square image API.
+- Automatically cleans temporary images after publishing.
+- If image generation fails, the bot falls back to
+  publishing the text post normally.
 
 ARCHITECTURE
-------------
 
 External Scheduler
         ↓
 POST /post
         ↓
-Render wakes service
+Google News RSS
         ↓
-Google News RSS  → MongoDB (trending_topics)
+MongoDB trending topics
         ↓
-Groq GPT-OSS
+Groq
         ↓
-Safety validation
+Text post generation
         ↓
-Binance Square publisher
+Cloudflare Workers AI
         ↓
-Persistent state (file) + MongoDB (topics, history)
+Related image
         ↓
-Response
+Binance Square image publisher
+        ↓
+Persistent state + MongoDB
 
 IMPORTANT
----------
 
 There is NO internal timer.
 There is NO setInterval().
@@ -61,7 +58,6 @@ The server only creates a post when:
 POST /post
 
 is called with the correct authorization header.
-
 =========================================================
 */
 
@@ -98,28 +94,7 @@ const REQUEST_TIMEOUT_MS = parsePositiveInteger(
 
 const PORT = parsePositiveInteger(process.env.PORT, 3000);
 
-/*
-IMPORTANT:
-
-For production, default is FALSE.
-
-That means if DRY_RUN is not defined,
-the bot can actually publish.
-
-If you want testing mode:
-
-DRY_RUN=true
-*/
-
 const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
-
-/*
-Pakistan timezone by default.
-
-You can change this in Render:
-
-BOT_TIMEZONE=Asia/Karachi
-*/
 
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Asia/Karachi";
 
@@ -127,7 +102,7 @@ const STATE_FILE = path.join(__dirname, "bot-state.json");
 
 const STATE_BACKUP_FILE = path.join(__dirname, "bot-state.backup.json");
 
-const SQUARE_SCRIPT = path.join(
+const SQUARE_TEXT_SCRIPT = path.join(
   __dirname,
   ".agents",
   "skills",
@@ -136,24 +111,61 @@ const SQUARE_SCRIPT = path.join(
   "post-text.mjs",
 );
 
+const SQUARE_IMAGE_SCRIPT = path.join(
+  __dirname,
+  ".agents",
+  "skills",
+  "square-post",
+  "scripts",
+  "post-image.mjs",
+);
+
 const GENERATION_MAX_TOKENS = parsePositiveInteger(
   process.env.GENERATION_MAX_TOKENS,
   1800,
 );
 
-/*
-How many days a trending topic stays eligible
-before it's considered stale and skipped.
-*/
 const TRENDING_TOPIC_MAX_AGE_HOURS = parsePositiveInteger(
   process.env.TRENDING_TOPIC_MAX_AGE_HOURS,
   36,
 );
 
 /*
-Google News RSS.
+=========================================================
+CLOUDFLARE WORKERS AI
+=========================================================
 
-No Google API key required.
+Set these in your .env / Render environment:
+
+CLOUDFLARE_ACCOUNT_ID=your_account_id
+CLOUDFLARE_API_TOKEN=your_token
+
+Default model:
+
+@cf/black-forest-labs/flux-1-schnell
+
+You can change it with:
+
+CLOUDFLARE_IMAGE_MODEL=...
+
+=========================================================
+*/
+
+const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
+
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+
+const CLOUDFLARE_IMAGE_MODEL =
+  process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
+
+/*
+Temporary directory for generated images.
+*/
+
+const GENERATED_IMAGE_DIR = path.join(__dirname, "generated-images");
+
+/*
+Google News RSS
 */
 
 const GOOGLE_NEWS_URL =
@@ -164,7 +176,7 @@ const GOOGLE_NEWS_URL =
   "&hl=en-US&gl=US&ceid=US:en";
 
 /* =======================================================
-   VALIDATION HELPERS
+   HELPERS
 ======================================================= */
 
 function parsePositiveInteger(value, fallback) {
@@ -201,6 +213,16 @@ if (!MONGODB_URI) {
   process.exit(1);
 }
 
+if (!CLOUDFLARE_ACCOUNT_ID) {
+  console.error("❌ CLOUDFLARE_ACCOUNT_ID is missing.");
+  process.exit(1);
+}
+
+if (!CLOUDFLARE_API_TOKEN) {
+  console.error("❌ CLOUDFLARE_API_TOKEN is missing.");
+  process.exit(1);
+}
+
 /* =======================================================
    GROQ
 ======================================================= */
@@ -231,19 +253,19 @@ async function connectMongo() {
 
   postHistoryCollection = db.collection("post_history");
 
-  /*
-  Indexes are safe to call repeatedly;
-  MongoDB no-ops if they already exist.
-  */
-
-  await trendingTopicsCollection.createIndex({ used: 1, fetchedAt: -1 });
+  await trendingTopicsCollection.createIndex({
+    used: 1,
+    fetchedAt: -1,
+  });
 
   await trendingTopicsCollection.createIndex(
     { fingerprint: 1 },
     { unique: true },
   );
 
-  await postHistoryCollection.createIndex({ publishedAt: -1 });
+  await postHistoryCollection.createIndex({
+    publishedAt: -1,
+  });
 
   console.log("💾 MongoDB connected.");
 }
@@ -259,10 +281,10 @@ async function disconnectMongo() {
   }
 }
 
-/*
-A stable fingerprint so the same headline
-isn't stored twice across cycles.
-*/
+/* =======================================================
+   TRENDING TOPICS
+======================================================= */
+
 function fingerprintTopic(title) {
   return String(title || "")
     .toLowerCase()
@@ -271,10 +293,6 @@ function fingerprintTopic(title) {
     .slice(0, 180);
 }
 
-/*
-Store freshly researched news items into MongoDB.
-Existing fingerprints are left untouched (upsert-safe).
-*/
 async function storeTrendingTopics(newsItems) {
   if (!Array.isArray(newsItems) || newsItems.length === 0) {
     return;
@@ -325,10 +343,6 @@ async function storeTrendingTopics(newsItems) {
   }
 }
 
-/*
-Pull the freshest unused trending topic from MongoDB.
-Falls back to null if nothing usable is found.
-*/
 async function pullTrendingTopic() {
   const cutoff = new Date(
     Date.now() - TRENDING_TOPIC_MAX_AGE_HOURS * 60 * 60 * 1000,
@@ -339,13 +353,22 @@ async function pullTrendingTopic() {
       {
         used: false,
 
-        fetchedAt: { $gte: cutoff },
+        fetchedAt: {
+          $gte: cutoff,
+        },
       },
+
       {
-        $set: { used: true, usedAt: new Date() },
+        $set: {
+          used: true,
+          usedAt: new Date(),
+        },
       },
+
       {
-        sort: { fetchedAt: -1 },
+        sort: {
+          fetchedAt: -1,
+        },
 
         returnDocument: "after",
       },
@@ -359,10 +382,6 @@ async function pullTrendingTopic() {
   }
 }
 
-/*
-Housekeeping: remove topics that are old and
-were never used, so the collection doesn't grow forever.
-*/
 async function pruneStaleTopics() {
   const cutoff = new Date(
     Date.now() - TRENDING_TOPIC_MAX_AGE_HOURS * 4 * 60 * 60 * 1000,
@@ -370,7 +389,9 @@ async function pruneStaleTopics() {
 
   try {
     await trendingTopicsCollection.deleteMany({
-      fetchedAt: { $lt: cutoff },
+      fetchedAt: {
+        $lt: cutoff,
+      },
     });
   } catch (error) {
     console.warn("⚠️ Pruning stale topics failed:", error.message);
@@ -394,6 +415,10 @@ async function storePostHistory(post, result) {
 
       catalystConfidence: post.catalystConfidence,
 
+      imageGenerated: Boolean(post.imageGenerated),
+
+      imageGenerationFailed: Boolean(post.imageGenerationFailed),
+
       publishedAt: new Date(),
 
       dryRun: Boolean(result?.dryRun),
@@ -404,7 +429,7 @@ async function storePostHistory(post, result) {
 }
 
 /* =======================================================
-   TOPIC POOL (fallback only, used when RSS + Mongo empty)
+   TOPIC POOL
 ======================================================= */
 
 const TOPICS = [
@@ -467,13 +492,21 @@ const TOPICS = [
 function createDefaultState() {
   return {
     date: getLocalDate(),
+
     postsToday: 0,
+
     totalPosts: 0,
+
     totalFailures: 0,
+
     totalSkipped: 0,
+
     lastPostAt: null,
+
     lastTriggerAt: null,
+
     lastTriggerResult: null,
+
     history: [],
   };
 }
@@ -487,8 +520,11 @@ let state = createDefaultState();
 function getLocalDate() {
   const formatter = new Intl.DateTimeFormat("en-CA", {
     timeZone: BOT_TIMEZONE,
+
     year: "numeric",
+
     month: "2-digit",
+
     day: "2-digit",
   });
 
@@ -496,7 +532,7 @@ function getLocalDate() {
 }
 
 /* =======================================================
-   LOAD STATE
+   STATE LOAD
 ======================================================= */
 
 async function loadState() {
@@ -504,25 +540,37 @@ async function loadState() {
 
   try {
     const raw = await fs.readFile(STATE_FILE, "utf8");
+
     const parsed = JSON.parse(raw);
 
     if (parsed && typeof parsed === "object") {
-      state = { ...createDefaultState(), ...parsed };
+      state = {
+        ...createDefaultState(),
+        ...parsed,
+      };
+
       loaded = true;
+
       console.log("💾 State loaded successfully.");
     }
-  } catch (error) {
+  } catch {
     console.warn("⚠️ Primary state unavailable.");
   }
 
   if (!loaded) {
     try {
       const raw = await fs.readFile(STATE_BACKUP_FILE, "utf8");
+
       const parsed = JSON.parse(raw);
 
       if (parsed && typeof parsed === "object") {
-        state = { ...createDefaultState(), ...parsed };
+        state = {
+          ...createDefaultState(),
+          ...parsed,
+        };
+
         loaded = true;
+
         console.log("♻️ Backup state restored.");
       }
     } catch {
@@ -531,10 +579,12 @@ async function loadState() {
   }
 
   normalizeState();
+
   resetDailyCounter();
 
   if (!loaded) {
     await saveState();
+
     console.log("💾 Fresh state created.");
   }
 }
@@ -544,10 +594,21 @@ function normalizeState() {
     state.date = getLocalDate();
   }
 
-  if (!Number.isFinite(state.postsToday)) state.postsToday = 0;
-  if (!Number.isFinite(state.totalPosts)) state.totalPosts = 0;
-  if (!Number.isFinite(state.totalFailures)) state.totalFailures = 0;
-  if (!Number.isFinite(state.totalSkipped)) state.totalSkipped = 0;
+  if (!Number.isFinite(state.postsToday)) {
+    state.postsToday = 0;
+  }
+
+  if (!Number.isFinite(state.totalPosts)) {
+    state.totalPosts = 0;
+  }
+
+  if (!Number.isFinite(state.totalFailures)) {
+    state.totalFailures = 0;
+  }
+
+  if (!Number.isFinite(state.totalSkipped)) {
+    state.totalSkipped = 0;
+  }
 
   if (!Array.isArray(state.history)) {
     state.history = [];
@@ -565,15 +626,14 @@ async function saveState() {
     .catch(() => {})
     .then(async () => {
       const tempFile = `${STATE_FILE}.tmp`;
+
       const json = JSON.stringify(state, null, 2);
 
       await fs.writeFile(tempFile, json, "utf8");
 
       try {
         await fs.copyFile(STATE_FILE, STATE_BACKUP_FILE);
-      } catch {
-        /* backup may not exist during first save */
-      }
+      } catch {}
 
       await fs.rename(tempFile, STATE_FILE);
     });
@@ -586,7 +646,9 @@ function resetDailyCounter() {
 
   if (state.date !== today) {
     console.log(`📅 New local day detected: ${today}`);
+
     state.date = today;
+
     state.postsToday = 0;
 
     saveState().catch((error) => {
@@ -605,10 +667,14 @@ async function fetchWithTimeout(
   timeout = REQUEST_TIMEOUT_MS,
 ) {
   const controller = new AbortController();
+
   const timer = setTimeout(() => controller.abort(), timeout);
 
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -640,6 +706,7 @@ function stripHtml(value) {
 
 function getXmlTag(xml, tag) {
   const regex = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
+
   const match = xml.match(regex);
 
   if (!match) return "";
@@ -657,7 +724,8 @@ async function researchWeb() {
   try {
     const response = await fetchWithTimeout(GOOGLE_NEWS_URL, {
       headers: {
-        "User-Agent": "Mozilla/5.0 BinanceSquareAI/7.0",
+        "User-Agent": "Mozilla/5.0 BinanceSquareAI/8.0",
+
         Accept: "application/rss+xml, application/xml, text/xml",
       },
     });
@@ -684,16 +752,22 @@ async function researchWeb() {
       const item = match[1];
 
       const title = getXmlTag(item, "title");
+
       const description = getXmlTag(item, "description");
+
       const publishedAt = getXmlTag(item, "pubDate");
+
       const source = getXmlTag(item, "source");
 
       if (!title) continue;
 
       news.push({
         title: title.slice(0, 300),
+
         description: description.slice(0, 700),
+
         publishedAt: publishedAt.slice(0, 100),
+
         source: source.slice(0, 150),
       });
     }
@@ -706,17 +780,14 @@ async function researchWeb() {
 
     console.log(`   ✅ ${news.length} fresh news items found.`);
 
-    /*
-    Persist everything found this cycle so future
-    cycles can draw on today's full trending pool,
-    not just whatever RSS happens to return right now.
-    */
     await storeTrendingTopics(news);
 
     return news;
   } catch (error) {
     console.warn(`   ⚠️ Research failed: ${error.message}`);
+
     console.log("   ↪️ Will rely on stored trending topics / topic pool.");
+
     return [];
   }
 }
@@ -736,8 +807,10 @@ function getRandomTopic() {
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
+
     [array[i], array[j]] = [array[j], array[i]];
   }
+
   return array;
 }
 
@@ -750,6 +823,7 @@ function getRecentPostMemory() {
     .slice(-12)
     .map((post) => {
       const topic = String(post.topic || "crypto");
+
       const text = String(post.text || "")
         .replace(/\s+/g, " ")
         .slice(0, 200);
@@ -760,34 +834,48 @@ function getRecentPostMemory() {
 }
 
 /* =======================================================
-   GROQ STRUCTURED OUTPUT SCHEMA
+   POST SCHEMA
 ======================================================= */
 
 const POST_SCHEMA = {
   type: "object",
 
   properties: {
-    title: { type: "string" },
+    title: {
+      type: "string",
+    },
 
     topic: {
       type: "string",
+
       enum: ["bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto"],
     },
 
-    content: { type: "string" },
+    content: {
+      type: "string",
+    },
 
-    qualityScore: { type: "number" },
+    qualityScore: {
+      type: "number",
+    },
 
-    newsUsed: { type: "boolean" },
+    newsUsed: {
+      type: "boolean",
+    },
 
     catalystConfidence: {
       type: "string",
+
       enum: ["LOW", "MEDIUM", "HIGH", "NONE"],
     },
 
-    skip: { type: "boolean" },
+    skip: {
+      type: "boolean",
+    },
 
-    skipReason: { type: "string" },
+    skipReason: {
+      type: "string",
+    },
   },
 
   required: [
@@ -832,46 +920,41 @@ GOAL
 
 Write one post that makes a reader stop scrolling because the headline raises
 a real question in their head, then answer it in a satisfying, honest way.
-The engagement should come from genuine curiosity and clarity, not from
-hype, fear, or manipulation.
 
 VOICE AND STYLE
 
-- Plain, everyday language. Write like you're explaining it to a smart
-  friend who isn't a trader.
-- Short sentences. Short paragraphs (1-3 sentences each).
-- No emojis, no emoji-style bullet symbols, no hashtags inside the body.
-- No AI-sounding phrases: never use "in today's fast-paced market",
-  "in the world of crypto", "let's dive in", "as we navigate", "unpack",
-  "game-changer", "in conclusion", or similar filler.
-- No exclamation-point hype. No ALL CAPS words.
-- First line must work as a headline on its own: specific, a little
-  surprising, and honest about what follows. Avoid generic phrasing like
-  "Bitcoin update" or "Crypto market news".
-- The body should deliver on what the headline promises. Do not clickbait
-  with a hook that the rest of the post doesn't actually answer.
-- End with one open, genuine question that invites people to share their
-  own view or experience, not a generic "what do you think?".
+- Plain, everyday language.
+- Short sentences.
+- Short paragraphs.
+- No emojis.
+- No emoji-style bullet symbols.
+- No hashtags inside the body.
+- No AI-sounding phrases.
+- No exclamation-point hype.
+- No ALL CAPS words.
+- First line must work as a headline.
+- Headline should be specific and interesting.
+- Avoid generic headlines.
+- End with one genuine question.
 
 HARD RULES
 
 - Do not invent current prices.
 - Do not invent exact percentage movements.
 - Do not invent breaking news.
-- If research is provided, use only information supported by it, and be
-  clear you are relaying reported information, not something you verified.
+- If research is provided, use only information supported by it.
 - If research is not provided, discuss the fallback topic generally.
-- Do not give financial advice. Do not tell anyone to buy or sell.
-- Do not promise or imply profits, returns, or price targets.
+- Do not give financial advice.
+- Do not tell anyone to buy or sell.
+- Do not promise profits.
 - Do not fabricate statistics.
-- Do not use manipulative urgency ("don't miss out", "last chance",
-  "before it's too late").
-- Include exactly 3 hashtags at the very end, after the disclaimer line
-  described below, relevant to the topic.
-- End with exactly this line, on its own, after the hashtags:
+- Do not use manipulative urgency.
+- Include exactly 3 hashtags at the very end.
+- End with exactly:
+
 Not financial advice.
 
-Post length: 700-1400 characters approximately, not counting hashtags.
+Post length: 700-1400 characters approximately.
 
 ${prompt}
 `,
@@ -891,7 +974,9 @@ ${prompt}
 
           json_schema: {
             name: "binance_square_post",
+
             strict: true,
+
             schema: POST_SCHEMA,
           },
         },
@@ -929,7 +1014,7 @@ ${prompt}
 }
 
 /* =======================================================
-   NORMALIZE GENERATED POST
+   NORMALIZE POST
 ======================================================= */
 
 function normalizeGeneratedPost(post) {
@@ -983,7 +1068,7 @@ function normalizeGeneratedPost(post) {
 }
 
 /* =======================================================
-   HASHTAGS (now exactly 3)
+   HASHTAGS
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto") {
@@ -991,11 +1076,6 @@ function ensureHashtags(content, topic = "crypto") {
 
   let text = String(content || "").trim();
 
-  /*
-  Remove ALL hashtags from the original content.
-  We will add back exactly 3.
-  This prevents Binance API error 220094.
-  */
   text = text
     .replace(/#[a-zA-Z0-9_]+/g, "")
     .replace(/\n{3,}/g, "\n\n")
@@ -1003,14 +1083,17 @@ function ensureHashtags(content, topic = "crypto") {
 
   const defaultTags = {
     bitcoin: ["#Bitcoin", "#BTC", "#Crypto"],
-    btc: ["#Bitcoin", "#BTC", "#Crypto"],
+
     ethereum: ["#Ethereum", "#ETH", "#Crypto"],
-    eth: ["#Ethereum", "#ETH", "#Crypto"],
+
     bnb: ["#BNB", "#Binance", "#Crypto"],
+
     solana: ["#Solana", "#SOL", "#Crypto"],
-    sol: ["#Solana", "#SOL", "#Crypto"],
+
     xrp: ["#XRP", "#Ripple", "#Crypto"],
+
     market: ["#Crypto", "#Market", "#Trading"],
+
     crypto: ["#Crypto", "#Binance", "#Blockchain"],
   };
 
@@ -1023,7 +1106,9 @@ function ensureHashtags(content, topic = "crypto") {
   const finalTags = [];
 
   for (const tag of selectedTags) {
-    if (finalTags.length >= MAX_HASHTAGS) break;
+    if (finalTags.length >= MAX_HASHTAGS) {
+      break;
+    }
 
     if (
       !finalTags.some(
@@ -1037,7 +1122,9 @@ function ensureHashtags(content, topic = "crypto") {
   const fallbackTags = ["#Crypto", "#Binance", "#Blockchain"];
 
   for (const tag of fallbackTags) {
-    if (finalTags.length >= MAX_HASHTAGS) break;
+    if (finalTags.length >= MAX_HASHTAGS) {
+      break;
+    }
 
     if (
       !finalTags.some(
@@ -1048,11 +1135,9 @@ function ensureHashtags(content, topic = "crypto") {
     }
   }
 
-  const disclaimer = "Not financial advice.";
-
   text = text.replace(/Not financial advice\.\s*$/i, "").trim();
 
-  return `${text}\n\n${finalTags.join(" ")}\n\n${disclaimer}`;
+  return `${text}\n\n${finalTags.join(" ")}\n\nNot financial advice.`;
 }
 
 /* =======================================================
@@ -1073,72 +1158,71 @@ The better question is why this particular story is getting attention right now,
 
 Prices move for a hundred reasons. Understanding shifts for far fewer.
 
-What's your read on this one?
-
-Not financial advice.`,
+What's your read on this one?`,
 
     `${newsIntro}Here's a pattern worth noticing: the stories that move markets are rarely the ones people expected a week earlier.
 
 That's not a reason to panic or to chase headlines. It's a reason to pay attention to what's actually changing versus what's just noise.
 
-So, is this signal or noise to you?
-
-Not financial advice.`,
+So, is this signal or noise to you?`,
 
     `${newsIntro}A lot of people skim past stories like this because it doesn't come with a price target attached.
 
 But the things that actually move this space long term rarely show up as a single dramatic number. They show up as small shifts that compound.
 
-Curious how you're reading this one.
-
-Not financial advice.`,
+Curious how you're reading this one.`,
   ];
 
   const content = templates[Math.floor(Math.random() * templates.length)];
 
   return {
-    title: `${String(topic).slice(0, 60)}`,
+    title: String(topic).slice(0, 60),
+
     topic: "crypto",
+
     content: ensureHashtags(content, "crypto"),
+
     qualityScore: 7,
+
     newsUsed: Boolean(selectedTopic),
+
     catalystConfidence: selectedTopic ? "LOW" : "NONE",
+
     skip: false,
+
     skipReason: "",
   };
 }
 
 /* =======================================================
-   SELECT TOPIC (Mongo trending → live RSS → static pool)
+   SELECT TOPIC
 ======================================================= */
 
 async function selectTopic(newsResearch) {
-  /*
-  Priority 1: an unused trending topic already
-  stored in MongoDB from an earlier research pass
-  today (keeps a bigger, deduped pool to draw from).
-  */
   const stored = await pullTrendingTopic();
 
   if (stored) {
     return {
       title: stored.title,
+
       description: stored.description,
+
       publishedAt: stored.publishedAt,
+
       source: stored.source,
+
       fromDb: true,
     };
   }
 
-  /*
-  Priority 2: whatever this cycle's live RSS
-  research turned up.
-  */
   if (Array.isArray(newsResearch) && newsResearch.length > 0) {
     const picked =
       newsResearch[Math.floor(Math.random() * newsResearch.length)];
 
-    return { ...picked, fromDb: false };
+    return {
+      ...picked,
+      fromDb: false,
+    };
   }
 
   return null;
@@ -1159,8 +1243,11 @@ async function generatePost(newsResearch) {
 
   if (selectedTopic) {
     console.log(`   📰 ${selectedTopic.title}`);
+
     console.log(
-      `   🗄️ Source: ${selectedTopic.fromDb ? "MongoDB trending store" : "live RSS"}`,
+      `   🗄️ Source: ${
+        selectedTopic.fromDb ? "MongoDB trending store" : "live RSS"
+      }`,
     );
   } else {
     console.log(`   💡 ${fallbackTopic}`);
@@ -1193,7 +1280,7 @@ FALLBACK TOPIC:
 
 ${fallbackTopic}
 
-RECENT POSTS (do not repeat these headlines or angles):
+RECENT POSTS:
 
 ${recentPosts || "None"}
 
@@ -1202,15 +1289,13 @@ TASK:
 Create exactly ONE Binance Square crypto post.
 
 If current web research exists:
-- Use it as the seed for a genuinely curious angle a reader wouldn't
-  have thought of on their own.
-- Do not add facts that are not present.
-- Treat the headline as a reported topic rather than something you
-  personally verified.
+- Use it as the seed.
+- Do not add unsupported facts.
+- Treat the headline as reported information.
 
 If current web research is unavailable:
 - Use the fallback topic.
-- Find a genuinely interesting angle on it rather than a generic summary.
+- Find an interesting angle.
 
 Set newsUsed to true only when current web research was actually used.
 Set skip to false unless there is genuinely no usable way to create a post.
@@ -1220,11 +1305,13 @@ Set skip to false unless there is genuinely no usable way to create a post.
     const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
 
     post.content = ensureHashtags(post.content, post.topic);
+
     post.content = forceDisclaimer(post.content);
 
     return post;
   } catch (error) {
     console.error("⚠️ Groq generation failed:", error.message);
+
     console.log("↪️ Building fallback post.");
 
     return buildFallbackPost(selectedTopic, fallbackTopic);
@@ -1251,13 +1338,21 @@ function validatePost(post) {
   const reasons = [];
 
   if (!post) {
-    return { valid: false, reasons: ["empty post"] };
+    return {
+      valid: false,
+      reasons: ["empty post"],
+    };
   }
 
   const content = String(post.content || "").trim();
 
-  if (content.length < 100) reasons.push("post is too short");
-  if (content.length > 5000) reasons.push("post is too long");
+  if (content.length < 100) {
+    reasons.push("post is too short");
+  }
+
+  if (content.length > 5000) {
+    reasons.push("post is too long");
+  }
 
   const lower = content.toLowerCase();
 
@@ -1300,89 +1395,325 @@ function validatePost(post) {
 
   const suspiciousPatterns = [
     /\$\d[\d,.]*\s*(?:today|now|currently)/i,
+
     /\d+(?:\.\d+)?%\s*(?:today|now|currently)/i,
   ];
 
   for (const pattern of suspiciousPatterns) {
     if (pattern.test(content)) {
       reasons.push("contains an unsupported live-market claim");
+
       break;
     }
   }
 
-  return { valid: reasons.length === 0, reasons };
+  return {
+    valid: reasons.length === 0,
+
+    reasons,
+  };
 }
 
 /* =======================================================
    DUPLICATE CHECK
 ======================================================= */
 
-/*
-Intentionally disabled.
-
-The user requested duplicate protection
-to remain disabled.
-*/
-
 function isDuplicate() {
-  return { duplicate: false, score: 0 };
+  return {
+    duplicate: false,
+    score: 0,
+  };
 }
 
 /* =======================================================
-   PUBLISH TO BINANCE SQUARE
+   IMAGE PROMPT
 ======================================================= */
 
-function publishToSquare(content) {
+/*
+Creates a clean prompt specifically for
+Cloudflare's image model.
+
+IMPORTANT:
+
+We deliberately tell the model:
+
+- no text
+- no logos
+- no watermarks
+- no UI
+- no charts containing fake numbers
+
+This makes the image more suitable for
+Binance Square.
+*/
+
+function buildImagePrompt(post) {
+  const topic = String(post?.topic || "crypto").toLowerCase();
+
+  const title = String(post?.title || "").slice(0, 250);
+
+  const content = String(post?.content || "")
+    .replace(/#[a-zA-Z0-9_]+/g, "")
+    .replace(/Not financial advice\./gi, "")
+    .slice(0, 700);
+
+  return `
+Create a high-quality editorial crypto illustration for a Binance Square social media post.
+
+Main topic: ${topic}
+
+Headline:
+${title}
+
+Context:
+${content}
+
+Visual direction:
+- modern premium crypto editorial artwork
+- cinematic composition
+- visually striking but realistic
+- professional financial media aesthetic
+- strong depth and lighting
+- clean composition
+- suitable for a social media feed
+- focus on the main crypto concept
+- visually communicate the idea of the post
+- no unnecessary clutter
+
+STRICT NEGATIVE REQUIREMENTS:
+- no text
+- no letters
+- no words
+- no numbers
+- no captions
+- no logos
+- no brand logos
+- no Binance logo
+- no watermarks
+- no UI screenshots
+- no fake price charts
+- no readable cryptocurrency symbols
+- no signatures
+- no borders
+- no image frames
+`;
+}
+
+/* =======================================================
+   CLOUDFLARE IMAGE GENERATION
+======================================================= */
+
+async function generateImageWithCloudflare(post) {
+  console.log("\n🎨 Generating related image with Cloudflare Workers AI...");
+
+  const prompt = buildImagePrompt(post);
+
+  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(
+    CLOUDFLARE_ACCOUNT_ID,
+  )}/ai/run/${encodeURIComponent(CLOUDFLARE_IMAGE_MODEL)}`;
+
+  try {
+    const response = await fetchWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+
+          "Content-Type": "application/json",
+        },
+
+        body: JSON.stringify({
+          prompt,
+        }),
+      },
+
+      120000,
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+
+      throw new Error(`Cloudflare API error ${response.status}: ${errorText}`);
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+
+    let imageBuffer;
+
+    /*
+    Most Workers AI image models return
+    the generated image directly as binary.
+
+    Some configurations may return JSON.
+    We support both.
+    */
+
+    if (contentType.includes("application/json")) {
+      const json = await response.json();
+
+      let base64Image =
+        json?.result?.image ||
+        json?.result?.output ||
+        json?.image ||
+        json?.output;
+
+      if (Array.isArray(base64Image)) {
+        base64Image = base64Image[0];
+      }
+
+      if (typeof base64Image !== "string") {
+        throw new Error(
+          "Cloudflare returned JSON but no image data was found.",
+        );
+      }
+
+      /*
+      Remove data URI prefix if present.
+      */
+
+      base64Image = base64Image.replace(/^data:image\/[^;]+;base64,/i, "");
+
+      imageBuffer = Buffer.from(base64Image, "base64");
+    } else {
+      const arrayBuffer = await response.arrayBuffer();
+
+      imageBuffer = Buffer.from(arrayBuffer);
+    }
+
+    if (!imageBuffer || imageBuffer.length < 1000) {
+      throw new Error("Cloudflare returned an empty or invalid image.");
+    }
+
+    await fs.mkdir(GENERATED_IMAGE_DIR, {
+      recursive: true,
+    });
+
+    const timestamp = Date.now();
+
+    const random = Math.random().toString(36).slice(2, 8);
+
+    const imagePath = path.join(
+      GENERATED_IMAGE_DIR,
+      `binance-${timestamp}-${random}.png`,
+    );
+
+    await fs.writeFile(imagePath, imageBuffer);
+
+    console.log(`   ✅ Image generated: ${imagePath}`);
+
+    console.log(
+      `   📦 Image size: ${(imageBuffer.length / 1024).toFixed(1)} KB`,
+    );
+
+    return imagePath;
+  } catch (error) {
+    console.error("❌ Cloudflare image generation failed:", error.message);
+
+    throw error;
+  }
+}
+
+/* =======================================================
+   CLEAN GENERATED IMAGE
+======================================================= */
+
+async function cleanupGeneratedImage(imagePath) {
+  if (!imagePath) return;
+
+  try {
+    await fs.unlink(imagePath);
+
+    console.log("🧹 Temporary image deleted.");
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.warn("⚠️ Could not delete temporary image:", error.message);
+    }
+  }
+}
+
+/* =======================================================
+   PUBLISH TEXT TO BINANCE
+======================================================= */
+
+function publishTextToSquare(content) {
   return new Promise((resolve, reject) => {
-    console.log("\n📡 Publishing to Binance Square...");
+    console.log("\n📡 Publishing text to Binance Square...");
 
     if (DRY_RUN) {
       console.log("🧪 DRY_RUN=true");
-      console.log("   No real publication will occur.");
+
       console.log("\n----- GENERATED POST -----\n");
+
       console.log(content);
+
       console.log("\n--------------------------\n");
 
-      resolve({ success: true, dryRun: true, id: null, link: null });
+      resolve({
+        success: true,
+
+        dryRun: true,
+
+        id: null,
+
+        link: null,
+      });
+
       return;
     }
 
-    fs.access(SQUARE_SCRIPT)
+    fs.access(SQUARE_TEXT_SCRIPT)
       .then(() => {
-        const child = spawn("node", [SQUARE_SCRIPT, "--text", content], {
+        const child = spawn("node", [SQUARE_TEXT_SCRIPT, "--text", content], {
           cwd: path.join(__dirname, ".agents", "skills", "square-post"),
 
-          env: { ...process.env, BINANCE_SQUARE_OPENAPI_KEY },
+          env: {
+            ...process.env,
+
+            BINANCE_SQUARE_OPENAPI_KEY,
+          },
 
           shell: false,
+
           windowsHide: true,
         });
 
         let stdout = "";
+
         let stderr = "";
+
         let settled = false;
 
         const finishReject = (error) => {
           if (settled) return;
+
           settled = true;
+
           reject(error);
         };
 
         const finishResolve = (value) => {
           if (settled) return;
+
           settled = true;
+
           resolve(value);
         };
 
         child.stdout.on("data", (data) => {
           const text = data.toString();
+
           stdout += text;
+
           process.stdout.write(text);
         });
 
         child.stderr.on("data", (data) => {
           const text = data.toString();
+
           stderr += text;
+
           process.stderr.write(text);
         });
 
@@ -1395,17 +1726,29 @@ function publishToSquare(content) {
             finishReject(
               new Error(`Square publisher exited with code ${code}\n${stderr}`),
             );
+
             return;
           }
 
           const id = stdout.match(/ID:\s*(.+)/i)?.[1]?.trim() || null;
+
           const link = stdout.match(/Link:\s*(.+)/i)?.[1]?.trim() || null;
 
-          finishResolve({ success: true, dryRun: false, id, link, stdout });
+          finishResolve({
+            success: true,
+
+            dryRun: false,
+
+            id,
+
+            link,
+
+            stdout,
+          });
         });
       })
       .catch((error) => {
-        finishReject(
+        reject(
           new Error(
             `Binance Square publisher script not found: ${error.message}`,
           ),
@@ -1415,29 +1758,195 @@ function publishToSquare(content) {
 }
 
 /* =======================================================
+   PUBLISH IMAGE TO BINANCE
+======================================================= */
+
+function publishImageToSquare(content, imagePath) {
+  return new Promise((resolve, reject) => {
+    console.log("\n📡 Publishing image post to Binance Square...");
+
+    if (DRY_RUN) {
+      console.log("🧪 DRY_RUN=true");
+
+      console.log("\n----- GENERATED POST -----\n");
+
+      console.log(content);
+
+      console.log("\n🖼️ Image:");
+
+      console.log(imagePath);
+
+      console.log("\n--------------------------\n");
+
+      resolve({
+        success: true,
+
+        dryRun: true,
+
+        id: null,
+
+        link: null,
+      });
+
+      return;
+    }
+
+    fs.access(SQUARE_IMAGE_SCRIPT)
+      .then(() => {
+        const child = spawn(
+          "node",
+          [SQUARE_IMAGE_SCRIPT, "--text", content, "--images", imagePath],
+          {
+            cwd: path.join(__dirname, ".agents", "skills", "square-post"),
+
+            env: {
+              ...process.env,
+
+              BINANCE_SQUARE_OPENAPI_KEY,
+            },
+
+            shell: false,
+
+            windowsHide: true,
+          },
+        );
+
+        let stdout = "";
+
+        let stderr = "";
+
+        let settled = false;
+
+        const finishReject = (error) => {
+          if (settled) return;
+
+          settled = true;
+
+          reject(error);
+        };
+
+        const finishResolve = (value) => {
+          if (settled) return;
+
+          settled = true;
+
+          resolve(value);
+        };
+
+        child.stdout.on("data", (data) => {
+          const text = data.toString();
+
+          stdout += text;
+
+          process.stdout.write(text);
+        });
+
+        child.stderr.on("data", (data) => {
+          const text = data.toString();
+
+          stderr += text;
+
+          process.stderr.write(text);
+        });
+
+        child.on("error", (error) => {
+          finishReject(error);
+        });
+
+        child.on("close", (code) => {
+          if (code !== 0) {
+            finishReject(
+              new Error(
+                `Square image publisher exited with code ${code}\n${stderr}`,
+              ),
+            );
+
+            return;
+          }
+
+          const id = stdout.match(/ID:\s*(.+)/i)?.[1]?.trim() || null;
+
+          const link = stdout.match(/Link:\s*(.+)/i)?.[1]?.trim() || null;
+
+          finishResolve({
+            success: true,
+
+            dryRun: false,
+
+            id,
+
+            link,
+
+            stdout,
+          });
+        });
+      })
+      .catch((error) => {
+        reject(
+          new Error(
+            `Binance Square image publisher script not found: ${error.message}`,
+          ),
+        );
+      });
+  });
+}
+
+/* =======================================================
+   GENERATE + PUBLISH IMAGE
+======================================================= */
+
+async function generateAndPublishImage(post) {
+  let imagePath = null;
+
+  try {
+    imagePath = await generateImageWithCloudflare(post);
+
+    const result = await publishImageToSquare(post.content, imagePath);
+
+    return {
+      ...result,
+
+      imageGenerated: true,
+    };
+  } finally {
+    await cleanupGeneratedImage(imagePath);
+  }
+}
+
+/* =======================================================
    SAVE POST
 ======================================================= */
 
 async function savePost(post, result) {
   state.history.push({
     id: result?.id || null,
+
     title: post.title || null,
+
     topic: post.topic || "crypto",
+
     text: post.content,
+
     qualityScore: post.qualityScore,
+
     newsUsed: Boolean(post.newsUsed),
+
     catalystConfidence: post.catalystConfidence,
+
+    imageGenerated: Boolean(post.imageGenerated),
+
+    imageGenerationFailed: Boolean(post.imageGenerationFailed),
+
     publishedAt: new Date().toISOString(),
+
     dryRun: Boolean(result?.dryRun),
   });
 
-  if (state.history.length > MAX_HISTORY) {
-    state.history = state.history.slice(-MAX_HISTORY);
-  }
-
   if (!result?.dryRun) {
     state.postsToday++;
+
     state.totalPosts++;
+
     state.lastPostAt = new Date().toISOString();
   }
 
@@ -1454,50 +1963,90 @@ async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 BINANCE SQUARE AI BOT V7.0.0");
+
+  console.log("🚀 BINANCE SQUARE AI BOT V8.0.0");
+
   console.log("================================================");
+
   console.log(
-    `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
+    `🕐 ${new Date().toLocaleString("en-US", {
+      timeZone: BOT_TIMEZONE,
+    })}`,
   );
+
   console.log(`🌍 Timezone: ${BOT_TIMEZONE}`);
+
   console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
 
   if (state.postsToday >= MAX_POSTS_PER_DAY) {
     console.log("\n🛑 Daily limit reached.");
 
     state.totalSkipped++;
+
     await saveState();
 
-    return { success: false, skipped: true, reason: "daily_limit" };
+    return {
+      success: false,
+
+      skipped: true,
+
+      reason: "daily_limit",
+    };
   }
 
   try {
+    /*
+    ===============================================
+    STEP 1
+    ===============================================
+    */
+
     const news = await researchWeb();
 
     console.log(`\n📰 Research items available: ${news.length}`);
 
     pruneStaleTopics().catch(() => {});
 
+    /*
+    ===============================================
+    STEP 2
+    ===============================================
+    */
+
     const post = await generatePost(news);
 
     console.log("\n📝 Topic:", post.topic);
+
     console.log("⭐ Quality:", `${post.qualityScore}/10`);
+
     console.log("📰 Web research used:", post.newsUsed);
+
     console.log("🎯 Catalyst confidence:", post.catalystConfidence);
 
     if (post.skip) {
       console.log("\n⏭️ AI skipped this cycle.");
+
       console.log("Reason:", post.skipReason || "No reason provided.");
 
       state.totalSkipped++;
+
       await saveState();
 
       return {
         success: false,
+
         skipped: true,
+
         reason: post.skipReason || "ai_skip",
       };
     }
+
+    /*
+    ===============================================
+    STEP 3
+    VALIDATION
+    ===============================================
+    */
 
     console.log("\n🛡️ Running safety validation...");
 
@@ -1511,17 +2060,28 @@ async function runCycle() {
       }
 
       state.totalSkipped++;
+
       await saveState();
 
       return {
         success: false,
+
         skipped: true,
+
         reason: "validation_failed",
+
         validation: validation.reasons,
       };
     }
 
     console.log("   ✓ Safety validation passed.");
+
+    /*
+    ===============================================
+    STEP 4
+    DUPLICATE CHECK
+    ===============================================
+    */
 
     const duplicate = isDuplicate();
 
@@ -1529,39 +2089,115 @@ async function runCycle() {
       console.log("⏭️ Duplicate detected.");
 
       state.totalSkipped++;
+
       await saveState();
 
-      return { success: false, skipped: true, reason: "duplicate" };
+      return {
+        success: false,
+
+        skipped: true,
+
+        reason: "duplicate",
+      };
     }
 
     console.log("   ✓ Duplicate protection disabled.");
 
-    const result = await publishToSquare(post.content);
+    /*
+    ===============================================
+    STEP 5
+    IMAGE GENERATION
+    ===============================================
+    */
+
+    let result;
+
+    try {
+      console.log("\n🎨 IMAGE PIPELINE STARTING");
+
+      result = await generateAndPublishImage(post);
+
+      post.imageGenerated = true;
+
+      post.imageGenerationFailed = false;
+
+      console.log("\n🖼️ Image post published successfully.");
+    } catch (imageError) {
+      /*
+      IMPORTANT:
+
+      If Cloudflare temporarily fails,
+      we DO NOT lose the entire post.
+
+      The bot falls back to a normal
+      text post.
+      */
+
+      console.error("\n⚠️ Image pipeline failed:", imageError.message);
+
+      console.log("↪️ Falling back to text-only Binance Square post.");
+
+      post.imageGenerated = false;
+
+      post.imageGenerationFailed = true;
+
+      result = await publishTextToSquare(post.content);
+    }
+
+    /*
+    ===============================================
+    STEP 6
+    SAVE
+    ===============================================
+    */
 
     await savePost(post, result);
 
     console.log("\n╔══════════════════════════════════════════╗");
+
     console.log("║        ✅ CYCLE COMPLETED               ║");
+
     console.log("╚══════════════════════════════════════════╝");
 
-    if (result.id) console.log(`🆔 ID: ${result.id}`);
-    if (result.link) console.log(`🔗 ${result.link}`);
-    if (result.dryRun) console.log("🧪 DRY RUN — not published.");
+    if (result.id) {
+      console.log(`🆔 ID: ${result.id}`);
+    }
+
+    if (result.link) {
+      console.log(`🔗 ${result.link}`);
+    }
+
+    if (result.dryRun) {
+      console.log("🧪 DRY RUN — not published.");
+    }
+
+    console.log(`🖼️ Image generated: ${Boolean(post.imageGenerated)}`);
 
     return {
       success: true,
+
       id: result.id || null,
+
       link: result.link || null,
+
       dryRun: Boolean(result.dryRun),
+
+      imageGenerated: Boolean(post.imageGenerated),
     };
   } catch (error) {
     state.totalFailures++;
+
     await saveState();
 
     console.error("\n❌ Cycle error:");
+
     console.error(error?.stack || error?.message || error);
 
-    return { success: false, error: error?.message || "Unknown cycle error" };
+    return {
+      success: false,
+
+      error: error?.message || "Unknown error",
+    };
   }
 }
 
@@ -1574,7 +2210,12 @@ let cycleRunning = false;
 async function safeRunCycle() {
   if (cycleRunning) {
     console.log("⚠️ Previous cycle is still running.");
-    return { success: false, error: "A post cycle is already running." };
+
+    return {
+      success: false,
+
+      error: "A post cycle is already running.",
+    };
   }
 
   cycleRunning = true;
@@ -1586,8 +2227,10 @@ async function safeRunCycle() {
       "❌ Unexpected cycle error:",
       error?.stack || error?.message || error,
     );
+
     return {
       success: false,
+
       error: error?.message || "Unexpected cycle error",
     };
   } finally {
@@ -1618,17 +2261,22 @@ function isAuthorized(req) {
 async function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
+
     let finished = false;
 
     const finishReject = (error) => {
       if (finished) return;
+
       finished = true;
+
       reject(error);
     };
 
     const finishResolve = () => {
       if (finished) return;
+
       finished = true;
+
       resolve(body);
     };
 
@@ -1637,11 +2285,13 @@ async function readRequestBody(req) {
 
       if (body.length > 10000) {
         finishReject(new Error("Request body too large."));
+
         req.destroy();
       }
     });
 
     req.on("end", finishResolve);
+
     req.on("error", finishReject);
   });
 }
@@ -1655,7 +2305,9 @@ function sendJSON(res, statusCode, data) {
 
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
+
     "Cache-Control": "no-store",
+
     "X-Content-Type-Options": "nosniff",
   });
 
@@ -1676,22 +2328,42 @@ async function startServer() {
 
         return sendJSON(res, 200, {
           status: "alive",
+
           service: "binance-square-ai-bot",
-          version: "7.0.0",
+
+          version: "8.0.0",
+
           timezone: BOT_TIMEZONE,
+
           localDate: getLocalDate(),
+
           postsToday: state.postsToday,
+
           maxPostsPerDay: MAX_POSTS_PER_DAY,
+
           totalPosts: state.totalPosts,
+
           totalFailures: state.totalFailures,
+
           totalSkipped: state.totalSkipped,
+
           uptime: process.uptime(),
+
           lastPostAt: state.lastPostAt,
+
           lastTriggerAt: state.lastTriggerAt,
+
           lastTriggerResult: state.lastTriggerResult,
+
           cycleRunning,
+
           dryRun: DRY_RUN,
+
           mongoConnected: Boolean(mongoClient),
+
+          imageGeneration: "Cloudflare Workers AI",
+
+          imageModel: CLOUDFLARE_IMAGE_MODEL,
         });
       }
 
@@ -1700,13 +2372,20 @@ async function startServer() {
 
         if (!isAuthorized(req)) {
           console.log("❌ Unauthorized POST trigger.");
-          return sendJSON(res, 401, { success: false, error: "Unauthorized." });
+
+          return sendJSON(res, 401, {
+            success: false,
+
+            error: "Unauthorized.",
+          });
         }
 
         if (cycleRunning) {
           console.log("⚠️ Post cycle already running.");
+
           return sendJSON(res, 409, {
             success: false,
+
             error: "A post cycle is already running.",
           });
         }
@@ -1715,10 +2394,16 @@ async function startServer() {
           await readRequestBody(req);
         } catch (error) {
           console.warn("⚠️ Request body warning:", error.message);
-          return sendJSON(res, 400, { success: false, error: error.message });
+
+          return sendJSON(res, 400, {
+            success: false,
+
+            error: error.message,
+          });
         }
 
         state.lastTriggerAt = new Date().toISOString();
+
         await saveState();
 
         console.log("🚀 Starting requested post cycle...");
@@ -1726,15 +2411,21 @@ async function startServer() {
         const result = await safeRunCycle();
 
         state.lastTriggerResult = result;
+
         await saveState();
 
         if (result.success) {
           return sendJSON(res, 200, {
             success: true,
+
             message: "Post cycle completed.",
+
             result,
+
             postsToday: state.postsToday,
+
             totalPosts: state.totalPosts,
+
             lastPostAt: state.lastPostAt,
           });
         }
@@ -1742,28 +2433,41 @@ async function startServer() {
         if (result.skipped) {
           return sendJSON(res, 200, {
             success: false,
+
             skipped: true,
+
             reason: result.reason,
+
             validation: result.validation || undefined,
+
             postsToday: state.postsToday,
+
             totalPosts: state.totalPosts,
+
             totalSkipped: state.totalSkipped,
           });
         }
 
         return sendJSON(res, 500, {
           success: false,
+
           message: "Post cycle failed.",
+
           error: result.error || "Unknown error",
+
           postsToday: state.postsToday,
+
           totalPosts: state.totalPosts,
+
           totalFailures: state.totalFailures,
         });
       }
 
       return sendJSON(res, 404, {
         success: false,
+
         error: "Route not found.",
+
         availableRoutes: ["GET /", "GET /health", "POST /post"],
       });
     } catch (error) {
@@ -1772,6 +2476,7 @@ async function startServer() {
       if (!res.headersSent) {
         return sendJSON(res, 500, {
           success: false,
+
           error: "Internal server error.",
         });
       }
@@ -1785,8 +2490,11 @@ async function startServer() {
 
     httpServer.listen(PORT, "0.0.0.0", () => {
       console.log(`🟢 HTTP server running on port ${PORT}`);
+
       console.log(`🌍 Timezone: ${BOT_TIMEZONE}`);
+
       console.log("🚀 Production server ready.");
+
       resolve();
     });
   });
@@ -1800,9 +2508,11 @@ let shuttingDown = false;
 
 async function shutdown(signal) {
   if (shuttingDown) return;
+
   shuttingDown = true;
 
   console.log(`\n\n🛑 ${signal} received.`);
+
   console.log("💾 Saving state...");
 
   try {
@@ -1816,20 +2526,24 @@ async function shutdown(signal) {
   if (httpServer) {
     httpServer.close(() => {
       console.log("👋 HTTP server closed.");
+
       process.exit(0);
     });
 
     setTimeout(() => {
       console.log("⚠️ Forced shutdown.");
+
       process.exit(0);
     }, 10000).unref();
   } else {
     console.log("👋 Bot stopped safely.");
+
     process.exit(0);
   }
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
+
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 /* =======================================================
@@ -1838,12 +2552,13 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 async function startBotAndServer() {
   await connectMongo();
+
   await loadState();
 
   console.log(`
 ╔══════════════════════════════════════════════════╗
 ║                                                  ║
-║       🤖 BINANCE SQUARE AI BOT V7.0.0           ║
+║       🤖 BINANCE SQUARE AI BOT V8.0.0           ║
 ║                                                  ║
 ║       ⚡ HTTP TRIGGER ARCHITECTURE               ║
 ║                                                  ║
@@ -1851,28 +2566,55 @@ async function startBotAndServer() {
 `);
 
   console.log(`🧠 Provider: Groq`);
+
   console.log(`🧠 Model: ${GROQ_MODEL}`);
+
   console.log(`🌐 Web research: Google News RSS`);
+
   console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
+
   console.log(`📊 Binance market API: DISABLED`);
+
   console.log(`📈 Technical analysis: DISABLED`);
+
   console.log(`📰 Live news research: ENABLED`);
+
   console.log(`🛡️ Safety validation: ENABLED`);
+
   console.log(`🔎 Duplicate protection: DISABLED`);
+
   console.log(`📡 Binance Square: ENABLED`);
+
+  console.log(`🎨 Image generation: ENABLED`);
+
+  console.log(`🎨 Image provider: Cloudflare Workers AI`);
+
+  console.log(`🎨 Image model: ${CLOUDFLARE_IMAGE_MODEL}`);
+
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
+
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
+
   console.log(`❓ Topic pool: ${TOPICS.length}`);
+
   console.log(`🔐 POST authentication: ENABLED`);
+
   console.log(`⏱️ Internal interval: DISABLED`);
+
   console.log(`📡 External scheduling: ENABLED`);
+
   console.log(`🌍 Bot timezone: ${BOT_TIMEZONE}`);
 
   await startServer();
 
   console.log("\n🟢 Bot is waiting for external triggers.");
+
   console.log("📡 POST /post → creates exactly ONE post.");
+
+  console.log("🎨 Every post attempts to generate a related image.");
+
   console.log("💤 No internal timer is running.");
+
   console.log("⏰ External scheduler controls posting times.");
 }
 
@@ -1885,9 +2627,7 @@ startBotAndServer().catch(async (error) => {
 
   try {
     await saveState();
-  } catch {
-    /* nothing else we can do */
-  }
+  } catch {}
 
   await disconnectMongo();
 

@@ -1,35 +1,63 @@
-import Groq from "groq-sdk";
-import dotenv from "dotenv";
+import "dotenv/config";
+import fs from "fs/promises";
 
-dotenv.config();
+const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+const apiToken = process.env.CLOUDFLARE_API_TOKEN;
 
-const groq = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
-
-try {
-  const response = await groq.chat.completions.create({
-    model: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
-
-    messages: [
-      {
-        role: "system",
-        content: "You are a professional cryptocurrency content writer.",
-      },
-      {
-        role: "user",
-        content:
-          "Write one short, useful and original Binance Square post about Bitcoin. Do not invent current prices or news.",
-      },
-    ],
-  });
-
-  console.log("\n========== GROQ TEST ==========\n");
-
-  console.log(response.choices[0].message.content);
-
-  console.log("\n================================\n");
-} catch (error) {
-  console.error("\nGroq API failed:\n");
-  console.error(error?.message || error);
+if (!accountId || !apiToken) {
+  throw new Error(
+    "Missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_API_TOKEN in .env",
+  );
 }
+
+const model = "@cf/black-forest-labs/flux-1-schnell";
+
+const prompt = `
+Create a professional crypto-news image for a Binance Square post.
+
+Subject: Bitcoin market analysis.
+
+Show a futuristic but realistic Bitcoin trading environment,
+Bitcoin symbol, clean financial charts, subtle market data,
+dark premium background, cinematic lighting.
+
+No text, no words, no captions, no watermark.
+Square composition suitable for a social media crypto post.
+`;
+
+console.log("Generating image...");
+
+const response = await fetch(
+  `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${model}`,
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      prompt,
+    }),
+  },
+);
+
+if (!response.ok) {
+  const error = await response.text();
+  throw new Error(`Cloudflare API error ${response.status}: ${error}`);
+}
+
+const result = await response.json();
+
+if (!result.success) {
+  console.error(result);
+  throw new Error("Cloudflare image generation failed");
+}
+
+const imageBase64 = result.result.image;
+
+const imageBuffer = Buffer.from(imageBase64, "base64");
+
+await fs.writeFile("cloudflare-test.png", imageBuffer);
+
+console.log("✅ Image generated!");
+console.log("Saved as: cloudflare-test.png");
