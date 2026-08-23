@@ -1507,11 +1507,9 @@ async function generateImageWithCloudflare(post) {
   console.log("\n🎨 Generating related image with Cloudflare Workers AI...");
 
   const prompt = buildImagePrompt(post);
-
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(
     CLOUDFLARE_ACCOUNT_ID,
   )}/ai/run/${encodeURIComponent(CLOUDFLARE_IMAGE_MODEL)}`;
-
   try {
     const response = await fetchWithTimeout(
       endpoint,
