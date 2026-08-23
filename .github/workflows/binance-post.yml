@@ -4,7 +4,11 @@ on:
   # Fires at a clean 3-hour cadence (00:00, 03:00, 06:00 ... UTC).
   # The actual trigger time is randomized inside the job below.
   schedule:
+<<<<<<< HEAD
     - cron: "0 */3 * * *"
+=======
+    - cron: "0 */2 * * *"
+>>>>>>> d2a38a595b8681aa6e50bc3e1dd7e217d7d813ca
 
   workflow_dispatch:
 
