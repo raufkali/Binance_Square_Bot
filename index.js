@@ -19,7 +19,7 @@ NEW IN V9.3
 - Psychologically optimized prompt (personal action, specific prices).
 - Forces $TICKER in first sentence for max click-through.
 - Generates REALISTIC TradingView-style charts (no fake PNL).
-- Peak-hour posting filter (skips dead zones).
+- Peak-hour posting filter removed – post on every trigger.
 - Only 2 hashtags for cleaner engagement.
 
 =========================================================
@@ -55,31 +55,7 @@ const PORT = parsePositiveInteger(process.env.PORT, 3000);
 const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Asia/Karachi";
 
-// [INFLUENCER CHANGE] Peak hours for posting (UTC)
-((ALLOWED_HOURS = 0),
-  1,
-  2,
-  3,
-  4,
-  5,
-  6,
-  7,
-  8,
-  9,
-  10,
-  11,
-  12,
-  13,
-  14,
-  15,
-  16,
-  17,
-  18,
-  19,
-  20,
-  21,
-  22,
-  23);
+// [REMOVED] Peak hours filter – no longer used
 
 const STATE_FILE = path.join(__dirname, "bot-state.json");
 const STATE_BACKUP_FILE = path.join(__dirname, "bot-state.backup.json");
@@ -1488,12 +1464,20 @@ async function savePost(post, result) {
 }
 
 /* =======================================================
-   [INFLUENCER CHANGE] MAIN CYCLE WITH PEAK-HOUR FILTER
+   MAIN CYCLE – PEAK-HOUR FILTER REMOVED
 ======================================================= */
 
 async function runCycle() {
   resetDailyCounter();
 
+  // [REMOVED] Peak‑hour filter – the bot will post on every trigger
+
+  console.log("\n================================================");
+  console.log("🚀 BINANCE SQUARE AI BOT V9.3.0 (INFLUENCER)");
+  console.log("================================================");
+  console.log(
+    `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
+  );
   console.log(`🌍 Timezone: ${BOT_TIMEZONE}`);
   console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
 
@@ -1696,8 +1680,8 @@ async function startServer() {
           imageGeneration: "Cloudflare (Realistic Charts)",
           imageModel: CLOUDFLARE_IMAGE_MODEL,
           strategy:
-            "Momentum ranking (Volume * PriceChange) + Peak-hour posting",
-          allowedHoursUTC: ALLOWED_HOURS,
+            "Momentum ranking (Volume * PriceChange) – no time restrictions",
+          // removed "allowedHoursUTC"
         });
       }
 
@@ -1848,7 +1832,7 @@ async function startBotAndServer() {
   console.log(
     `🎨 Image provider: Cloudflare Workers AI (${CLOUDFLARE_IMAGE_MODEL})`,
   );
-  console.log(`⏰ Peak-hour filter: ${ALLOWED_HOURS.join(", ")} UTC`);
+  console.log(`⏰ Peak-hour filter: REMOVED (posts on every trigger)`);
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
   console.log(`❓ Topic pool: ${TOPICS.length}`);
@@ -1865,6 +1849,9 @@ async function startBotAndServer() {
   console.log("🎨 Images are realistic TradingView-style charts.");
   console.log(
     "💤 No internal timer is running. External scheduler controls times.",
+  );
+  console.log(
+    "⏰ No peak‑hour restrictions – every trigger posts (if daily limit allows).",
   );
 }
 
