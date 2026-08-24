@@ -56,9 +56,30 @@ const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Asia/Karachi";
 
 // [INFLUENCER CHANGE] Peak hours for posting (UTC)
-const ALLOWED_HOURS = process.env.ALLOWED_HOURS
-  ? process.env.ALLOWED_HOURS.split(",").map(Number)
-  : [9, 13, 17, 21]; // London open, US pre-market, US open, US close
+((ALLOWED_HOURS = 0),
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23);
 
 const STATE_FILE = path.join(__dirname, "bot-state.json");
 const STATE_BACKUP_FILE = path.join(__dirname, "bot-state.backup.json");
@@ -1473,24 +1494,6 @@ async function savePost(post, result) {
 async function runCycle() {
   resetDailyCounter();
 
-  // [INFLUENCER CHANGE] Peak-hour filtering – skip dead zones
-  const now = new Date();
-  const utcHour = now.getUTCHours();
-  if (!ALLOWED_HOURS.includes(utcHour) && !process.env.FORCE_POST) {
-    console.log(
-      `⏰ Skipping post – UTC hour ${utcHour} is not in allowed hours [${ALLOWED_HOURS.join(", ")}]`,
-    );
-    state.totalSkipped++;
-    await saveState();
-    return { success: false, skipped: true, reason: "off_peak_hours" };
-  }
-
-  console.log("\n================================================");
-  console.log("🚀 BINANCE SQUARE AI BOT V9.3.0 (INFLUENCER)");
-  console.log("================================================");
-  console.log(
-    `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
-  );
   console.log(`🌍 Timezone: ${BOT_TIMEZONE}`);
   console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
 
