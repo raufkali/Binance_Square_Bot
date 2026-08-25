@@ -303,8 +303,9 @@ const TOPICS = [
   "DeFi",
   "Web3",
   "Crypto whales",
-  "Crypto liquidity",
   "Crypto volatility",
+  "Crypto liquidity",
+
   "Trading psychology",
   "Risk management",
   "Common crypto trading mistakes",
