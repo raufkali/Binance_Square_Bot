@@ -1,34 +1,70 @@
-name: Binance Square Post Scheduler
+name: Alternating Post Scheduler (Binance / LinkedIn)
 
 on:
-  # Fires at a clean 3-hour cadence (00:00, 03:00, 06:00 ... UTC).
-  # The actual trigger time is randomized inside the job below.
+  # Runs automatically every 3 hours
   schedule:
     - cron: "0 */3 * * *"
 
+  # Allows manual testing
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: post-scheduler
+  cancel-in-progress: false
 
 jobs:
   trigger-post:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Random pre-trigger delay
+      # =====================================================
+      # Checkout repository so we can read/write scheduler state
+      # =====================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # =====================================================
+      # Decide which platform to post to
+      # =====================================================
+      - name: Decide which platform to post to
+        id: platform
+        shell: bash
         run: |
-          # Random delay between 1 and 6 minutes, in seconds.
-          # Keeps the visible trigger time off the exact hour mark
-          # and different every run, without spending much runner time.
-          DELAY=$(( (RANDOM % 300) + 60 ))
+          STATE_FILE=".post-platform"
 
-          MINUTES=$((DELAY / 60))
-          SECONDS=$((DELAY % 60))
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "No previous platform found."
+            echo "linkedin" > "$STATE_FILE"
+            TARGET="linkedin"
+            LAST="none"
+          else
+            LAST=$(tr -d '[:space:]' < "$STATE_FILE")
 
-          echo "Sleeping ${MINUTES}m ${SECONDS}s before triggering..."
+            if [ "$LAST" = "linkedin" ]; then
+              TARGET="binance"
+            else
+              TARGET="linkedin"
+            fi
+          fi
 
-          sleep "$DELAY"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
 
+          echo "Previous platform: $LAST"
+          echo "Current platform: $TARGET"
+
+      # =====================================================
+      # Trigger Binance Square Bot
+      # Same host as LinkedIn — combined server handles /post
+      # =====================================================
       - name: Trigger Binance Square Bot
+        if: steps.platform.outputs.target == 'binance'
+        shell: bash
         run: |
+          echo "Triggering Binance Square Bot..."
+
           curl -X POST \
             -H "Authorization: Bearer ${{ secrets.POST_TRIGGER_SECRET }}" \
             -H "Content-Type: application/json" \
@@ -39,5 +75,50 @@ jobs:
             --output response.json \
             "https://binance-square-bot-loi6.onrender.com/post"
 
-          echo "Response:"
+          echo "Binance response:"
           cat response.json
+
+      # =====================================================
+      # Trigger LinkedIn Bot
+      # Same host as Binance — combined server handles /linkedin/post
+      # =====================================================
+      - name: Trigger LinkedIn Bot
+        if: steps.platform.outputs.target == 'linkedin'
+        shell: bash
+        run: |
+          echo "Triggering LinkedIn Bot..."
+
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.LINKEDIN_POST_TRIGGER_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            --fail \
+            --show-error \
+            --silent \
+            --output response.json \
+            "https://binance-square-bot-loi6.onrender.com/linkedin/post"
+
+          echo "LinkedIn response:"
+          cat response.json
+
+      # =====================================================
+      # Save the platform that actually ran
+      # =====================================================
+      - name: Save scheduler state
+        shell: bash
+        run: |
+          TARGET="${{ steps.platform.outputs.target }}"
+
+          echo "$TARGET" > .post-platform
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .post-platform
+
+          if git diff --cached --quiet; then
+            echo "No state changes."
+          else
+            git commit -m "Update post platform state"
+            git push
+          fi
