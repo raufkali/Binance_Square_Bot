@@ -1,43 +1,170 @@
-name: Binance Square Post Scheduler
+name: Social Post Scheduler
 
 on:
-  # Fires at a clean 3-hour cadence (00:00, 03:00, 06:00 ... UTC).
-  # The actual trigger time is randomized inside the job below.
+  # Every 3 hours
   schedule:
     - cron: "0 */3 * * *"
 
+  # Allows manual testing
   workflow_dispatch:
+
+# Required so GitHub Actions can update post-state.txt
+permissions:
+  contents: write
 
 jobs:
   trigger-post:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ============================================================
+      # 1. Get repository
+      # ============================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================================
+      # 2. Random delay
+      # ============================================================
       - name: Random pre-trigger delay
         run: |
-          # Random delay between 1 and 6 minutes, in seconds.
-          # Keeps the visible trigger time off the exact hour mark
-          # and different every run, without spending much runner time.
+          # Random delay between 1 and 6 minutes
           DELAY=$(( (RANDOM % 300) + 60 ))
 
           MINUTES=$((DELAY / 60))
           SECONDS=$((DELAY % 60))
 
           echo "Sleeping ${MINUTES}m ${SECONDS}s before triggering..."
-
           sleep "$DELAY"
 
-      - name: Trigger Binance Square Bot
+      # ============================================================
+      # 3. Determine which platform posts next
+      # ============================================================
+      - name: Determine next platform
+        id: platform
+        shell: bash
         run: |
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.POST_TRIGGER_SECRET }}" \
-            -H "Content-Type: application/json" \
-            --data '{}' \
-            --fail \
-            --show-error \
-            --silent \
-            --output response.json \
-            "https://binance-square-bot-loi6.onrender.com/post"
 
-          echo "Response:"
+          if [ ! -f post-state.txt ]; then
+            echo "No previous state found."
+            echo "First post will be Binance."
+
+            NEXT="binance"
+
+          else
+
+            LAST=$(cat post-state.txt | tr -d '[:space:]')
+
+            echo "Previous platform: $LAST"
+
+            if [ "$LAST" = "binance" ]; then
+              NEXT="linkedin"
+
+            elif [ "$LAST" = "linkedin" ]; then
+              NEXT="binance"
+
+            else
+              echo "Unknown state. Defaulting to Binance."
+              NEXT="binance"
+            fi
+
+          fi
+
+          echo "Next platform: $NEXT"
+
+          echo "platform=$NEXT" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 4. Trigger Binance OR LinkedIn
+      # ============================================================
+      - name: Trigger selected platform
+        shell: bash
+        env:
+          POST_TRIGGER_SECRET: ${{ secrets.POST_TRIGGER_SECRET }}
+        run: |
+
+          PLATFORM="${{ steps.platform.outputs.platform }}"
+
+          echo "======================================"
+          echo "Platform selected: $PLATFORM"
+          echo "======================================"
+
+          if [ "$PLATFORM" = "binance" ]; then
+
+            echo "Triggering Binance Square Bot..."
+
+            curl -X POST \
+              -H "Authorization: Bearer ${POST_TRIGGER_SECRET}" \
+              -H "Content-Type: application/json" \
+              --data '{}' \
+              --fail \
+              --show-error \
+              --silent \
+              --output response.json \
+              "https://binance-square-bot-loi6.onrender.com/post"
+
+          elif [ "$PLATFORM" = "linkedin" ]; then
+
+            echo "Triggering LinkedIn Bot..."
+
+            curl -X POST \
+              -H "Authorization: Bearer ${POST_TRIGGER_SECRET}" \
+              -H "Content-Type: application/json" \
+              --data '{}' \
+              --fail \
+              --show-error \
+              --silent \
+              --output response.json \
+              "https://binance-square-bot-loi6.onrender.com/linkedin/post"
+
+          else
+
+            echo "ERROR: Unknown platform: $PLATFORM"
+            exit 1
+
+          fi
+
+          echo ""
+          echo "======================================"
+          echo "API Response:"
+          echo "======================================"
+
           cat response.json
+
+      # ============================================================
+      # 5. Save successful platform as previous state
+      # ============================================================
+      - name: Save post state
+        shell: bash
+        run: |
+
+          PLATFORM="${{ steps.platform.outputs.platform }}"
+
+          echo "$PLATFORM" > post-state.txt
+
+          echo "Saved state:"
+          cat post-state.txt
+
+      # ============================================================
+      # 6. Commit state so next run knows what happened
+      # ============================================================
+      - name: Commit post state
+        shell: bash
+        run: |
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add post-state.txt
+
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update social post state"
+
+          git push
