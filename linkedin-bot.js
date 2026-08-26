@@ -23,6 +23,7 @@ FIXES:
   7. Prevents publisher names from becoming organizations.
   8. Prevents Google News wrapper URLs from being published
      as application URLs.
+     
   9. Better Google News article extraction.
  10. Better fallback generation when AI fails.
  11. Better LinkedIn post formatting.
