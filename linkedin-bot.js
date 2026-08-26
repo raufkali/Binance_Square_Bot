@@ -10,23 +10,9 @@ dotenv.config();
 
 /*
 =========================================================
-LINKEDIN AI BOT V3.0.0 (REAL JOB SOURCING EDITION)
-=========================================================
-Key changes vs v2.1.0:
-- Google News RSS replaced with real, structured job-board
-  sources (Arbeitnow + RemoteOK). News headlines have no
-  company/requirements/apply-link, which is why the old bot
-  could not produce posts like your target example and had
-  nothing real to post.
-- Prompt + schema rewritten to match your target post style,
-  using ONLY fields that came from the real listing (company,
-  title, location, requirements, apply URL). No invented
-  emails, deadlines, or salaries.
-- Retry/backoff added around every network call that can
-  transiently fail (job fetch, image generation, LinkedIn API).
-- LinkedIn token expiry is now surfaced proactively, and a
-  401 from LinkedIn clears the stored token immediately instead
-  of failing silently on every future cycle.
+LINKEDIN AI BOT V2.2.0 (INDIVIDUAL PROFILE EDITION)
+– Now with reliable job postings, enhanced prompt,
+  "HIRING" overlay, and retry logic.
 =========================================================
 */
 
@@ -34,7 +20,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 /* =======================================================
-   CONFIG
+   CONFIG – Hardcoded defaults (no new env vars needed)
 ======================================================= */
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
@@ -71,29 +57,23 @@ const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 const CLOUDFLARE_IMAGE_MODEL =
   process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
 
-// How many days before expiry to start logging loud warnings.
-const TOKEN_EXPIRY_WARNING_DAYS = parsePositiveInteger(
-  process.env.LINKEDIN_TOKEN_EXPIRY_WARNING_DAYS,
-  5,
-);
-
 const STATE_FILE = path.join(__dirname, "linkedin-state.json");
 const STATE_BACKUP_FILE = path.join(__dirname, "linkedin-state.backup.json");
 const GENERATED_IMAGE_DIR = path.join(__dirname, "linkedin-generated-images");
 
-// Real, keyless, structured job-board sources.
-// Arbeitnow: broad international listings (includes remote + on-site).
-// RemoteOK: remote-first tech jobs.
-const ARBEITNOW_API_URL = "https://www.arbeitnow.com/api/job-board-api";
-const REMOTEOK_API_URL = "https://remoteok.com/api";
+// ===== HARDCODED JOB FEED (no .env needed) =====
+// Change this to any RSS feed from Indeed, Rozee.pk, etc.
+const JOB_FEED_URL =
+  "https://rss.indeed.com/rss?q=software+engineer&l=Pakistan";
 
+// ===== LINKEDIN API ENDPOINTS =====
 const LINKEDIN_API = "https://api.linkedin.com/rest";
 const LINKEDIN_OAUTH_AUTHORIZE =
   "https://www.linkedin.com/oauth/v2/authorization";
 const LINKEDIN_OAUTH_TOKEN = "https://www.linkedin.com/oauth/v2/accessToken";
 
 /* =======================================================
-   VALIDATION
+   VALIDATION (secrets check)
 ======================================================= */
 
 if (!GROQ_API_KEY) {
@@ -165,13 +145,6 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
-function stripHtmlTags(value) {
-  return String(value || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 async function fetchWithTimeout(
   url,
   options = {},
@@ -186,32 +159,12 @@ async function fetchWithTimeout(
   }
 }
 
-/**
- * Generic retry-with-backoff wrapper for any async operation that can
- * transiently fail (network blips, rate limits, cold starts).
- * `shouldRetry` lets callers opt out of retrying permanent failures
- * (e.g. 401 auth errors) so we don't waste time/hammer the API.
- */
-async function withRetry(
-  fn,
-  { retries = 3, baseDelayMs = 1000, label = "operation", shouldRetry } = {},
-) {
-  let lastError;
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      return await fn(attempt);
-    } catch (error) {
-      lastError = error;
-      const canRetry = shouldRetry ? shouldRetry(error) : true;
-      if (!canRetry || attempt >= retries) break;
-      const delay = baseDelayMs * attempt;
-      console.warn(
-        `   ⚠️ ${label} failed (attempt ${attempt}/${retries}): ${error.message}. Retrying in ${delay}ms...`,
-      );
-      await sleep(delay);
-    }
+function shuffleArray(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
   }
-  throw lastError;
+  return array;
 }
 
 /* =======================================================
@@ -219,7 +172,7 @@ async function withRetry(
 ======================================================= */
 
 let mongoClient = null;
-let jobListingsCollection = null;
+let trendingTopicsCollection = null;
 let postHistoryCollection = null;
 let linkedinTokensCollection = null;
 
@@ -239,20 +192,17 @@ async function connectMongo() {
 
     const db = mongoClient.db(MONGODB_DB_NAME);
 
-    jobListingsCollection = db.collection("linkedin_job_listings");
+    trendingTopicsCollection = db.collection("linkedin_trending_topics");
     postHistoryCollection = db.collection("linkedin_post_history");
     linkedinTokensCollection = db.collection("linkedin_tokens");
 
-    await jobListingsCollection.createIndex(
+    await trendingTopicsCollection.createIndex(
       { fingerprint: 1 },
       { unique: true },
     );
-    await jobListingsCollection.createIndex({ used: 1, fetchedAt: -1 });
+    await trendingTopicsCollection.createIndex({ used: 1, fetchedAt: -1 });
     await postHistoryCollection.createIndex({ publishedAt: -1 });
-    await linkedinTokensCollection.createIndex({
-      provider: 1,
-      unique: true,
-    });
+    await linkedinTokensCollection.createIndex({ provider: 1, unique: true });
 
     console.log("💾 [LinkedIn] MongoDB connected.");
   } catch (error) {
@@ -265,7 +215,7 @@ async function disconnectMongo() {
   try {
     if (mongoClient) await mongoClient.close();
     mongoClient = null;
-    jobListingsCollection = null;
+    trendingTopicsCollection = null;
     postHistoryCollection = null;
     linkedinTokensCollection = null;
     console.log("💾 [LinkedIn] MongoDB connection closed.");
@@ -311,9 +261,8 @@ async function saveLinkedInToken(data) {
   );
 }
 
-async function clearLinkedInToken(reason = "unspecified") {
+async function clearLinkedInToken() {
   if (!linkedinTokensCollection) return;
-  console.warn(`⚠️ Clearing stored LinkedIn token. Reason: ${reason}`);
   await linkedinTokensCollection.deleteOne({ provider: "linkedin" });
 }
 
@@ -436,21 +385,8 @@ async function getValidLinkedInAccessToken() {
 
   if (stored.expiresAt && new Date(stored.expiresAt) <= new Date()) {
     console.warn("⚠️ Stored LinkedIn token has expired.");
-    await clearLinkedInToken("expired");
+    await clearLinkedInToken();
     return null;
-  }
-
-  if (stored.expiresAt) {
-    const daysLeft =
-      (new Date(stored.expiresAt).getTime() - Date.now()) /
-      (24 * 60 * 60 * 1000);
-    if (daysLeft <= TOKEN_EXPIRY_WARNING_DAYS) {
-      console.warn(
-        `⚠️ LinkedIn token expires in ${daysLeft.toFixed(
-          1,
-        )} day(s). Re-authenticate via /auth/linkedin soon to avoid a gap.`,
-      );
-    }
   }
 
   return stored.accessToken;
@@ -514,221 +450,182 @@ async function handleLinkedInAuthCallback({ code, state, error }) {
 }
 
 /* =======================================================
-   REAL JOB SOURCING (replaces Google News RSS)
+   JOB RESEARCH (Now uses hardcoded job RSS feed)
 ======================================================= */
 
-function fingerprintJob(job) {
-  return `${job.company}::${job.title}`
+function decodeXml(value) {
+  return String(value || "")
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/gi, "'");
+}
+
+function stripHtml(value) {
+  return String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function getXmlTag(xml, tag) {
+  const match = xml.match(
+    new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"),
+  );
+  if (!match) return "";
+  return decodeXml(stripHtml(match[1])).trim();
+}
+
+function fingerprintTopic(title) {
+  return String(title || "")
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim()
     .slice(0, 180);
 }
 
-function shuffleArray(array) {
-  for (let i = array.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [array[i], array[j]] = [array[j], array[i]];
-  }
-  return array;
-}
-
-async function fetchArbeitnowJobs() {
-  const response = await withRetry(
-    () => fetchWithTimeout(ARBEITNOW_API_URL, {}, 15000),
-    { retries: 3, baseDelayMs: 1500, label: "Arbeitnow fetch" },
-  );
-
-  if (!response.ok) throw new Error(`Arbeitnow HTTP ${response.status}`);
-  const json = await response.json();
-  const items = Array.isArray(json?.data) ? json.data : [];
-
-  return items.map((item) => ({
-    source: "Arbeitnow",
-    title: String(item.title || "").slice(0, 200),
-    company: String(item.company_name || "").slice(0, 150),
-    location: String(item.location || (item.remote ? "Remote" : "")).slice(
-      0,
-      120,
-    ),
-    remote: Boolean(item.remote),
-    jobTypes: Array.isArray(item.job_types) ? item.job_types : [],
-    tags: Array.isArray(item.tags) ? item.tags.slice(0, 10) : [],
-    description: stripHtmlTags(item.description).slice(0, 2500),
-    applyUrl: String(item.url || "").slice(0, 500),
-    publishedAt: item.created_at
-      ? new Date(item.created_at * 1000).toISOString()
-      : null,
-  }));
-}
-
-async function fetchRemoteOkJobs() {
-  const response = await withRetry(
-    () =>
-      fetchWithTimeout(
-        REMOTEOK_API_URL,
-        { headers: { "User-Agent": "LinkedInAIBot/3.0" } },
-        15000,
-      ),
-    { retries: 3, baseDelayMs: 1500, label: "RemoteOK fetch" },
-  );
-
-  if (!response.ok) throw new Error(`RemoteOK HTTP ${response.status}`);
-  const json = await response.json();
-  const items = Array.isArray(json) ? json.slice(1) : []; // first entry is metadata
-
-  return items
-    .filter((item) => item && item.position)
-    .map((item) => ({
-      source: "RemoteOK",
-      title: String(item.position || "").slice(0, 200),
-      company: String(item.company || "").slice(0, 150),
-      location: String(item.location || "Remote").slice(0, 120) || "Remote",
-      remote: true,
-      jobTypes: [],
-      tags: Array.isArray(item.tags) ? item.tags.slice(0, 10) : [],
-      description: stripHtmlTags(item.description).slice(0, 2500),
-      applyUrl: String(item.url || item.apply_url || "").slice(0, 500),
-      publishedAt: item.date ? new Date(item.date).toISOString() : null,
-    }));
-}
-
-async function storeJobListings(jobs) {
-  if (!jobListingsCollection || !Array.isArray(jobs) || jobs.length === 0) {
+async function storeTrendingTopics(items) {
+  if (
+    !trendingTopicsCollection ||
+    !Array.isArray(items) ||
+    items.length === 0
+  ) {
     return;
   }
 
-  const operations = jobs
-    .filter((job) => job.title && job.company && job.applyUrl)
-    .map((job) => ({
-      updateOne: {
-        filter: { fingerprint: fingerprintJob(job) },
-        update: {
-          $setOnInsert: {
-            ...job,
-            fingerprint: fingerprintJob(job),
-            fetchedAt: new Date(),
-            used: false,
-            usedAt: null,
-          },
+  const operations = items.map((item) => ({
+    updateOne: {
+      filter: { fingerprint: fingerprintTopic(item.title) },
+      update: {
+        $setOnInsert: {
+          fingerprint: fingerprintTopic(item.title),
+          title: item.title,
+          description: item.description,
+          source: item.source,
+          publishedAt: item.publishedAt,
+          fetchedAt: new Date(),
+          used: false,
+          usedAt: null,
         },
-        upsert: true,
       },
-    }));
-
-  if (operations.length === 0) return;
+      upsert: true,
+    },
+  }));
 
   try {
-    await jobListingsCollection.bulkWrite(operations, { ordered: false });
+    await trendingTopicsCollection.bulkWrite(operations, { ordered: false });
   } catch (error) {
-    console.warn("⚠️ Job listing storage failed:", error.message);
+    console.warn("⚠️ Topic storage failed:", error.message);
   }
 }
 
-async function pullJobListing() {
-  if (!jobListingsCollection) return null;
+async function pullTrendingTopic() {
+  if (!trendingTopicsCollection) return null;
 
-  const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
   try {
-    const result = await jobListingsCollection.findOneAndUpdate(
+    const result = await trendingTopicsCollection.findOneAndUpdate(
       { used: false, fetchedAt: { $gte: cutoff } },
       { $set: { used: true, usedAt: new Date() } },
       { sort: { fetchedAt: -1 }, returnDocument: "after" },
     );
     return result || null;
   } catch (error) {
-    console.warn("⚠️ Job listing pull failed:", error.message);
+    console.warn("⚠️ Topic pull failed:", error.message);
     return null;
   }
 }
 
-/**
- * Fetches real, structured job listings from public job-board APIs.
- * Falls back gracefully if one source fails - as long as one source
- * succeeds we still have real jobs to post about.
- */
+// ===== NEW: Fetch from job RSS feed =====
 async function researchOpportunities() {
-  console.log("\n🌐 [LinkedIn] Fetching real job listings...");
-
-  const results = await Promise.allSettled([
-    fetchArbeitnowJobs(),
-    fetchRemoteOkJobs(),
-  ]);
-
+  console.log("\n🌐 [LinkedIn] Searching job RSS feed...");
   let jobs = [];
-  results.forEach((result, index) => {
-    const label = index === 0 ? "Arbeitnow" : "RemoteOK";
-    if (result.status === "fulfilled") {
-      console.log(`   ✅ ${label}: ${result.value.length} jobs found.`);
-      jobs = jobs.concat(result.value);
-    } else {
-      console.warn(`   ⚠️ ${label} failed: ${result.reason?.message}`);
+
+  try {
+    const response = await fetchWithTimeout(JOB_FEED_URL, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 LinkedInAI/2.2",
+        Accept: "application/rss+xml, application/xml, text/xml",
+      },
+    });
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const xml = await response.text();
+    const items = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
+
+    for (const match of items.slice(0, 25)) {
+      const item = match[1];
+      const title = getXmlTag(item, "title");
+      if (!title) continue;
+
+      jobs.push({
+        title: title.slice(0, 300),
+        description: getXmlTag(item, "description").slice(0, 700),
+        publishedAt: getXmlTag(item, "pubDate").slice(0, 100),
+        source: getXmlTag(item, "link") || "Job Board",
+      });
     }
-  });
 
-  jobs = jobs.filter((job) => job.title && job.company && job.applyUrl);
-  shuffleArray(jobs);
-
-  if (jobs.length === 0) {
-    console.warn("   ⚠️ No job listings retrieved from any source.");
+    shuffleArray(jobs);
+    console.log(`   ✅ ${jobs.length} job listings found.`);
+    await storeTrendingTopics(jobs);
+  } catch (error) {
+    console.warn("   ⚠️ Job feed fetch failed:", error.message);
+    // Fallback: create a dummy topic so we never skip
   }
 
-  await storeJobListings(jobs);
   return jobs;
 }
 
-async function selectJob(jobs) {
-  const stored = await pullJobListing();
+// ===== Fallback topic if no jobs found =====
+async function selectTopic(newsItems) {
+  const stored = await pullTrendingTopic();
   if (stored) return { ...stored, fromDb: true };
 
-  if (Array.isArray(jobs) && jobs.length) {
-    const selected = jobs[Math.floor(Math.random() * jobs.length)];
+  if (Array.isArray(newsItems) && newsItems.length) {
+    const selected = newsItems[Math.floor(Math.random() * newsItems.length)];
     return { ...selected, fromDb: false };
   }
 
-  return null;
+  // FALLBACK: always return a career tips topic so bot never skips
+  return {
+    title: "How to land your dream job in 2026",
+    description:
+      "Update your CV, network actively, and apply consistently to opportunities that match your skills.",
+    publishedAt: new Date().toISOString(),
+    source: "LinkedIn Bot",
+    fromDb: false,
+  };
 }
 
 /* =======================================================
-   GROQ
+   GROQ – Enhanced prompt to match your exact format
 ======================================================= */
 
 const POST_SCHEMA = {
   type: "object",
   properties: {
     title: { type: "string" },
-    organization: { type: "string" },
-    orgHashtag: { type: "string" },
-    jobType: {
+    type: {
       type: "string",
-      enum: ["Full-time", "Part-time", "Contract", "Internship", "Remote"],
+      enum: ["job", "internship", "scholarship", "fellowship"],
     },
-    industry: { type: "string" },
-    location: { type: "string" },
-    requirements: {
-      type: "array",
-      items: { type: "string" },
-    },
-    applyLine: { type: "string" },
-    hashtags: {
-      type: "array",
-      items: { type: "string" },
-    },
+    organization: { type: "string" },
+    content: { type: "string" },
     imageQuery: { type: "string" },
     skip: { type: "boolean" },
     skipReason: { type: "string" },
   },
   required: [
     "title",
+    "type",
     "organization",
-    "orgHashtag",
-    "jobType",
-    "industry",
-    "location",
-    "requirements",
-    "applyLine",
-    "hashtags",
+    "content",
     "imageQuery",
     "skip",
     "skipReason",
@@ -736,174 +633,78 @@ const POST_SCHEMA = {
   additionalProperties: false,
 };
 
-function buildPostText(fields) {
-  const {
-    orgHashtag,
-    organization,
-    title,
-    jobType,
-    industry,
-    location,
-    requirements,
-    applyLine,
-    hashtags,
-  } = fields;
-
-  const reqLines = requirements
-    .slice(0, 8)
-    .map((req) => `🔹 ${req}`)
-    .join("\n");
-
-  const tagLine = hashtags
-    .slice(0, 3)
-    .map((tag) => (tag.startsWith("#") ? tag : `#${tag}`))
-    .join(" ");
-
-  return [
-    `🚀 #${orgHashtag} is Hiring | ${title}`,
-    "",
-    `${organization} is looking for a ${title} to join their team.`,
-    "",
-    "📌 Key Details:",
-    `* Job Type: ${jobType}`,
-    `* Position: ${title}`,
-    `* Industry: ${industry}`,
-    `* Location: ${location}`,
-    "",
-    "What we're looking for:",
-    reqLines,
-    "",
-    applyLine,
-    "",
-    tagLine,
-  ]
-    .filter((line) => line !== undefined && line !== null)
-    .join("\n")
-    .trim();
-}
-
-function normalizePost(raw, sourceJob) {
+function normalizePost(post) {
   const allowedTypes = new Set([
-    "Full-time",
-    "Part-time",
-    "Contract",
-    "Internship",
-    "Remote",
+    "job",
+    "internship",
+    "scholarship",
+    "fellowship",
   ]);
 
-  const fields = {
-    title: String(raw?.title || "")
-      .trim()
-      .slice(0, 150),
-    organization: String(raw?.organization || "")
-      .trim()
-      .slice(0, 150),
-    orgHashtag: String(raw?.orgHashtag || "")
-      .trim()
-      .replace(/[^a-zA-Z0-9]/g, "")
-      .slice(0, 60),
-    jobType: allowedTypes.has(raw?.jobType) ? raw.jobType : "Full-time",
-    industry: String(raw?.industry || "")
-      .trim()
-      .slice(0, 100),
-    location: String(raw?.location || "")
-      .trim()
-      .slice(0, 100),
-    requirements: Array.isArray(raw?.requirements)
-      ? raw.requirements
-          .map((r) => stripEmojis(String(r || "")).trim())
-          .filter(Boolean)
-          .slice(0, 8)
-      : [],
-    applyLine: stripEmojis(String(raw?.applyLine || "")).trim(),
-    hashtags: Array.isArray(raw?.hashtags)
-      ? raw.hashtags.map((h) => String(h || "").trim()).filter(Boolean)
-      : [],
-    imageQuery: String(raw?.imageQuery || "professional office workspace")
-      .trim()
-      .slice(0, 150),
-    skip: Boolean(raw?.skip),
-    skipReason: String(raw?.skipReason || "").trim(),
-  };
-
-  // Hard safety net: always force the apply line to point at the REAL
-  // apply URL from the source listing. Never trust the model to invent
-  // contact details (emails, phone numbers, deadlines aren't in scope
-  // here at all).
-  if (sourceJob?.applyUrl) {
-    fields.applyLine = `📩 Interested? Apply here: ${sourceJob.applyUrl}`;
-  }
-
-  const content = fields.skip ? "" : buildPostText(fields);
-
   return {
-    ...fields,
-    content,
-    type: fields.jobType === "Internship" ? "internship" : "job",
+    title: String(post?.title || "Career Opportunity")
+      .trim()
+      .slice(0, 150),
+    type: allowedTypes.has(post?.type) ? post.type : "job",
+    organization: String(post?.organization || "")
+      .trim()
+      .slice(0, 150),
+    content: stripEmojis(String(post?.content || "").trim()),
+    imageQuery: String(post?.imageQuery || "professional office workspace")
+      .trim()
+      .slice(0, 150),
+    skip: Boolean(post?.skip),
+    skipReason: String(post?.skipReason || "").trim(),
   };
 }
 
-async function callGeneration(job, recentPosts, retries = 3) {
-  const sourceBlock = `
-Company: ${job.company}
-Title: ${job.title}
-Location: ${job.location || "Not specified"}
-Remote: ${job.remote ? "Yes" : "Unknown"}
-Job type(s) from source: ${(job.jobTypes || []).join(", ") || "Not specified"}
-Tags: ${(job.tags || []).join(", ") || "None"}
-Apply URL: ${job.applyUrl}
+async function callGeneration(prompt, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      console.log(`   🧠 Groq attempt ${attempt}/${retries}`);
 
-Full description:
-${job.description || "No further description provided."}
-`;
-
-  return withRetry(
-    async () => {
       const response = await groq.chat.completions.create({
         model: GROQ_MODEL,
         messages: [
           {
             role: "user",
-            content: `
-You write LinkedIn posts announcing real job openings, based ONLY on the
-structured listing given below. You never invent facts that are not
-supported by the listing.
+            content: `You are a professional LinkedIn post writer for job opportunities.
 
-Audience: students and early-career professionals.
-Language: simple, clear, professional English.
+Your task: Read the JOB LISTING below and create a LinkedIn post in the EXACT format shown in the example.
 
-STRICT RULES:
-- Never invent a company name, salary, deadline, phone number, or email.
-- "orgHashtag" must be the company name with spaces/punctuation removed
-  (e.g. "Softpers Interactive" -> "Softpers"). If the company name is
-  unclear or missing, set skip=true.
-- "requirements" must be 4-8 short bullet phrases pulled or reasonably
-  summarized from the actual description below. Do not invent skills
-  that are not mentioned or clearly implied by the description.
-- "applyLine" should be one short sentence inviting the reader to apply
-  (do NOT include a URL or email yourself - that is added automatically
-  from the verified source link).
-- "industry" should be a short reasonable label (e.g. "IT Services /
-  Software Development") inferred from the role/description.
-- "hashtags" must be 2-3 relevant tags, no "#" prefix needed (added
-  automatically), no spaces within a tag.
-- If the listing is too vague, spammy, expired-looking, or not a real
-  job (e.g. an aggregator page with no real employer), set skip=true
-  and explain briefly in skipReason. Do not fabricate details to fill
-  gaps - skip instead.
-- "imageQuery" must describe a generic, non-branded, professional scene
-  (no logos, no real people, no text).
+EXAMPLE POST:
+🚀 #CompanyName is Hiring | Job Title
 
-REAL JOB LISTING (source of truth - use only this):
-${sourceBlock}
+Are you passionate about ... (short intro)
 
-RECENTLY POSTED TITLES (avoid repeating the same role/company):
-${recentPosts || "None"}
+📌 Key Details:
+* Job Type: Full‑time / Internship
+* Position: Job Title
+* Industry: ...
+* Location: City, Country (or Remote)
+* Contact: email@domain.com
+
+What we’re looking for:
+🔹 requirement 1
+🔹 requirement 2
+...
+
+📩 Interested? Send your CV via email at ... or apply at [link].
+
+RULES:
+- Use simple A2-B1 English.
+- No emojis except the rocket and circle symbols (🚀, 🔹, 📌, 📩) – those are allowed.
+- Only use information from the listing. Never invent details.
+- If the listing does NOT contain enough info (no role, no requirements, no application method), then set "skip": true and explain why.
+- Otherwise set "skip": false.
+
+JOB LISTING:
+${prompt}
 `,
           },
         ],
-        temperature: 0.4,
-        max_completion_tokens: 900,
+        temperature: 0.3,
+        max_completion_tokens: 1000,
         reasoning_effort: "low",
         reasoning_format: "hidden",
         response_format: {
@@ -919,14 +720,17 @@ ${recentPosts || "None"}
       const raw = response?.choices?.[0]?.message?.content;
       if (!raw) throw new Error("Groq returned empty content.");
 
-      return normalizePost(JSON.parse(raw), job);
-    },
-    { retries, baseDelayMs: 1500, label: "Groq generation" },
-  );
+      return normalizePost(JSON.parse(raw));
+    } catch (error) {
+      console.warn(`   ⚠️ Groq attempt failed: ${error.message}`);
+      if (attempt >= retries) throw error;
+      await sleep(1500 * attempt);
+    }
+  }
 }
 
 /* =======================================================
-   VALIDATION
+   VALIDATION (relaxed)
 ======================================================= */
 
 function validatePost(post) {
@@ -937,43 +741,23 @@ function validatePost(post) {
 
   if (content.length < 80) reasons.push("post is too short");
   if (content.length > 3000) reasons.push("post is too long");
-  if (!/key details/i.test(content))
-    reasons.push("missing Key Details section");
-  if (!post.requirements || post.requirements.length < 2)
-    reasons.push("missing requirements");
-  if (!/apply/i.test(content)) reasons.push("missing apply call-to-action");
-  if (!post.organization) reasons.push("missing organization name");
-
-  const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
-  if (hashtags.length > 4) reasons.push("too many hashtags");
+  if (!/apply|send|cv|email/i.test(content))
+    reasons.push("missing application instruction");
 
   return { valid: reasons.length === 0, reasons };
 }
 
 /* =======================================================
-   CLOUDFLARE IMAGE
+   IMAGE GENERATION WITH "HIRING" OVERLAY
 ======================================================= */
 
 function buildImagePrompt(post) {
-  return `
-Create a realistic professional stock-photo-style image related to:
-
-${post.imageQuery}
-
-Requirements:
-- professional career or education context
-- realistic photography
-- clean composition
-- suitable for LinkedIn
-- no text
-- no logos
-- no watermarks
-- no brand names
-- no recognizable public figures
-- no close-up identifiable faces
-- natural lighting
-- horizontal composition
-`;
+  // Decide background based on job type
+  const bg =
+    post.type === "job"
+      ? "software company modern office building"
+      : "educational institution building";
+  return `professional photograph of a ${bg}, clear sky, no people, no text, realistic, horizontal composition, high quality`;
 }
 
 async function generateImageWithCloudflare(post) {
@@ -981,84 +765,101 @@ async function generateImageWithCloudflare(post) {
 
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
 
-  return withRetry(
-    async () => {
-      const response = await fetchWithTimeout(
-        endpoint,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ prompt: buildImagePrompt(post) }),
-        },
-        120000,
-      );
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Cloudflare ${response.status}: ${text}`);
-      }
-
-      const contentType = response.headers.get("content-type") || "";
-      let imageBuffer;
-
-      if (contentType.includes("application/json")) {
-        const json = await response.json();
-        let b64 =
-          json?.result?.image ||
-          json?.result?.output ||
-          json?.image ||
-          json?.output;
-
-        if (Array.isArray(b64)) b64 = b64[0];
-        if (typeof b64 !== "string")
-          throw new Error("Cloudflare returned no image data.");
-
-        imageBuffer = Buffer.from(
-          b64.replace(/^data:image\/[^;]+;base64,/i, ""),
-          "base64",
-        );
-      } else {
-        imageBuffer = Buffer.from(await response.arrayBuffer());
-      }
-
-      if (!imageBuffer || imageBuffer.length < 1000) {
-        throw new Error("Invalid generated image.");
-      }
-
-      let finalBuffer = imageBuffer;
-
-      try {
-        const sharpModule = await import("sharp");
-        const sharp = sharpModule.default;
-
-        finalBuffer = await sharp(imageBuffer)
-          .resize(1200, 627, { fit: "cover" })
-          .jpeg({ quality: 88 })
-          .toBuffer();
-      } catch {
-        console.log("ℹ️ sharp unavailable; using original image.");
-      }
-
-      await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
-
-      const imagePath = path.join(
-        GENERATED_IMAGE_DIR,
-        `linkedin-${Date.now()}.jpg`,
-      );
-
-      await fs.writeFile(imagePath, finalBuffer);
-
-      console.log(
-        `   ✅ Image generated: ${(finalBuffer.length / 1024).toFixed(1)} KB`,
-      );
-
-      return imagePath;
+  const response = await fetchWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ prompt: buildImagePrompt(post) }),
     },
-    { retries: 2, baseDelayMs: 2000, label: "Cloudflare image generation" },
+    120000,
   );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Cloudflare ${response.status}: ${text}`);
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+  let imageBuffer;
+
+  if (contentType.includes("application/json")) {
+    const json = await response.json();
+    let b64 =
+      json?.result?.image ||
+      json?.result?.output ||
+      json?.image ||
+      json?.output;
+
+    if (Array.isArray(b64)) b64 = b64[0];
+    if (typeof b64 !== "string")
+      throw new Error("Cloudflare returned no image data.");
+
+    imageBuffer = Buffer.from(
+      b64.replace(/^data:image\/[^;]+;base64,/i, ""),
+      "base64",
+    );
+  } else {
+    imageBuffer = Buffer.from(await response.arrayBuffer());
+  }
+
+  if (!imageBuffer || imageBuffer.length < 1000) {
+    throw new Error("Invalid generated image.");
+  }
+
+  // ===== Overlay "HIRING" text =====
+  let finalBuffer = imageBuffer;
+  try {
+    const sharpModule = await import("sharp");
+    const sharp = sharpModule.default;
+
+    // Resize to 1200x627 (LinkedIn recommended)
+    let img = sharp(imageBuffer).resize(1200, 627, { fit: "cover" });
+
+    // Create SVG overlay with semi-transparent background and bold "HIRING"
+    const svg = `
+      <svg width="1200" height="627">
+        <rect x="0" y="0" width="1200" height="627" fill="rgba(0,0,0,0.5)" />
+        <text x="600" y="313" font-family="Arial, Helvetica, sans-serif" font-size="100" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="central" letter-spacing="5">HIRING</text>
+      </svg>
+    `;
+    const overlay = Buffer.from(svg);
+
+    finalBuffer = await img
+      .composite([{ input: overlay, top: 0, left: 0 }])
+      .jpeg({ quality: 88 })
+      .toBuffer();
+  } catch (err) {
+    console.warn("   ⚠️ Image overlay failed, using raw image:", err.message);
+    // Fallback: keep raw buffer but still resize
+    try {
+      const sharpModule = await import("sharp");
+      const sharp = sharpModule.default;
+      finalBuffer = await sharp(imageBuffer)
+        .resize(1200, 627, { fit: "cover" })
+        .jpeg({ quality: 88 })
+        .toBuffer();
+    } catch {
+      // keep original
+    }
+  }
+
+  // Save image
+  await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
+  const imagePath = path.join(
+    GENERATED_IMAGE_DIR,
+    `linkedin-${Date.now()}.jpg`,
+  );
+  await fs.writeFile(imagePath, finalBuffer);
+
+  console.log(
+    `   ✅ Image generated with HIRING overlay (${(finalBuffer.length / 1024).toFixed(1)} KB)`,
+  );
+
+  return imagePath;
 }
 
 async function cleanupImage(imagePath) {
@@ -1069,66 +870,71 @@ async function cleanupImage(imagePath) {
 }
 
 /* =======================================================
-   LINKEDIN API
+   LINKEDIN API (with retries)
 ======================================================= */
 
-class LinkedInAuthError extends Error {}
+async function linkedinRequest(url, options = {}, retries = 3) {
+  let lastError;
+  for (let i = 1; i <= retries; i++) {
+    try {
+      const token = await getValidLinkedInAccessToken();
+      if (!token) {
+        throw new Error(
+          "No valid LinkedIn access token. Visit /auth/linkedin first.",
+        );
+      }
 
-async function linkedinRequest(url, options = {}) {
-  const token = await getValidLinkedInAccessToken();
+      const response = await fetchWithTimeout(
+        url,
+        {
+          ...options,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Linkedin-Version": LINKEDIN_VERSION,
+            "X-Restli-Protocol-Version": "2.0.0",
+            ...(options.headers || {}),
+          },
+        },
+        60000,
+      );
 
-  if (!token) {
-    throw new LinkedInAuthError(
-      "No valid LinkedIn access token. Visit /auth/linkedin first.",
-    );
+      // Handle rate limiting
+      if (response.status === 429) {
+        const retryAfter = parseInt(response.headers.get("retry-after") || "5");
+        console.log(`⏳ Rate limited. Waiting ${retryAfter}s...`);
+        await sleep(retryAfter * 1000);
+        continue;
+      }
+
+      // Server errors – retry
+      if (response.status >= 500 && i < retries) {
+        console.log(
+          `🔄 Server error (${response.status}). Retry ${i}/${retries}...`,
+        );
+        await sleep(2000 * i);
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (i === retries) throw error;
+      console.log(`🔄 Request failed, retry ${i}/${retries}...`);
+      await sleep(2000 * i);
+    }
   }
-
-  const response = await fetchWithTimeout(
-    url,
-    {
-      ...options,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Linkedin-Version": LINKEDIN_VERSION,
-        "X-Restli-Protocol-Version": "2.0.0",
-        ...(options.headers || {}),
-      },
-    },
-    60000,
-  );
-
-  if (response.status === 401) {
-    // Token is dead (revoked/expired server-side even though our local
-    // expiresAt said otherwise). Clear it now so the NEXT cycle fails
-    // fast with a clear "please re-auth" message instead of repeating
-    // this same silent failure every time.
-    await clearLinkedInToken("LinkedIn API returned 401");
-    throw new LinkedInAuthError(
-      "LinkedIn rejected the access token (401). Re-authenticate via /auth/linkedin.",
-    );
-  }
-
-  return response;
-}
-
-async function linkedinRequestWithRetry(url, options, label) {
-  return withRetry(() => linkedinRequest(url, options), {
-    retries: 3,
-    baseDelayMs: 2000,
-    label,
-    shouldRetry: (error) => !(error instanceof LinkedInAuthError),
-  });
+  throw lastError || new Error("Request failed after retries.");
 }
 
 async function registerImageUpload() {
   const personUrn = await getLinkedInPersonUrn();
   if (!personUrn) {
-    throw new LinkedInAuthError(
+    throw new Error(
       "No person URN found. Please re-authenticate via /auth/linkedin.",
     );
   }
 
-  const response = await linkedinRequestWithRetry(
+  const response = await linkedinRequest(
     `${LINKEDIN_API}/images?action=initializeUpload`,
     {
       method: "POST",
@@ -1137,11 +943,9 @@ async function registerImageUpload() {
         initializeUploadRequest: { owner: personUrn },
       }),
     },
-    "LinkedIn image init",
   );
 
   const text = await response.text();
-
   if (!response.ok) {
     throw new Error(
       `LinkedIn image initialization failed: ${response.status} ${text}`,
@@ -1163,45 +967,33 @@ async function registerImageUpload() {
 }
 
 async function uploadImageBinary(uploadUrl, imagePath) {
+  const token = await getValidLinkedInAccessToken();
   const buffer = await fs.readFile(imagePath);
 
-  await withRetry(
-    async () => {
-      const token = await getValidLinkedInAccessToken();
-      if (!token) throw new LinkedInAuthError("No valid LinkedIn token.");
-
-      const response = await fetchWithTimeout(
-        uploadUrl,
-        {
-          method: "PUT",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/octet-stream",
-          },
-          body: buffer,
-        },
-        60000,
-      );
-
-      if (!response.ok && response.status !== 201) {
-        throw new Error(
-          `LinkedIn image upload failed: ${response.status} ${await response.text()}`,
-        );
-      }
-    },
+  const response = await fetchWithTimeout(
+    uploadUrl,
     {
-      retries: 3,
-      baseDelayMs: 2000,
-      label: "LinkedIn image upload",
-      shouldRetry: (error) => !(error instanceof LinkedInAuthError),
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/octet-stream",
+      },
+      body: buffer,
     },
+    60000,
   );
+
+  if (!response.ok && response.status !== 201) {
+    throw new Error(
+      `LinkedIn image upload failed: ${response.status} ${await response.text()}`,
+    );
+  }
 }
 
 async function createLinkedInPost(text, imageUrn = null) {
   const personUrn = await getLinkedInPersonUrn();
   if (!personUrn) {
-    throw new LinkedInAuthError("No person URN found. Please re-authenticate.");
+    throw new Error("No person URN found. Please re-authenticate.");
   }
 
   const body = {
@@ -1223,24 +1015,18 @@ async function createLinkedInPost(text, imageUrn = null) {
     };
   }
 
-  const response = await linkedinRequestWithRetry(
-    `${LINKEDIN_API}/posts`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    },
-    "LinkedIn create post",
-  );
+  const response = await linkedinRequest(`${LINKEDIN_API}/posts`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
   const textResponse = await response.text();
-
   if (!response.ok) {
     throw new Error(`LinkedIn post failed: ${response.status} ${textResponse}`);
   }
 
   const id = response.headers.get("x-restli-id");
-
   return {
     id: id || null,
     link: id
@@ -1259,7 +1045,6 @@ async function publishToLinkedIn(post, imagePath) {
     console.log("\n----- POST -----\n");
     console.log(post.content);
     console.log("\n---------------\n");
-
     return { success: true, dryRun: true, id: null, link: null };
   }
 
@@ -1393,7 +1178,6 @@ async function storePostHistory(post, result) {
     await postHistoryCollection.insertOne({
       id: result?.id || null,
       title: post.title || null,
-      organization: post.organization || null,
       type: post.type || "job",
       text: post.content,
       publishedAt: new Date(),
@@ -1408,7 +1192,6 @@ async function savePost(post, result) {
   state.history.push({
     id: result?.id || null,
     title: post.title,
-    organization: post.organization,
     type: post.type,
     text: post.content,
     imageGenerated: Boolean(result?.imageGenerated),
@@ -1438,7 +1221,7 @@ async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 LINKEDIN AI BOT V3.0.0");
+  console.log("🚀 LINKEDIN AI BOT V2.2.0");
   console.log("================================================");
   console.log(
     `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
@@ -1454,25 +1237,42 @@ async function runCycle() {
 
   try {
     const token = await getValidLinkedInAccessToken();
-
     if (!token) {
-      throw new LinkedInAuthError(
-        "LinkedIn is not authorized. Open /auth/linkedin first.",
-      );
+      throw new Error("LinkedIn is not authorized. Open /auth/linkedin first.");
     }
 
-    const jobs = await researchOpportunities();
-    const job = await selectJob(jobs);
-
-    if (!job) {
-      console.log("⏭️ No job listings available this cycle.");
-      state.totalSkipped++;
-      await saveState();
-      return { success: false, skipped: true, reason: "no_jobs_found" };
-    }
-
+    const news = await researchOpportunities();
+    const selectedTopic = await selectTopic(news);
     const recentPosts = getRecentPostMemory();
-    const post = await callGeneration(job, recentPosts, 3);
+
+    let researchBlock = "NO CURRENT LISTING FOUND.";
+
+    if (selectedTopic) {
+      researchBlock = `
+Headline:
+${selectedTopic.title}
+
+Description:
+${selectedTopic.description || ""}
+
+Published:
+${selectedTopic.publishedAt || ""}
+
+Source:
+${selectedTopic.source || "Unknown"}
+`;
+    }
+
+    const prompt = `
+CURRENT JOB LISTING:
+
+${researchBlock}
+
+RECENT POSTS:
+${recentPosts || "None"}
+`;
+
+    const post = await callGeneration(prompt, 3);
 
     if (post.skip) {
       console.log("⏭️ AI skipped:", post.skipReason);
@@ -1508,7 +1308,7 @@ async function runCycle() {
     try {
       imagePath = await generateImageWithCloudflare(post);
     } catch (error) {
-      console.warn("⚠️ Image generation failed after retries:", error.message);
+      console.warn("⚠️ Image generation failed:", error.message);
     }
 
     let result;
@@ -1535,11 +1335,7 @@ async function runCycle() {
     state.totalFailures++;
     await saveState();
     console.error("\n❌ Cycle error:", error?.stack || error?.message || error);
-    return {
-      success: false,
-      error: error?.message || "Unknown error",
-      authError: error instanceof LinkedInAuthError,
-    };
+    return { success: false, error: error?.message || "Unknown error" };
   }
 }
 
@@ -1565,7 +1361,7 @@ async function initializeLinkedInBot() {
   if (initialized) return;
 
   console.log("\n==============================================");
-  console.log("🤖 INITIALIZING LINKEDIN BOT");
+  console.log("🤖 INITIALIZING LINKEDIN BOT (V2.2.0)");
   console.log("==============================================");
 
   await connectMongo();
@@ -1577,6 +1373,7 @@ async function initializeLinkedInBot() {
   console.log(`🎨 Cloudflare: ${CLOUDFLARE_IMAGE_MODEL}`);
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
   console.log(`🎯 Daily limit: ${MAX_POSTS_PER_DAY}`);
+  console.log(`📡 Job feed: ${JOB_FEED_URL}`);
 
   const token = await getValidLinkedInAccessToken();
   const personUrn = await getLinkedInPersonUrn();
@@ -1603,23 +1400,12 @@ async function runLinkedInBot() {
 async function getLinkedInStatus() {
   resetDailyCounter();
 
-  const tokenDoc = await getLinkedInToken();
   const token = await getValidLinkedInAccessToken();
   const personUrn = await getLinkedInPersonUrn();
 
-  let daysUntilExpiry = null;
-  if (tokenDoc?.expiresAt) {
-    daysUntilExpiry = Number(
-      (
-        (new Date(tokenDoc.expiresAt).getTime() - Date.now()) /
-        (24 * 60 * 60 * 1000)
-      ).toFixed(1),
-    );
-  }
-
   return {
     service: "linkedin-ai-bot",
-    version: "3.0.0",
+    version: "2.2.0",
     timezone: BOT_TIMEZONE,
     localDate: getLocalDate(),
     postsToday: state.postsToday,
@@ -1632,8 +1418,6 @@ async function getLinkedInStatus() {
     mongoConnected: Boolean(mongoClient),
     linkedinAuthorized: Boolean(token),
     personUrnStored: Boolean(personUrn),
-    tokenExpiresAt: tokenDoc?.expiresAt || null,
-    daysUntilTokenExpiry: daysUntilExpiry,
   };
 }
 
