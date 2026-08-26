@@ -1,0 +1,40 @@
+name: Binance Square Scheduler
+
+on:
+  # Runs every 4 hours
+  schedule:
+    - cron: "0 */4 * * *"
+
+  # Allows manual testing
+  workflow_dispatch:
+
+concurrency:
+  group: binance-square-scheduler
+  cancel-in-progress: false
+
+jobs:
+  trigger-binance:
+    runs-on: ubuntu-latest
+
+    steps:
+      # =====================================================
+      # Trigger Binance Square Bot
+      # =====================================================
+      - name: Trigger Binance Square Bot
+        shell: bash
+        run: |
+          echo "🚀 Triggering Binance Square Bot..."
+
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.POST_TRIGGER_SECRET }}" \
+            -H "Content-Type: application/json" \
+            --data '{}' \
+            --fail \
+            --show-error \
+            --silent \
+            --output response.json \
+            "https://binance-square-bot-loi6.onrender.com/post"
+
+          echo ""
+          echo "📡 Binance response:"
+          cat response.json
