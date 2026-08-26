@@ -10,8 +10,8 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V10.2.0
-TEXT ONLY
+BINANCE SQUARE AI BOT V10.3.0
+TEXT ONLY – QUANTITATIVE CYCLE ANALYSIS
 =========================================================
 */
 
@@ -622,7 +622,7 @@ function getXmlTag(xml, tag) {
 }
 
 /* =======================================================
-   MARKET DATA
+   MARKET DATA (BASIC & ADVANCED)
 ======================================================= */
 
 async function getMarketData() {
@@ -1021,6 +1021,163 @@ function generateSignal({ lastPrice, priceChange, smaShort, smaLong, rsi }) {
 }
 
 /* =======================================================
+   ADVANCED CYCLE METRICS (NEW)
+======================================================= */
+
+async function getAdvancedMarketData(symbol = "BTCUSDT") {
+  console.log("\n🧮 [Binance] Calculating advanced cycle metrics...");
+
+  const klinesRes = await fetchWithTimeout(
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1w&limit=1000`,
+    {},
+    15000,
+  );
+  if (!klinesRes.ok) {
+    throw new Error(`Weekly klines HTTP ${klinesRes.status}`);
+  }
+  const klines = await klinesRes.json();
+
+  const weekly = klines.map((c) => ({
+    time: c[0],
+    open: Number(c[1]),
+    high: Number(c[2]),
+    low: Number(c[3]),
+    close: Number(c[4]),
+    volume: Number(c[5]),
+  }));
+
+  if (weekly.length < 200) {
+    throw new Error("Insufficient weekly data.");
+  }
+
+  const closes = weekly.map((w) => w.close);
+
+  // Calculate 50‑week SMA
+  const sma50 = [];
+  for (let i = 0; i < closes.length; i++) {
+    if (i < 49) {
+      sma50.push(null);
+      continue;
+    }
+    const window = closes.slice(i - 49, i + 1);
+    sma50.push(window.reduce((a, b) => a + b, 0) / 50);
+  }
+
+  const currentPrice = closes[closes.length - 1];
+  const currentSMA50 = sma50[sma50.length - 1];
+
+  // Candle catalog: weekly >+20% while below 50W SMA
+  const candleCatalog = [];
+  for (let i = 1; i < weekly.length; i++) {
+    const prevClose = weekly[i - 1].close;
+    const currClose = weekly[i].close;
+    const gain = (currClose - prevClose) / prevClose;
+    const belowSMA = sma50[i] !== null && currClose < sma50[i];
+    if (gain > 0.2 && belowSMA) {
+      let futureLow = Infinity;
+      for (let j = i + 1; j < weekly.length; j++) {
+        if (weekly[j].low < futureLow) futureLow = weekly[j].low;
+      }
+      candleCatalog.push({
+        date: new Date(weekly[i].time).toISOString().slice(0, 10),
+        close: currClose,
+        gainPercent: (gain * 100).toFixed(2),
+        futureLow: futureLow === Infinity ? null : futureLow,
+      });
+    }
+  }
+
+  // Keep recent occurrences, but total count is important.
+  const totalCandleCatalogCount = candleCatalog.length;
+  const recentCandles = candleCatalog.slice(-5);
+
+  // Cycle clock: days since last all-time high
+  let peakIndex = 0;
+  let peakPrice = -Infinity;
+  for (let i = 0; i < weekly.length; i++) {
+    if (weekly[i].high > peakPrice) {
+      peakPrice = weekly[i].high;
+      peakIndex = i;
+    }
+  }
+  const peakDate = new Date(weekly[peakIndex].time);
+  const daysSincePeak = Math.floor(
+    (Date.now() - peakDate.getTime()) / 86400000,
+  );
+
+  // Historical bear market bottoms (approximate durations in days)
+  const bearMarketDurations = [
+    { name: "2013-2015", days: 410 },
+    { name: "2017-2018", days: 364 },
+    { name: "2021-2022", days: 406 },
+  ];
+  const bottomWindowStart = Math.min(...bearMarketDurations.map((b) => b.days));
+  const bottomWindowEnd = Math.max(...bearMarketDurations.map((b) => b.days));
+
+  // Critical level: 50‑week SMA (or could be previous swing low)
+  const criticalLevel = currentSMA50;
+
+  // Verdict window: based on historical bottom durations
+  const verdictStart = new Date(
+    peakDate.getTime() + bottomWindowStart * 86400000,
+  );
+  const verdictEnd = new Date(peakDate.getTime() + bottomWindowEnd * 86400000);
+  const verdictWindow = `${verdictStart.toISOString().slice(0, 10)}..${verdictEnd.toISOString().slice(0, 10)}`;
+
+  return {
+    currentPrice,
+    currentSMA50,
+    candleCatalog: recentCandles,
+    totalCandleCatalogCount,
+    peakPrice,
+    peakDate: peakDate.toISOString().slice(0, 10),
+    daysSincePeak,
+    bottomWindow: `${bottomWindowStart}-${bottomWindowEnd}`,
+    verdictWindow,
+    criticalLevel,
+  };
+}
+
+function buildTechnicalNarrative(metrics) {
+  const {
+    currentPrice,
+    currentSMA50,
+    candleCatalog,
+    totalCandleCatalogCount,
+    peakPrice,
+    peakDate,
+    daysSincePeak,
+    bottomWindow,
+    verdictWindow,
+    criticalLevel,
+  } = metrics;
+
+  let candleCatalogText = "";
+  if (candleCatalog.length > 0) {
+    candleCatalogText = candleCatalog
+      .map(
+        (c) =>
+          `${c.date} (close $${c.close.toFixed(0)}, +${c.gainPercent}%, future low $${c.futureLow.toFixed(0)})`,
+      )
+      .join(", ");
+  } else {
+    candleCatalogText = "none in recent history";
+  }
+
+  return `
+CYCLE & STRUCTURAL DATA (${metrics.symbol || "BTC"}):
+- Current price: $${currentPrice.toFixed(0)}
+- 50-week SMA: $${currentSMA50.toFixed(0)}
+- Candle catalog (weekly +20% candles below 50W, last 15y): ${totalCandleCatalogCount} occurrences. Recent ones: ${candleCatalogText}
+- Last all-time high: $${peakPrice.toFixed(0)} on ${peakDate}
+- Days since peak: ${daysSincePeak}
+- Historical bear market bottoms occurred ${bottomWindow} days after peak.
+- Verdict window: ${verdictWindow}
+- Critical level: $${criticalLevel.toFixed(0)}
+`;
+}
+
+/* =======================================================
    GOOGLE NEWS RESEARCH
 ======================================================= */
 
@@ -1032,7 +1189,7 @@ async function researchWeb() {
   try {
     const response = await fetchWithTimeout(GOOGLE_NEWS_URL, {
       headers: {
-        "User-Agent": "Mozilla/5.0 BinanceSquareAI/10.2",
+        "User-Agent": "Mozilla/5.0 BinanceSquareAI/10.3",
         Accept: "application/rss+xml, application/xml, text/xml",
       },
     });
@@ -1234,7 +1391,7 @@ async function callGeneration(
           {
             role: "system",
             content: `
-You are an expert cryptocurrency content writer creating a short Binance Square post.
+You are an expert quantitative cryptocurrency analyst writing a short Binance Square post.
 
 Return ONLY valid JSON matching the supplied JSON schema.
 
@@ -1559,7 +1716,7 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST
+   GENERATE POST (MODIFIED)
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
@@ -1632,38 +1789,57 @@ Signal reason: ${signal?.reason || "No clear signal."}
 `;
   }
 
-  const prompt = `
-Create a concise Binance Square crypto market post.
+  // NEW: Fetch advanced cycle metrics for the selected symbol
+  let advancedBlock = "NO ADVANCED CYCLE DATA AVAILABLE.";
 
-CURRENT WEB RESEARCH:
-${researchBlock}
+  if (marketData) {
+    try {
+      const advanced = await getAdvancedMarketData(marketData.symbol);
+      advancedBlock = buildTechnicalNarrative({
+        ...advanced,
+        symbol: marketData.symbol,
+      });
+    } catch (err) {
+      console.warn("⚠️ Advanced metrics failed:", err.message);
+    }
+  }
+
+  const prompt = `
+Create a concise Binance Square crypto market post using the exact analytical style shown in the example below.
+
+EXAMPLE POST STYLE:
+"$BTC - Our own instruments just crossed. Candle catalog: four +20% weeks below the 50W in 15 years - Jan-2015, Dec-2018, Apr-2019, Jan-2023, each at a turn, the low behind never broke: 152, 3,122, 15,479 held. Cycle clock: day 321 off the peak, and completed bears bottomed days 364-406. Yesterday printed candle #5. Verdict window: Oct-05..Nov-16 - break 57,735 and the clock wins, hold it and the candle does."
+
+YOUR TASK:
+Write a post that follows this structure and tone:
+- Begin with "$BTC" (or the actual ticker).
+- State a significant technical observation (e.g., "Our own instruments just crossed" or similar).
+- Mention the "candle catalog" with actual numbers: total count, dates, and prices if available.
+- State the current "cycle clock" (days since peak) and the historical bottom window.
+- If relevant, mention "Yesterday printed candle #X" (you can infer if a new +20% candle occurred).
+- Provide a "verdict window" with a critical price level.
+- End with a strong conclusion that ties the breakout/hold to the cycle outcome.
+
+DATA PROVIDED:
+${advancedBlock}
 
 CURRENT MARKET DATA:
 ${marketBlock}
 
-FALLBACK TOPIC:
-${fallbackTopic}
+CURRENT WEB RESEARCH:
+${researchBlock}
 
-RECENT POSTS:
+RECENT POSTS (for style reference only):
 ${recentPosts || "None"}
 
-CONTENT REQUIREMENTS:
-
-1. Use the current market data accurately.
-2. If a news headline is supplied, connect the post to it without inventing details.
-3. Do not invent a personal trade, purchase, profit, or investment.
-4. Do not promise future returns.
-5. Do not use guaranteed-profit language.
-6. Do not fabricate targets or catalysts.
-7. Make the post interesting enough for a crypto audience.
-8. Use short, readable sentences.
-9. Include the relevant ticker.
-10. Include 2-3 relevant hashtags.
-11. Keep the content under 700 characters.
-12. The title should be short and attention-grabbing.
-13. Set newsUsed to true only when current research is actually used.
-14. Set signal and signalConfidence according to the supplied market signal.
-15. If there is insufficient information to make a useful post, set skip=true.
+REQUIREMENTS:
+- Use ONLY the data provided. Do not invent numbers.
+- Keep the total content under 700 characters.
+- The post must sound like a quantitative analyst, not a generic news bot.
+- Use the ticker and relevant hashtags (2-3 max).
+- Set newsUsed to true only if web research is actually used; otherwise false.
+- Set signal and signalConfidence from the market signal data.
+- If there is insufficient information, set skip=true.
 
 Return valid JSON only.
 `;
@@ -1997,7 +2173,7 @@ async function runCycle() {
 
   console.log("\n================================================");
 
-  console.log("🚀 BINANCE SQUARE AI BOT V10.2.0");
+  console.log("🚀 BINANCE SQUARE AI BOT V10.3.0");
 
   console.log("================================================");
 
@@ -2220,15 +2396,17 @@ async function initializeBinanceBot() {
 
   console.log(`🧠 Provider: Groq (${GROQ_MODEL})`);
 
-  console.log("🔥 Strategy: Market + News Analysis");
+  console.log("🔥 Strategy: Quantitative Cycle + Market Analysis");
 
   console.log("🌐 Web research: Google News RSS");
 
   console.log("📊 Market data: Binance real-time");
 
-  console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
+  console.log(
+    "📈 Advanced cycle metrics: Weekly SMA50, Candle Catalog, Cycle Clock",
+  );
 
-  console.log("📈 Signal generation: SMA + RSI");
+  console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
 
   console.log("🛡️ Validation: ENABLED");
 
@@ -2265,7 +2443,7 @@ function getBinanceStatus() {
   return {
     service: "binance-square-ai-bot",
 
-    version: "10.2.0",
+    version: "10.3.0",
 
     provider: "Groq",
 
@@ -2300,6 +2478,8 @@ function getBinanceStatus() {
     imageGeneration: "Disabled",
 
     imageModel: "None",
+
+    advancedMetrics: "Enabled",
   };
 }
 
