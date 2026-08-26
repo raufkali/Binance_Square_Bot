@@ -10,9 +10,27 @@ dotenv.config();
 
 /*
 =========================================================
-LINKEDIN AI BOT V2.2.0 (INDIVIDUAL PROFILE EDITION)
-– Now with reliable job postings, enhanced prompt,
-  "HIRING" overlay, and retry logic.
+LINKEDIN AI OPPORTUNITY BOT V3.0.0
+INDIVIDUAL PROFILE EDITION
+
+FETCHES:
+- Jobs
+- Internships
+- Scholarships
+- Fellowships
+- Graduate opportunities
+- Remote opportunities
+- Other relevant career opportunities
+
+FLOW:
+1. Fetch recent opportunities from multiple RSS feeds
+2. Store opportunities in MongoDB
+3. Select an unused recent opportunity
+4. AI extracts ONLY verified information
+5. Generate structured LinkedIn post
+6. Generate opportunity-specific image
+7. Add dynamic overlay
+8. Publish to personal LinkedIn profile
 =========================================================
 */
 
@@ -20,7 +38,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 /* =======================================================
-   CONFIG – Hardcoded defaults (no new env vars needed)
+   CONFIG
 ======================================================= */
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
@@ -41,7 +59,9 @@ const MAX_POSTS_PER_DAY = parsePositiveInteger(
   process.env.LINKEDIN_MAX_POSTS_PER_DAY,
   3,
 );
+
 const MAX_HISTORY = parsePositiveInteger(process.env.LINKEDIN_MAX_HISTORY, 150);
+
 const REQUEST_TIMEOUT_MS = parsePositiveInteger(
   process.env.REQUEST_TIMEOUT_MS,
   30000,
@@ -53,55 +73,121 @@ const DRY_RUN =
 const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Asia/Karachi";
 
 const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
+
 const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+
 const CLOUDFLARE_IMAGE_MODEL =
   process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
 
 const STATE_FILE = path.join(__dirname, "linkedin-state.json");
+
 const STATE_BACKUP_FILE = path.join(__dirname, "linkedin-state.backup.json");
+
 const GENERATED_IMAGE_DIR = path.join(__dirname, "linkedin-generated-images");
 
-// ===== HARDCODED JOB FEED (no .env needed) =====
-// Change this to any RSS feed from Indeed, Rozee.pk, etc.
-const JOB_FEED_URL =
-  "https://rss.indeed.com/rss?q=software+engineer&l=Pakistan";
+/* =======================================================
+   RSS SOURCES
+=======================================================
 
-// ===== LINKEDIN API ENDPOINTS =====
+   Google News RSS is used for scholarships, internships,
+   fellowships and broader opportunity discovery.
+
+   Indeed RSS is used for jobs.
+
+   You can add/remove feeds here without changing the
+   rest of the bot.
+======================================================= */
+
+const OPPORTUNITY_FEEDS = [
+  {
+    name: "Indeed Pakistan Software Jobs",
+    type: "job",
+    url: "https://rss.indeed.com/rss?q=software+engineer&l=Pakistan",
+  },
+  {
+    name: "Indeed Pakistan Developer Jobs",
+    type: "job",
+    url: "https://rss.indeed.com/rss?q=developer&l=Pakistan",
+  },
+  {
+    name: "Indeed Remote Software Jobs",
+    type: "job",
+    url: "https://rss.indeed.com/rss?q=software+engineer&l=Remote",
+  },
+
+  {
+    name: "Google News Internships",
+    type: "internship",
+    url: "https://news.google.com/rss/search?q=software+engineering+internship+OR+computer+science+internship&hl=en-US&gl=US&ceid=US:en",
+  },
+
+  {
+    name: "Google News Scholarships",
+    type: "scholarship",
+    url: "https://news.google.com/rss/search?q=fully+funded+scholarship+OR+international+scholarship+2026+OR+2027&hl=en-US&gl=US&ceid=US:en",
+  },
+
+  {
+    name: "Google News Fellowships",
+    type: "fellowship",
+    url: "https://news.google.com/rss/search?q=fully+funded+fellowship+OR+international+fellowship+2026+OR+2027&hl=en-US&gl=US&ceid=US:en",
+  },
+
+  {
+    name: "Google News Graduate Opportunities",
+    type: "opportunity",
+    url: "https://news.google.com/rss/search?q=graduate+program+OR+graduate+opportunity+computer+science&hl=en-US&gl=US&ceid=US:en",
+  },
+
+  {
+    name: "Google News Remote Jobs",
+    type: "job",
+    url: "https://news.google.com/rss/search?q=remote+software+developer+job+OR+remote+software+engineer+job&hl=en-US&gl=US&ceid=US:en",
+  },
+];
+
+/* =======================================================
+   LINKEDIN API
+======================================================= */
+
 const LINKEDIN_API = "https://api.linkedin.com/rest";
+
 const LINKEDIN_OAUTH_AUTHORIZE =
   "https://www.linkedin.com/oauth/v2/authorization";
+
 const LINKEDIN_OAUTH_TOKEN = "https://www.linkedin.com/oauth/v2/accessToken";
 
 /* =======================================================
-   VALIDATION (secrets check)
+   VALIDATION
 ======================================================= */
 
 if (!GROQ_API_KEY) {
-  console.error("❌ GROQ_API_KEY is missing.");
   throw new Error("GROQ_API_KEY is missing.");
 }
+
 if (!LINKEDIN_CLIENT_ID) {
-  console.error("❌ LINKEDIN_CLIENT_ID is missing.");
   throw new Error("LINKEDIN_CLIENT_ID is missing.");
 }
+
 if (!LINKEDIN_CLIENT_SECRET) {
-  console.error("❌ LINKEDIN_CLIENT_SECRET is missing.");
   throw new Error("LINKEDIN_CLIENT_SECRET is missing.");
 }
+
 if (!LINKEDIN_REDIRECT_URI) {
-  console.error("❌ LINKEDIN_REDIRECT_URI is missing.");
   throw new Error("LINKEDIN_REDIRECT_URI is missing.");
 }
+
 if (!POST_TRIGGER_SECRET) {
-  console.error("❌ LINKEDIN_POST_TRIGGER_SECRET is missing.");
   throw new Error("LINKEDIN_POST_TRIGGER_SECRET is missing.");
 }
+
 if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
-  console.error("❌ Cloudflare credentials are missing.");
   throw new Error("Cloudflare credentials are missing.");
 }
 
-const groq = new Groq({ apiKey: GROQ_API_KEY });
+const groq = new Groq({
+  apiKey: GROQ_API_KEY,
+});
 
 /* =======================================================
    HELPERS
@@ -109,7 +195,11 @@ const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 function parsePositiveInteger(value, fallback) {
   const number = Number(value);
-  if (Number.isInteger(number) && number > 0) return number;
+
+  if (Number.isInteger(number) && number > 0) {
+    return number;
+  }
+
   return fallback;
 }
 
@@ -145,15 +235,48 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
+function cleanText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeUrl(url) {
+  try {
+    return new URL(String(url || "").trim()).toString();
+  } catch {
+    return "";
+  }
+}
+
+function isRecentDate(dateValue, maxHours = 168) {
+  if (!dateValue) return true;
+
+  const parsed = new Date(dateValue);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return true;
+  }
+
+  const age = Date.now() - parsed.getTime();
+
+  return age <= maxHours * 60 * 60 * 1000;
+}
+
 async function fetchWithTimeout(
   url,
   options = {},
   timeout = REQUEST_TIMEOUT_MS,
 ) {
   const controller = new AbortController();
+
   const timer = setTimeout(() => controller.abort(), timeout);
+
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
   } finally {
     clearTimeout(timer);
   }
@@ -162,8 +285,10 @@ async function fetchWithTimeout(
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
+
     [array[i], array[j]] = [array[j], array[i]];
   }
+
   return array;
 }
 
@@ -172,7 +297,7 @@ function shuffleArray(array) {
 ======================================================= */
 
 let mongoClient = null;
-let trendingTopicsCollection = null;
+let opportunitiesCollection = null;
 let postHistoryCollection = null;
 let linkedinTokensCollection = null;
 
@@ -182,43 +307,70 @@ async function connectMongo() {
   if (mongoClient) return;
 
   if (!MONGODB_URI) {
-    console.warn("⚠️ [LinkedIn] MONGODB_URI missing. Running without MongoDB.");
+    console.warn("⚠️ MONGODB_URI missing. Running without MongoDB.");
     return;
   }
 
   try {
-    mongoClient = new MongoClient(MONGODB_URI, { maxPoolSize: 5 });
+    mongoClient = new MongoClient(MONGODB_URI, {
+      maxPoolSize: 5,
+    });
+
     await mongoClient.connect();
 
     const db = mongoClient.db(MONGODB_DB_NAME);
 
-    trendingTopicsCollection = db.collection("linkedin_trending_topics");
+    opportunitiesCollection = db.collection("linkedin_opportunities");
+
     postHistoryCollection = db.collection("linkedin_post_history");
+
     linkedinTokensCollection = db.collection("linkedin_tokens");
 
-    await trendingTopicsCollection.createIndex(
+    await opportunitiesCollection.createIndex(
       { fingerprint: 1 },
       { unique: true },
     );
-    await trendingTopicsCollection.createIndex({ used: 1, fetchedAt: -1 });
-    await postHistoryCollection.createIndex({ publishedAt: -1 });
-    await linkedinTokensCollection.createIndex({ provider: 1, unique: true });
 
-    console.log("💾 [LinkedIn] MongoDB connected.");
+    await opportunitiesCollection.createIndex({
+      used: 1,
+      publishedAt: -1,
+    });
+
+    await opportunitiesCollection.createIndex({
+      category: 1,
+      publishedAt: -1,
+    });
+
+    await postHistoryCollection.createIndex({
+      publishedAt: -1,
+    });
+
+    await linkedinTokensCollection.createIndex(
+      { provider: 1 },
+      { unique: true },
+    );
+
+    console.log("💾 MongoDB connected.");
   } catch (error) {
-    console.warn("⚠️ [LinkedIn] MongoDB connection failed:", error.message);
+    console.warn("⚠️ MongoDB connection failed:", error.message);
+
     mongoClient = null;
+    opportunitiesCollection = null;
+    postHistoryCollection = null;
+    linkedinTokensCollection = null;
   }
 }
 
 async function disconnectMongo() {
   try {
-    if (mongoClient) await mongoClient.close();
+    if (mongoClient) {
+      await mongoClient.close();
+    }
+
     mongoClient = null;
-    trendingTopicsCollection = null;
+    opportunitiesCollection = null;
     postHistoryCollection = null;
     linkedinTokensCollection = null;
-    console.log("💾 [LinkedIn] MongoDB connection closed.");
   } catch {}
 }
 
@@ -227,14 +379,17 @@ async function disconnectMongo() {
 ======================================================= */
 
 async function getLinkedInToken() {
-  if (!linkedinTokensCollection) return null;
+  if (!linkedinTokensCollection) {
+    return null;
+  }
+
   try {
-    const token = await linkedinTokensCollection.findOne({
+    return await linkedinTokensCollection.findOne({
       provider: "linkedin",
     });
-    return token || null;
   } catch (error) {
     console.warn("⚠️ Could not read LinkedIn token:", error.message);
+
     return null;
   }
 }
@@ -242,11 +397,14 @@ async function getLinkedInToken() {
 async function saveLinkedInToken(data) {
   if (!linkedinTokensCollection) {
     console.warn("⚠️ MongoDB unavailable. LinkedIn token cannot be persisted.");
+
     return;
   }
 
   await linkedinTokensCollection.updateOne(
-    { provider: "linkedin" },
+    {
+      provider: "linkedin",
+    },
     {
       $set: {
         provider: "linkedin",
@@ -257,17 +415,25 @@ async function saveLinkedInToken(data) {
         updatedAt: new Date(),
       },
     },
-    { upsert: true },
+    {
+      upsert: true,
+    },
   );
 }
 
 async function clearLinkedInToken() {
-  if (!linkedinTokensCollection) return;
-  await linkedinTokensCollection.deleteOne({ provider: "linkedin" });
+  if (!linkedinTokensCollection) {
+    return;
+  }
+
+  await linkedinTokensCollection.deleteOne({
+    provider: "linkedin",
+  });
 }
 
 async function getLinkedInPersonUrn() {
   const token = await getLinkedInToken();
+
   return token?.personUrn || null;
 }
 
@@ -279,17 +445,29 @@ const oauthStates = new Map();
 
 function createOAuthState() {
   const state = crypto.randomBytes(32).toString("hex");
-  oauthStates.set(state, { createdAt: Date.now() });
+
+  oauthStates.set(state, {
+    createdAt: Date.now(),
+  });
+
   return state;
 }
 
 function consumeOAuthState(state) {
   if (!state) return false;
+
   const record = oauthStates.get(state);
+
   if (!record) return false;
+
   oauthStates.delete(state);
+
   const maxAge = 10 * 60 * 1000;
-  if (Date.now() - record.createdAt > maxAge) return false;
+
+  if (Date.now() - record.createdAt > maxAge) {
+    return false;
+  }
+
   return true;
 }
 
@@ -315,16 +493,25 @@ async function getLinkedInPersonId(accessToken) {
   const response = await fetchWithTimeout(
     "https://api.linkedin.com/v2/userinfo",
     {
-      headers: { Authorization: `Bearer ${accessToken}` },
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
     },
     10000,
   );
+
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Failed to fetch user info: ${response.status} ${text}`);
+    throw new Error(
+      `Failed to fetch LinkedIn user info: ${response.status} ${await response.text()}`,
+    );
   }
+
   const data = await response.json();
-  if (!data.sub) throw new Error("No person ID returned from userinfo");
+
+  if (!data.sub) {
+    throw new Error("No LinkedIn person ID returned.");
+  }
+
   return data.sub;
 }
 
@@ -341,7 +528,9 @@ async function exchangeLinkedInCode(code) {
     LINKEDIN_OAUTH_TOKEN,
     {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
       body,
     },
     30000,
@@ -356,6 +545,7 @@ async function exchangeLinkedInCode(code) {
   }
 
   const json = JSON.parse(text);
+
   const accessToken = json.access_token;
 
   if (!accessToken) {
@@ -363,10 +553,12 @@ async function exchangeLinkedInCode(code) {
   }
 
   const expiresIn = Number(json.expires_in || 0);
+
   const expiresAt =
     expiresIn > 0 ? new Date(Date.now() + expiresIn * 1000) : null;
 
   const personId = await getLinkedInPersonId(accessToken);
+
   const personUrn = `urn:li:person:${personId}`;
 
   await saveLinkedInToken({
@@ -376,16 +568,26 @@ async function exchangeLinkedInCode(code) {
     personUrn,
   });
 
-  return { accessToken, expiresAt, scope: json.scope || null, personUrn };
+  return {
+    accessToken,
+    expiresAt,
+    scope: json.scope || null,
+    personUrn,
+  };
 }
 
 async function getValidLinkedInAccessToken() {
   const stored = await getLinkedInToken();
-  if (!stored?.accessToken) return null;
+
+  if (!stored?.accessToken) {
+    return null;
+  }
 
   if (stored.expiresAt && new Date(stored.expiresAt) <= new Date()) {
     console.warn("⚠️ Stored LinkedIn token has expired.");
+
     await clearLinkedInToken();
+
     return null;
   }
 
@@ -393,7 +595,7 @@ async function getValidLinkedInAccessToken() {
 }
 
 /* =======================================================
-   HANDLE OAUTH CALLBACK
+   OAUTH CALLBACK
 ======================================================= */
 
 async function handleLinkedInAuthCallback({ code, state, error }) {
@@ -402,10 +604,12 @@ async function handleLinkedInAuthCallback({ code, state, error }) {
       statusCode: 400,
       html: `
 <!doctype html>
-<html><body>
+<html>
+<body>
 <h2>LinkedIn authorization failed</h2>
 <p>${escapeHtml(error)}</p>
-</body></html>`,
+</body>
+</html>`,
     };
   }
 
@@ -414,43 +618,53 @@ async function handleLinkedInAuthCallback({ code, state, error }) {
       statusCode: 400,
       html: `
 <!doctype html>
-<html><body>
+<html>
+<body>
 <h2>Invalid OAuth request</h2>
 <p>The authorization state is invalid or expired.</p>
-</body></html>`,
+</body>
+</html>`,
     };
   }
 
   try {
     const result = await exchangeLinkedInCode(code);
+
     return {
       statusCode: 200,
       html: `
 <!doctype html>
-<html><head><title>LinkedIn Connected</title></head>
+<html>
+<head>
+<title>LinkedIn Connected</title>
+</head>
 <body>
 <h2>LinkedIn connected successfully.</h2>
 <p>Your LinkedIn authorization token has been saved.</p>
 <p>Person URN: ${escapeHtml(result.personUrn)}</p>
 <p>You can close this window.</p>
-</body></html>`,
+</body>
+</html>`,
     };
   } catch (error) {
     console.error("OAuth callback error:", error);
+
     return {
       statusCode: 500,
       html: `
 <!doctype html>
-<html><body>
+<html>
+<body>
 <h2>LinkedIn connection failed</h2>
 <p>${escapeHtml(error.message)}</p>
-</body></html>`,
+</body>
+</html>`,
     };
   }
 }
 
 /* =======================================================
-   JOB RESEARCH (Now uses hardcoded job RSS feed)
+   RSS PARSING
 ======================================================= */
 
 function decodeXml(value) {
@@ -466,6 +680,8 @@ function decodeXml(value) {
 
 function stripHtml(value) {
   return String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -475,163 +691,398 @@ function getXmlTag(xml, tag) {
   const match = xml.match(
     new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"),
   );
+
   if (!match) return "";
+
   return decodeXml(stripHtml(match[1])).trim();
 }
 
-function fingerprintTopic(title) {
-  return String(title || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim()
-    .slice(0, 180);
+function getXmlLink(xml) {
+  const normal = getXmlTag(xml, "link");
+
+  if (normal) {
+    return normalizeUrl(normal);
+  }
+
+  const atom = xml.match(/<link[^>]+href=["']([^"']+)["'][^>]*\/?>/i);
+
+  return normalizeUrl(atom?.[1] || "");
 }
 
-async function storeTrendingTopics(items) {
-  if (
-    !trendingTopicsCollection ||
-    !Array.isArray(items) ||
-    items.length === 0
-  ) {
+function fingerprintOpportunity(title, url = "") {
+  return crypto
+    .createHash("sha256")
+    .update(
+      `${cleanText(title).toLowerCase()}|${normalizeUrl(url).toLowerCase()}`,
+    )
+    .digest("hex");
+}
+
+/* =======================================================
+   OPPORTUNITY DISCOVERY
+======================================================= */
+
+async function fetchFeed(feed) {
+  try {
+    console.log(`   🔎 ${feed.name}`);
+
+    const response = await fetchWithTimeout(
+      feed.url,
+      {
+        headers: {
+          "User-Agent": "Mozilla/5.0 LinkedInOpportunityBot/3.0",
+          Accept: "application/rss+xml, application/xml, text/xml",
+        },
+      },
+      30000,
+    );
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const xml = await response.text();
+
+    const items = [...xml.matchAll(/<(item|entry)\b[^>]*>([\s\S]*?)<\/\1>/gi)];
+
+    const opportunities = [];
+
+    for (const match of items.slice(0, 40)) {
+      const item = match[2];
+
+      const title = cleanText(getXmlTag(item, "title"));
+
+      if (!title) continue;
+
+      const description = cleanText(
+        getXmlTag(item, "description") ||
+          getXmlTag(item, "summary") ||
+          getXmlTag(item, "content"),
+      );
+
+      const publishedAt =
+        getXmlTag(item, "pubDate") ||
+        getXmlTag(item, "published") ||
+        getXmlTag(item, "updated");
+
+      const link = getXmlLink(item);
+
+      if (!isRecentDate(publishedAt, 336)) {
+        continue;
+      }
+
+      opportunities.push({
+        title: title.slice(0, 300),
+
+        description: description.slice(0, 2000),
+
+        publishedAt: publishedAt.slice(0, 100),
+
+        source: link || feed.name,
+
+        sourceName: feed.name,
+
+        category: feed.type,
+
+        url: link,
+
+        fingerprint: fingerprintOpportunity(title, link),
+      });
+    }
+
+    console.log(`      ✅ ${opportunities.length} recent opportunities`);
+
+    return opportunities;
+  } catch (error) {
+    console.warn(`      ⚠️ Feed failed: ${error.message}`);
+
+    return [];
+  }
+}
+
+async function researchOpportunities() {
+  console.log("\n🌐 Searching recent opportunities...");
+
+  const allResults = [];
+
+  for (const feed of OPPORTUNITY_FEEDS) {
+    const results = await fetchFeed(feed);
+
+    allResults.push(...results);
+  }
+
+  const unique = new Map();
+
+  for (const opportunity of allResults) {
+    if (!opportunity.fingerprint) {
+      continue;
+    }
+
+    if (!unique.has(opportunity.fingerprint)) {
+      unique.set(opportunity.fingerprint, opportunity);
+    }
+  }
+
+  const opportunities = shuffleArray(Array.from(unique.values()));
+
+  console.log(
+    `\n📊 Total unique recent opportunities: ${opportunities.length}`,
+  );
+
+  const counts = opportunities.reduce((acc, item) => {
+    const category = item.category || "opportunity";
+
+    acc[category] = (acc[category] || 0) + 1;
+
+    return acc;
+  }, {});
+
+  console.log("📌 Categories:", counts);
+
+  await storeOpportunities(opportunities);
+
+  return opportunities;
+}
+
+/* =======================================================
+   MONGODB OPPORTUNITIES
+======================================================= */
+
+async function storeOpportunities(items) {
+  if (!opportunitiesCollection || !items.length) {
     return;
   }
 
   const operations = items.map((item) => ({
     updateOne: {
-      filter: { fingerprint: fingerprintTopic(item.title) },
+      filter: {
+        fingerprint: item.fingerprint,
+      },
+
       update: {
         $setOnInsert: {
-          fingerprint: fingerprintTopic(item.title),
-          title: item.title,
-          description: item.description,
-          source: item.source,
-          publishedAt: item.publishedAt,
+          ...item,
           fetchedAt: new Date(),
           used: false,
           usedAt: null,
         },
       },
+
       upsert: true,
     },
   }));
 
   try {
-    await trendingTopicsCollection.bulkWrite(operations, { ordered: false });
+    await opportunitiesCollection.bulkWrite(operations, {
+      ordered: false,
+    });
+
+    console.log(`💾 Stored ${items.length} opportunities.`);
   } catch (error) {
-    console.warn("⚠️ Topic storage failed:", error.message);
+    console.warn("⚠️ Opportunity storage failed:", error.message);
   }
 }
 
-async function pullTrendingTopic() {
-  if (!trendingTopicsCollection) return null;
+async function pullStoredOpportunity() {
+  if (!opportunitiesCollection) {
+    return null;
+  }
 
-  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
+  const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
 
   try {
-    const result = await trendingTopicsCollection.findOneAndUpdate(
-      { used: false, fetchedAt: { $gte: cutoff } },
-      { $set: { used: true, usedAt: new Date() } },
-      { sort: { fetchedAt: -1 }, returnDocument: "after" },
+    const result = await opportunitiesCollection.findOneAndUpdate(
+      {
+        used: false,
+
+        fetchedAt: {
+          $gte: cutoff,
+        },
+      },
+
+      {
+        $set: {
+          used: true,
+          usedAt: new Date(),
+        },
+      },
+
+      {
+        sort: {
+          publishedAt: -1,
+          fetchedAt: -1,
+        },
+
+        returnDocument: "after",
+      },
     );
+
     return result || null;
   } catch (error) {
-    console.warn("⚠️ Topic pull failed:", error.message);
+    console.warn("⚠️ Stored opportunity pull failed:", error.message);
+
     return null;
   }
 }
 
-// ===== NEW: Fetch from job RSS feed =====
-async function researchOpportunities() {
-  console.log("\n🌐 [LinkedIn] Searching job RSS feed...");
-  let jobs = [];
+async function selectOpportunity(freshOpportunities) {
+  const stored = await pullStoredOpportunity();
 
-  try {
-    const response = await fetchWithTimeout(JOB_FEED_URL, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 LinkedInAI/2.2",
-        Accept: "application/rss+xml, application/xml, text/xml",
-      },
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-    const xml = await response.text();
-    const items = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
-
-    for (const match of items.slice(0, 25)) {
-      const item = match[1];
-      const title = getXmlTag(item, "title");
-      if (!title) continue;
-
-      jobs.push({
-        title: title.slice(0, 300),
-        description: getXmlTag(item, "description").slice(0, 700),
-        publishedAt: getXmlTag(item, "pubDate").slice(0, 100),
-        source: getXmlTag(item, "link") || "Job Board",
-      });
-    }
-
-    shuffleArray(jobs);
-    console.log(`   ✅ ${jobs.length} job listings found.`);
-    await storeTrendingTopics(jobs);
-  } catch (error) {
-    console.warn("   ⚠️ Job feed fetch failed:", error.message);
-    // Fallback: create a dummy topic so we never skip
+  if (stored) {
+    return {
+      ...stored,
+      fromDb: true,
+    };
   }
 
-  return jobs;
-}
-
-// ===== Fallback topic if no jobs found =====
-async function selectTopic(newsItems) {
-  const stored = await pullTrendingTopic();
-  if (stored) return { ...stored, fromDb: true };
-
-  if (Array.isArray(newsItems) && newsItems.length) {
-    const selected = newsItems[Math.floor(Math.random() * newsItems.length)];
-    return { ...selected, fromDb: false };
+  if (Array.isArray(freshOpportunities) && freshOpportunities.length) {
+    return {
+      ...freshOpportunities[0],
+      fromDb: false,
+    };
   }
 
-  // FALLBACK: always return a career tips topic so bot never skips
   return {
-    title: "How to land your dream job in 2026",
+    title: "Software Engineering Opportunity",
     description:
-      "Update your CV, network actively, and apply consistently to opportunities that match your skills.",
+      "A software engineering opportunity is available for candidates with relevant technical skills.",
     publishedAt: new Date().toISOString(),
-    source: "LinkedIn Bot",
+    source: "Opportunity Feed",
+    sourceName: "Opportunity Feed",
+    category: "opportunity",
+    url: "",
     fromDb: false,
   };
 }
 
 /* =======================================================
-   GROQ – Enhanced prompt to match your exact format
+   POST SCHEMA
 ======================================================= */
 
 const POST_SCHEMA = {
   type: "object",
+
   properties: {
-    title: { type: "string" },
-    type: {
+    title: {
       type: "string",
-      enum: ["job", "internship", "scholarship", "fellowship"],
     },
-    organization: { type: "string" },
-    content: { type: "string" },
-    imageQuery: { type: "string" },
-    skip: { type: "boolean" },
-    skipReason: { type: "string" },
+
+    opportunityType: {
+      type: "string",
+
+      enum: [
+        "job",
+        "internship",
+        "scholarship",
+        "fellowship",
+        "graduate_program",
+        "other",
+      ],
+    },
+
+    companyName: {
+      type: "string",
+    },
+
+    role: {
+      type: "string",
+    },
+
+    location: {
+      type: "string",
+    },
+
+    requirements: {
+      type: "array",
+
+      items: {
+        type: "string",
+      },
+    },
+
+    benefits: {
+      type: "array",
+
+      items: {
+        type: "string",
+      },
+    },
+
+    eligibility: {
+      type: "array",
+
+      items: {
+        type: "string",
+      },
+    },
+
+    applicationMethod: {
+      type: "string",
+    },
+
+    applicationUrl: {
+      type: "string",
+    },
+
+    hashtags: {
+      type: "array",
+
+      items: {
+        type: "string",
+      },
+    },
+
+    content: {
+      type: "string",
+    },
+
+    imageTitle: {
+      type: "string",
+    },
+
+    imageSubtitle: {
+      type: "string",
+    },
+
+    imageTheme: {
+      type: "string",
+    },
+
+    skip: {
+      type: "boolean",
+    },
+
+    skipReason: {
+      type: "string",
+    },
   },
+
   required: [
     "title",
-    "type",
-    "organization",
+    "opportunityType",
+    "companyName",
+    "role",
+    "location",
+    "requirements",
+    "benefits",
+    "eligibility",
+    "applicationMethod",
+    "applicationUrl",
+    "hashtags",
     "content",
-    "imageQuery",
+    "imageTitle",
+    "imageSubtitle",
+    "imageTheme",
     "skip",
     "skipReason",
   ],
+
   additionalProperties: false,
 };
+
+/* =======================================================
+   POST NORMALIZATION
+======================================================= */
 
 function normalizePost(post) {
   const allowedTypes = new Set([
@@ -639,129 +1090,536 @@ function normalizePost(post) {
     "internship",
     "scholarship",
     "fellowship",
+    "graduate_program",
+    "other",
   ]);
 
+  const normalizeArray = (value, max = 8) =>
+    Array.isArray(value)
+      ? value
+          .map((item) => cleanText(item))
+          .filter(Boolean)
+          .slice(0, max)
+      : [];
+
   return {
-    title: String(post?.title || "Career Opportunity")
-      .trim()
-      .slice(0, 150),
-    type: allowedTypes.has(post?.type) ? post.type : "job",
-    organization: String(post?.organization || "")
-      .trim()
-      .slice(0, 150),
+    title: cleanText(post?.title || "Career Opportunity").slice(0, 180),
+
+    opportunityType: allowedTypes.has(post?.opportunityType)
+      ? post.opportunityType
+      : "other",
+
+    companyName: cleanText(post?.companyName || "Organization").slice(0, 150),
+
+    role: cleanText(post?.role || "Opportunity Available").slice(0, 180),
+
+    location: cleanText(post?.location || "See official listing").slice(0, 180),
+
+    requirements: normalizeArray(post?.requirements),
+
+    benefits: normalizeArray(post?.benefits),
+
+    eligibility: normalizeArray(post?.eligibility),
+
+    applicationMethod: cleanText(
+      post?.applicationMethod || "Apply through the official application page.",
+    ).slice(0, 500),
+
+    applicationUrl: normalizeUrl(post?.applicationUrl || ""),
+
+    hashtags: normalizeArray(post?.hashtags, 8)
+      .map((tag) => {
+        const cleaned = tag.replace(/^#+/, "").replace(/[^a-zA-Z0-9_]/g, "");
+
+        return cleaned ? `#${cleaned}` : "";
+      })
+      .filter(Boolean),
+
     content: stripEmojis(String(post?.content || "").trim()),
-    imageQuery: String(post?.imageQuery || "professional office workspace")
-      .trim()
-      .slice(0, 150),
+
+    imageTitle: cleanText(post?.imageTitle || "OPPORTUNITY").slice(0, 80),
+
+    imageSubtitle: cleanText(post?.imageSubtitle || post?.role || "").slice(
+      0,
+      120,
+    ),
+
+    imageTheme: cleanText(
+      post?.imageTheme || "professional career opportunity",
+    ).slice(0, 250),
+
     skip: Boolean(post?.skip),
-    skipReason: String(post?.skipReason || "").trim(),
+
+    skipReason: cleanText(post?.skipReason || ""),
   };
 }
 
-async function callGeneration(prompt, retries = 3) {
+/* =======================================================
+   AI GENERATION
+======================================================= */
+
+async function callGeneration(opportunity, retries = 3) {
+  const listing = `
+TITLE:
+${opportunity.title}
+
+TYPE FROM SOURCE:
+${opportunity.category || "unknown"}
+
+DESCRIPTION:
+${opportunity.description || "Not provided"}
+
+PUBLISHED:
+${opportunity.publishedAt || "Unknown"}
+
+SOURCE:
+${opportunity.sourceName || "Unknown"}
+
+SOURCE URL:
+${opportunity.url || "Not available"}
+`;
+
+  const systemPrompt = `
+You are an expert LinkedIn career opportunity content creator.
+
+Your job is to transform a real opportunity listing into a concise,
+high-quality LinkedIn post.
+
+IMPORTANT:
+You MUST use ONLY information explicitly available in the source listing.
+
+Never invent:
+- salary
+- benefits
+- eligibility
+- degree requirements
+- location
+- deadline
+- company information
+- application links
+- skills
+- experience
+- visa sponsorship
+- remote status
+
+If information is missing, use an empty array or a safe phrase such as:
+"Not specified in the listing."
+
+Do not fabricate information to make the post look complete.
+
+The post MUST follow this structure:
+
+#COMPANY_NAME is HIRING #ROLE
+
+Requirements:
+- requirement
+- requirement
+
+Benefits:
+- benefit
+- benefit
+
+Eligibility:
+- eligibility requirement
+- eligibility requirement
+
+Where to Apply:
+application method or official URL
+
+#Hashtag #Hashtag #Hashtag
+
+For scholarships, fellowships and internships:
+Do NOT force the word "HIRING" if it would be misleading.
+
+Instead use:
+#ORGANIZATION_NAME is OFFERING #OPPORTUNITY
+
+Examples:
+
+#GOOGLE is HIRING #SOFTWAREENGINEER
+
+or
+
+#ERASMUS is OFFERING #SCHOLARSHIP
+
+or
+
+#MICROSOFT is OFFERING #INTERNSHIP
+
+The company/organization name must come from the source.
+
+ROLE must be the actual role/opportunity title from the source.
+
+The content should be easy to scan on LinkedIn.
+
+Use simple professional English.
+
+Do not use emojis.
+
+Do not write a long introduction.
+
+Do not add a "Source:" section.
+
+Do not add unsupported information.
+
+Generate 3-8 highly relevant hashtags.
+
+Image information must match the actual opportunity.
+
+For example:
+- Software job -> modern technology/software workplace
+- Internship -> young professional/technology internship environment
+- Scholarship -> university/international education environment
+- Fellowship -> academic/research/professional fellowship environment
+- Graduate program -> modern graduate/professional workplace
+- Healthcare job -> healthcare environment
+- Finance job -> professional finance/business environment
+- Engineering job -> engineering workplace
+- Remote job -> professional remote workspace
+
+The image must NOT contain logos or fake company branding.
+The image should NOT contain random text.
+
+If the source is too weak to identify the actual opportunity, set skip=true.
+`;
+
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       console.log(`   🧠 Groq attempt ${attempt}/${retries}`);
 
       const response = await groq.chat.completions.create({
         model: GROQ_MODEL,
+
         messages: [
           {
+            role: "system",
+            content: systemPrompt,
+          },
+
+          {
             role: "user",
-            content: `You are a professional LinkedIn post writer for job opportunities.
-
-Your task: Read the JOB LISTING below and create a LinkedIn post in the EXACT format shown in the example.
-
-EXAMPLE POST:
-🚀 #CompanyName is Hiring | Job Title
-
-Are you passionate about ... (short intro)
-
-📌 Key Details:
-* Job Type: Full‑time / Internship
-* Position: Job Title
-* Industry: ...
-* Location: City, Country (or Remote)
-* Contact: email@domain.com
-
-What we’re looking for:
-🔹 requirement 1
-🔹 requirement 2
-...
-
-📩 Interested? Send your CV via email at ... or apply at [link].
-
-RULES:
-- Use simple A2-B1 English.
-- No emojis except the rocket and circle symbols (🚀, 🔹, 📌, 📩) – those are allowed.
-- Only use information from the listing. Never invent details.
-- If the listing does NOT contain enough info (no role, no requirements, no application method), then set "skip": true and explain why.
-- Otherwise set "skip": false.
-
-JOB LISTING:
-${prompt}
-`,
+            content: listing,
           },
         ],
-        temperature: 0.3,
-        max_completion_tokens: 1000,
+
+        temperature: 0.2,
+
+        max_completion_tokens: 1600,
+
         reasoning_effort: "low",
+
         reasoning_format: "hidden",
+
         response_format: {
           type: "json_schema",
+
           json_schema: {
-            name: "linkedin_post",
+            name: "linkedin_opportunity",
+
             strict: true,
+
             schema: POST_SCHEMA,
           },
         },
       });
 
       const raw = response?.choices?.[0]?.message?.content;
-      if (!raw) throw new Error("Groq returned empty content.");
+
+      if (!raw) {
+        throw new Error("Groq returned empty content.");
+      }
 
       return normalizePost(JSON.parse(raw));
     } catch (error) {
       console.warn(`   ⚠️ Groq attempt failed: ${error.message}`);
-      if (attempt >= retries) throw error;
+
+      if (attempt >= retries) {
+        throw error;
+      }
+
       await sleep(1500 * attempt);
     }
   }
 }
 
 /* =======================================================
-   VALIDATION (relaxed)
+   CONTENT VALIDATION
 ======================================================= */
 
 function validatePost(post) {
   const reasons = [];
-  if (!post) return { valid: false, reasons: ["empty post"] };
 
-  const content = String(post.content || "").trim();
+  if (!post) {
+    return {
+      valid: false,
+      reasons: ["empty post"],
+    };
+  }
 
-  if (content.length < 80) reasons.push("post is too short");
-  if (content.length > 3000) reasons.push("post is too long");
-  if (!/apply|send|cv|email/i.test(content))
-    reasons.push("missing application instruction");
+  if (post.content.length < 100) {
+    reasons.push("post is too short");
+  }
 
-  return { valid: reasons.length === 0, reasons };
+  if (post.content.length > 3000) {
+    reasons.push("post is too long");
+  }
+
+  if (!post.companyName) {
+    reasons.push("missing organization");
+  }
+
+  if (!post.role) {
+    reasons.push("missing role/opportunity");
+  }
+
+  if (post.requirements.length === 0) {
+    reasons.push("missing requirements");
+  }
+
+  if (!post.applicationMethod && !post.applicationUrl) {
+    reasons.push("missing application method");
+  }
+
+  if (!/#\w+/i.test(post.content)) {
+    reasons.push("missing hashtags");
+  }
+
+  return {
+    valid: reasons.length === 0,
+    reasons,
+  };
 }
 
 /* =======================================================
-   IMAGE GENERATION WITH "HIRING" OVERLAY
+   IMAGE GENERATION
 ======================================================= */
 
+function getOpportunityVisual(post) {
+  const type = post.opportunityType;
+
+  if (type === "scholarship") {
+    return `
+international university campus,
+students studying,
+academic scholarship opportunity,
+modern university architecture,
+books and education atmosphere
+`;
+  }
+
+  if (type === "fellowship") {
+    return `
+professional research and fellowship environment,
+modern academic research center,
+researchers working,
+international professional development atmosphere
+`;
+  }
+
+  if (type === "internship") {
+    return `
+modern technology workplace,
+young professional intern,
+laptop with software development environment,
+collaborative professional office,
+early-career atmosphere
+`;
+  }
+
+  if (type === "graduate_program") {
+    return `
+modern professional corporate workplace,
+young graduate professionals,
+career development environment,
+laptops and collaborative workspace
+`;
+  }
+
+  if (post.role) {
+    const role = post.role.toLowerCase();
+
+    if (
+      role.includes("software") ||
+      role.includes("developer") ||
+      role.includes("engineer") ||
+      role.includes("programmer") ||
+      role.includes("data") ||
+      role.includes("ai") ||
+      role.includes("machine learning") ||
+      role.includes("cyber")
+    ) {
+      return `
+modern software engineering office,
+developers working with computers,
+technology workplace,
+subtle code visible on monitors,
+professional corporate environment
+`;
+    }
+
+    if (
+      role.includes("finance") ||
+      role.includes("account") ||
+      role.includes("bank")
+    ) {
+      return `
+modern financial services office,
+professional finance workplace,
+business professionals,
+subtle financial analytics screens
+`;
+    }
+
+    if (
+      role.includes("marketing") ||
+      role.includes("sales") ||
+      role.includes("business")
+    ) {
+      return `
+modern business and marketing office,
+professional business team,
+creative strategy workplace,
+laptops and presentation screens
+`;
+    }
+
+    if (role.includes("design") || role.includes("ui") || role.includes("ux")) {
+      return `
+modern creative design studio,
+professional UI UX designers,
+large design displays,
+creative digital workplace
+`;
+    }
+
+    if (
+      role.includes("health") ||
+      role.includes("medical") ||
+      role.includes("doctor") ||
+      role.includes("nurse")
+    ) {
+      return `
+modern healthcare workplace,
+professional medical environment,
+clean hospital interior,
+healthcare professionals
+`;
+    }
+
+    if (
+      role.includes("mechanical") ||
+      role.includes("electrical") ||
+      role.includes("civil") ||
+      role.includes("engineering")
+    ) {
+      return `
+modern engineering workplace,
+professional engineers,
+technical equipment,
+industrial engineering environment
+`;
+    }
+  }
+
+  return `
+modern professional workplace,
+career opportunity environment,
+professional people working,
+clean corporate office,
+laptop and workspace
+`;
+}
+
 function buildImagePrompt(post) {
-  // Decide background based on job type
-  const bg =
-    post.type === "job"
-      ? "software company modern office building"
-      : "educational institution building";
-  return `professional photograph of a ${bg}, clear sky, no people, no text, realistic, horizontal composition, high quality`;
+  const visual = getOpportunityVisual(post);
+
+  return `
+Create a premium realistic LinkedIn career opportunity image.
+
+OPPORTUNITY:
+${post.title}
+
+ORGANIZATION:
+${post.companyName}
+
+ROLE:
+${post.role}
+
+TYPE:
+${post.opportunityType}
+
+VISUAL THEME:
+${post.imageTheme}
+
+SCENE:
+${visual}
+
+STYLE:
+photorealistic,
+premium corporate photography,
+professional LinkedIn aesthetic,
+clean composition,
+realistic lighting,
+subtle depth of field,
+high-end editorial photography,
+modern,
+trustworthy,
+professional,
+horizontal 1.91:1 composition
+
+IMPORTANT:
+- No logos
+- No company branding
+- No fake certificates
+- No fake text
+- No random letters
+- No watermarks
+- No distorted people
+- No excessive futuristic effects
+- No cartoon style
+- No visible company trademarks
+
+The image should visually communicate the actual opportunity type.
+`;
+}
+
+/* =======================================================
+   IMAGE OVERLAY
+======================================================= */
+
+function escapeSvgText(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function getOverlayLabel(type) {
+  switch (type) {
+    case "job":
+      return "HIRING";
+
+    case "internship":
+      return "INTERNSHIP";
+
+    case "scholarship":
+      return "SCHOLARSHIP";
+
+    case "fellowship":
+      return "FELLOWSHIP";
+
+    case "graduate_program":
+      return "GRADUATE PROGRAM";
+
+    default:
+      return "OPPORTUNITY";
+  }
 }
 
 async function generateImageWithCloudflare(post) {
-  console.log("\n🎨 [LinkedIn] Generating image...");
+  console.log("\n🎨 Generating opportunity-specific image...");
 
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
 
@@ -769,34 +1627,44 @@ async function generateImageWithCloudflare(post) {
     endpoint,
     {
       method: "POST",
+
       headers: {
         Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ prompt: buildImagePrompt(post) }),
+
+      body: JSON.stringify({
+        prompt: buildImagePrompt(post),
+      }),
     },
     120000,
   );
 
   if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Cloudflare ${response.status}: ${text}`);
+    throw new Error(`Cloudflare ${response.status}: ${await response.text()}`);
   }
 
   const contentType = response.headers.get("content-type") || "";
+
   let imageBuffer;
 
   if (contentType.includes("application/json")) {
     const json = await response.json();
+
     let b64 =
       json?.result?.image ||
       json?.result?.output ||
       json?.image ||
       json?.output;
 
-    if (Array.isArray(b64)) b64 = b64[0];
-    if (typeof b64 !== "string")
+    if (Array.isArray(b64)) {
+      b64 = b64[0];
+    }
+
+    if (typeof b64 !== "string") {
       throw new Error("Cloudflare returned no image data.");
+    }
 
     imageBuffer = Buffer.from(
       b64.replace(/^data:image\/[^;]+;base64,/i, ""),
@@ -810,53 +1678,160 @@ async function generateImageWithCloudflare(post) {
     throw new Error("Invalid generated image.");
   }
 
-  // ===== Overlay "HIRING" text =====
   let finalBuffer = imageBuffer;
+
   try {
     const sharpModule = await import("sharp");
+
     const sharp = sharpModule.default;
 
-    // Resize to 1200x627 (LinkedIn recommended)
-    let img = sharp(imageBuffer).resize(1200, 627, { fit: "cover" });
+    const label = getOverlayLabel(post.opportunityType);
 
-    // Create SVG overlay with semi-transparent background and bold "HIRING"
+    const title = post.companyName;
+
+    const subtitle = post.role;
+
+    const safeLabel = escapeSvgText(label);
+
+    const safeTitle = escapeSvgText(title);
+
+    const safeSubtitle = escapeSvgText(subtitle);
+
     const svg = `
-      <svg width="1200" height="627">
-        <rect x="0" y="0" width="1200" height="627" fill="rgba(0,0,0,0.5)" />
-        <text x="600" y="313" font-family="Arial, Helvetica, sans-serif" font-size="100" font-weight="bold" fill="white" text-anchor="middle" dominant-baseline="central" letter-spacing="5">HIRING</text>
-      </svg>
-    `;
+<svg
+  width="1200"
+  height="627"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <defs>
+    <linearGradient
+      id="gradient"
+      x1="0"
+      y1="0"
+      x2="1"
+      y2="1"
+    >
+      <stop
+        offset="0%"
+        stop-color="rgba(0,0,0,0.78)"
+      />
+
+      <stop
+        offset="100%"
+        stop-color="rgba(0,0,0,0.25)"
+      />
+    </linearGradient>
+  </defs>
+
+  <rect
+    x="0"
+    y="0"
+    width="1200"
+    height="627"
+    fill="url(#gradient)"
+  />
+
+  <rect
+    x="55"
+    y="55"
+    width="360"
+    height="75"
+    rx="12"
+    fill="rgba(0,0,0,0.65)"
+  />
+
+  <text
+    x="85"
+    y="105"
+    font-family="Arial, Helvetica, sans-serif"
+    font-size="38"
+    font-weight="bold"
+    fill="white"
+  >
+    ${safeLabel}
+  </text>
+
+  <text
+    x="70"
+    y="400"
+    font-family="Arial, Helvetica, sans-serif"
+    font-size="62"
+    font-weight="bold"
+    fill="white"
+  >
+    ${safeTitle}
+  </text>
+
+  <text
+    x="70"
+    y="465"
+    font-family="Arial, Helvetica, sans-serif"
+    font-size="34"
+    fill="white"
+  >
+    ${safeSubtitle}
+  </text>
+
+  <rect
+    x="70"
+    y="500"
+    width="220"
+    height="6"
+    rx="3"
+    fill="white"
+  />
+</svg>
+`;
+
     const overlay = Buffer.from(svg);
 
-    finalBuffer = await img
-      .composite([{ input: overlay, top: 0, left: 0 }])
-      .jpeg({ quality: 88 })
+    finalBuffer = await sharp(imageBuffer)
+      .resize(1200, 627, {
+        fit: "cover",
+      })
+      .composite([
+        {
+          input: overlay,
+          top: 0,
+          left: 0,
+        },
+      ])
+      .jpeg({
+        quality: 90,
+      })
       .toBuffer();
-  } catch (err) {
-    console.warn("   ⚠️ Image overlay failed, using raw image:", err.message);
-    // Fallback: keep raw buffer but still resize
+  } catch (error) {
+    console.warn("⚠️ Overlay failed:", error.message);
+
     try {
       const sharpModule = await import("sharp");
+
       const sharp = sharpModule.default;
+
       finalBuffer = await sharp(imageBuffer)
-        .resize(1200, 627, { fit: "cover" })
-        .jpeg({ quality: 88 })
+        .resize(1200, 627, {
+          fit: "cover",
+        })
+        .jpeg({
+          quality: 90,
+        })
         .toBuffer();
-    } catch {
-      // keep original
-    }
+    } catch {}
   }
 
-  // Save image
-  await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
+  await fs.mkdir(GENERATED_IMAGE_DIR, {
+    recursive: true,
+  });
+
   const imagePath = path.join(
     GENERATED_IMAGE_DIR,
     `linkedin-${Date.now()}.jpg`,
   );
+
   await fs.writeFile(imagePath, finalBuffer);
 
   console.log(
-    `   ✅ Image generated with HIRING overlay (${(finalBuffer.length / 1024).toFixed(1)} KB)`,
+    `   ✅ Image generated: ${(finalBuffer.length / 1024).toFixed(1)} KB`,
   );
 
   return imagePath;
@@ -864,20 +1839,23 @@ async function generateImageWithCloudflare(post) {
 
 async function cleanupImage(imagePath) {
   if (!imagePath) return;
+
   try {
     await fs.unlink(imagePath);
   } catch {}
 }
 
 /* =======================================================
-   LINKEDIN API (with retries)
+   LINKEDIN REQUEST
 ======================================================= */
 
 async function linkedinRequest(url, options = {}, retries = 3) {
   let lastError;
+
   for (let i = 1; i <= retries; i++) {
     try {
       const token = await getValidLinkedInAccessToken();
+
       if (!token) {
         throw new Error(
           "No valid LinkedIn access token. Visit /auth/linkedin first.",
@@ -888,64 +1866,90 @@ async function linkedinRequest(url, options = {}, retries = 3) {
         url,
         {
           ...options,
+
           headers: {
             Authorization: `Bearer ${token}`,
+
             "Linkedin-Version": LINKEDIN_VERSION,
+
             "X-Restli-Protocol-Version": "2.0.0",
+
             ...(options.headers || {}),
           },
         },
         60000,
       );
 
-      // Handle rate limiting
       if (response.status === 429) {
-        const retryAfter = parseInt(response.headers.get("retry-after") || "5");
+        const retryAfter = parseInt(
+          response.headers.get("retry-after") || "5",
+          10,
+        );
+
         console.log(`⏳ Rate limited. Waiting ${retryAfter}s...`);
+
         await sleep(retryAfter * 1000);
+
         continue;
       }
 
-      // Server errors – retry
       if (response.status >= 500 && i < retries) {
         console.log(
-          `🔄 Server error (${response.status}). Retry ${i}/${retries}...`,
+          `🔄 LinkedIn server error ${response.status}. Retry ${i}/${retries}`,
         );
+
         await sleep(2000 * i);
+
         continue;
       }
 
       return response;
     } catch (error) {
       lastError = error;
-      if (i === retries) throw error;
-      console.log(`🔄 Request failed, retry ${i}/${retries}...`);
+
+      if (i === retries) {
+        throw error;
+      }
+
+      console.log(`🔄 LinkedIn request failed. Retry ${i}/${retries}`);
+
       await sleep(2000 * i);
     }
   }
-  throw lastError || new Error("Request failed after retries.");
+
+  throw lastError || new Error("LinkedIn request failed.");
 }
+
+/* =======================================================
+   LINKEDIN IMAGE UPLOAD
+======================================================= */
 
 async function registerImageUpload() {
   const personUrn = await getLinkedInPersonUrn();
+
   if (!personUrn) {
-    throw new Error(
-      "No person URN found. Please re-authenticate via /auth/linkedin.",
-    );
+    throw new Error("No person URN found. Please re-authenticate.");
   }
 
   const response = await linkedinRequest(
     `${LINKEDIN_API}/images?action=initializeUpload`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+
+      headers: {
+        "Content-Type": "application/json",
+      },
+
       body: JSON.stringify({
-        initializeUploadRequest: { owner: personUrn },
+        initializeUploadRequest: {
+          owner: personUrn,
+        },
       }),
     },
   );
 
   const text = await response.text();
+
   if (!response.ok) {
     throw new Error(
       `LinkedIn image initialization failed: ${response.status} ${text}`,
@@ -953,8 +1957,11 @@ async function registerImageUpload() {
   }
 
   const json = JSON.parse(text);
+
   const value = json.value || {};
+
   const uploadUrl = value.uploadUrl;
+
   const image = value.image;
 
   if (!uploadUrl || !image) {
@@ -963,21 +1970,28 @@ async function registerImageUpload() {
     );
   }
 
-  return { uploadUrl, image };
+  return {
+    uploadUrl,
+    image,
+  };
 }
 
 async function uploadImageBinary(uploadUrl, imagePath) {
   const token = await getValidLinkedInAccessToken();
+
   const buffer = await fs.readFile(imagePath);
 
   const response = await fetchWithTimeout(
     uploadUrl,
     {
       method: "PUT",
+
       headers: {
         Authorization: `Bearer ${token}`,
+
         "Content-Type": "application/octet-stream",
       },
+
       body: buffer,
     },
     60000,
@@ -990,45 +2004,67 @@ async function uploadImageBinary(uploadUrl, imagePath) {
   }
 }
 
+/* =======================================================
+   CREATE LINKEDIN POST
+======================================================= */
+
 async function createLinkedInPost(text, imageUrn = null) {
   const personUrn = await getLinkedInPersonUrn();
+
   if (!personUrn) {
-    throw new Error("No person URN found. Please re-authenticate.");
+    throw new Error("No person URN found.");
   }
 
   const body = {
     author: personUrn,
+
     commentary: text,
+
     visibility: "PUBLIC",
+
     distribution: {
       feedDistribution: "MAIN_FEED",
+
       targetEntities: [],
+
       thirdPartyDistributionChannels: [],
     },
+
     lifecycleState: "PUBLISHED",
+
     isReshareDisabledByAuthor: false,
   };
 
   if (imageUrn) {
     body.content = {
-      media: { altText: "Career opportunity", id: imageUrn },
+      media: {
+        altText: "Career opportunity",
+        id: imageUrn,
+      },
     };
   }
 
   const response = await linkedinRequest(`${LINKEDIN_API}/posts`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+
+    headers: {
+      "Content-Type": "application/json",
+    },
+
     body: JSON.stringify(body),
   });
 
   const textResponse = await response.text();
+
   if (!response.ok) {
     throw new Error(`LinkedIn post failed: ${response.status} ${textResponse}`);
   }
 
   const id = response.headers.get("x-restli-id");
+
   return {
     id: id || null,
+
     link: id
       ? `https://www.linkedin.com/feed/update/${encodeURIComponent(id)}/`
       : null,
@@ -1042,10 +2078,20 @@ async function createLinkedInPost(text, imageUrn = null) {
 async function publishToLinkedIn(post, imagePath) {
   if (DRY_RUN) {
     console.log("\n🧪 DRY_RUN=true");
+
     console.log("\n----- POST -----\n");
+
     console.log(post.content);
+
     console.log("\n---------------\n");
-    return { success: true, dryRun: true, id: null, link: null };
+
+    return {
+      success: true,
+      dryRun: true,
+      id: null,
+      link: null,
+      imageGenerated: Boolean(imagePath),
+    };
   }
 
   let imageUrn = null;
@@ -1053,13 +2099,19 @@ async function publishToLinkedIn(post, imagePath) {
   if (imagePath) {
     try {
       const { uploadUrl, image } = await registerImageUpload();
+
       await uploadImageBinary(uploadUrl, imagePath);
+
       imageUrn = image;
+
       console.log("   ✅ LinkedIn image uploaded.");
+
       await sleep(3000);
     } catch (error) {
-      console.warn("⚠️ Image upload failed.", error.message);
+      console.warn("⚠️ Image upload failed:", error.message);
+
       console.log("   Continuing with text-only post.");
+
       imageUrn = null;
     }
   }
@@ -1082,13 +2134,21 @@ async function publishToLinkedIn(post, imagePath) {
 function createDefaultState() {
   return {
     date: getLocalDate(),
+
     postsToday: 0,
+
     totalPosts: 0,
+
     totalFailures: 0,
+
     totalSkipped: 0,
+
     lastPostAt: null,
+
     lastTriggerAt: null,
+
     lastTriggerResult: null,
+
     history: [],
   };
 }
@@ -1096,12 +2156,30 @@ function createDefaultState() {
 let state = createDefaultState();
 
 function normalizeState() {
-  if (typeof state.date !== "string") state.date = getLocalDate();
-  if (!Number.isFinite(state.postsToday)) state.postsToday = 0;
-  if (!Number.isFinite(state.totalPosts)) state.totalPosts = 0;
-  if (!Number.isFinite(state.totalFailures)) state.totalFailures = 0;
-  if (!Number.isFinite(state.totalSkipped)) state.totalSkipped = 0;
-  if (!Array.isArray(state.history)) state.history = [];
+  if (typeof state.date !== "string") {
+    state.date = getLocalDate();
+  }
+
+  if (!Number.isFinite(state.postsToday)) {
+    state.postsToday = 0;
+  }
+
+  if (!Number.isFinite(state.totalPosts)) {
+    state.totalPosts = 0;
+  }
+
+  if (!Number.isFinite(state.totalFailures)) {
+    state.totalFailures = 0;
+  }
+
+  if (!Number.isFinite(state.totalSkipped)) {
+    state.totalSkipped = 0;
+  }
+
+  if (!Array.isArray(state.history)) {
+    state.history = [];
+  }
+
   state.history = state.history.slice(-MAX_HISTORY);
 }
 
@@ -1112,10 +2190,13 @@ async function saveState() {
     .catch(() => {})
     .then(async () => {
       const tempFile = `${STATE_FILE}.tmp`;
+
       await fs.writeFile(tempFile, JSON.stringify(state, null, 2), "utf8");
+
       try {
         await fs.copyFile(STATE_FILE, STATE_BACKUP_FILE);
       } catch {}
+
       await fs.rename(tempFile, STATE_FILE);
     });
 
@@ -1124,9 +2205,11 @@ async function saveState() {
 
 function resetDailyCounter() {
   const today = getLocalDate();
+
   if (state.date !== today) {
     state.date = today;
     state.postsToday = 0;
+
     saveState().catch(() => {});
   }
 }
@@ -1136,9 +2219,15 @@ async function loadState() {
 
   try {
     const raw = await fs.readFile(STATE_FILE, "utf8");
+
     const parsed = JSON.parse(raw);
+
     if (parsed && typeof parsed === "object") {
-      state = { ...createDefaultState(), ...parsed };
+      state = {
+        ...createDefaultState(),
+        ...parsed,
+      };
+
       loaded = true;
     }
   } catch {}
@@ -1146,9 +2235,15 @@ async function loadState() {
   if (!loaded) {
     try {
       const raw = await fs.readFile(STATE_BACKUP_FILE, "utf8");
+
       const parsed = JSON.parse(raw);
+
       if (parsed && typeof parsed === "object") {
-        state = { ...createDefaultState(), ...parsed };
+        state = {
+          ...createDefaultState(),
+          ...parsed,
+        };
+
         loaded = true;
       }
     } catch {}
@@ -1157,7 +2252,9 @@ async function loadState() {
   normalizeState();
   resetDailyCounter();
 
-  if (!loaded) await saveState();
+  if (!loaded) {
+    await saveState();
+  }
 }
 
 /* =======================================================
@@ -1172,15 +2269,26 @@ function getRecentPostMemory() {
 }
 
 async function storePostHistory(post, result) {
-  if (!postHistoryCollection) return;
+  if (!postHistoryCollection) {
+    return;
+  }
 
   try {
     await postHistoryCollection.insertOne({
       id: result?.id || null,
+
       title: post.title || null,
-      type: post.type || "job",
+
+      type: post.opportunityType || "other",
+
+      companyName: post.companyName || null,
+
+      role: post.role || null,
+
       text: post.content,
+
       publishedAt: new Date(),
+
       dryRun: Boolean(result?.dryRun),
     });
   } catch (error) {
@@ -1191,11 +2299,21 @@ async function storePostHistory(post, result) {
 async function savePost(post, result) {
   state.history.push({
     id: result?.id || null,
+
     title: post.title,
-    type: post.type,
+
+    type: post.opportunityType,
+
+    companyName: post.companyName,
+
+    role: post.role,
+
     text: post.content,
+
     imageGenerated: Boolean(result?.imageGenerated),
+
     publishedAt: new Date().toISOString(),
+
     dryRun: Boolean(result?.dryRun),
   });
 
@@ -1208,6 +2326,7 @@ async function savePost(post, result) {
   }
 
   await saveState();
+
   await storePostHistory(post, result);
 }
 
@@ -1221,63 +2340,89 @@ async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 LINKEDIN AI BOT V2.2.0");
+
+  console.log("🚀 LINKEDIN AI OPPORTUNITY BOT V3.0.0");
+
   console.log("================================================");
+
   console.log(
-    `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
+    `🕐 ${new Date().toLocaleString("en-US", {
+      timeZone: BOT_TIMEZONE,
+    })}`,
   );
+
   console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
 
   if (state.postsToday >= MAX_POSTS_PER_DAY) {
     console.log("🛑 Daily limit reached.");
+
     state.totalSkipped++;
+
     await saveState();
-    return { success: false, skipped: true, reason: "daily_limit" };
+
+    return {
+      success: false,
+      skipped: true,
+      reason: "daily_limit",
+    };
   }
 
   try {
     const token = await getValidLinkedInAccessToken();
+
     if (!token) {
       throw new Error("LinkedIn is not authorized. Open /auth/linkedin first.");
     }
 
-    const news = await researchOpportunities();
-    const selectedTopic = await selectTopic(news);
+    /* ===============================================
+       FETCH RECENT OPPORTUNITIES
+    =============================================== */
+
+    const opportunities = await researchOpportunities();
+
+    /* ===============================================
+       SELECT OPPORTUNITY
+    =============================================== */
+
+    const selected = await selectOpportunity(opportunities);
+
+    console.log("\n🎯 SELECTED OPPORTUNITY");
+
+    console.log(`📌 ${selected.title}`);
+
+    console.log(`🏷️ Type: ${selected.category || "unknown"}`);
+
+    console.log(`🔗 ${selected.url || "No URL"}`);
+
+    /* ===============================================
+       RECENT POST MEMORY
+    =============================================== */
+
     const recentPosts = getRecentPostMemory();
 
-    let researchBlock = "NO CURRENT LISTING FOUND.";
+    /* ===============================================
+       AI GENERATION
+    =============================================== */
 
-    if (selectedTopic) {
-      researchBlock = `
-Headline:
-${selectedTopic.title}
+    const enrichedOpportunity = {
+      ...selected,
 
-Description:
-${selectedTopic.description || ""}
+      recentPosts,
+    };
 
-Published:
-${selectedTopic.publishedAt || ""}
+    const post = await callGeneration(enrichedOpportunity, 3);
 
-Source:
-${selectedTopic.source || "Unknown"}
-`;
-    }
-
-    const prompt = `
-CURRENT JOB LISTING:
-
-${researchBlock}
-
-RECENT POSTS:
-${recentPosts || "None"}
-`;
-
-    const post = await callGeneration(prompt, 3);
+    /* ===============================================
+       AI SKIP
+    =============================================== */
 
     if (post.skip) {
       console.log("⏭️ AI skipped:", post.skipReason);
+
       state.totalSkipped++;
+
       await saveState();
+
       return {
         success: false,
         skipped: true,
@@ -1285,16 +2430,39 @@ ${recentPosts || "None"}
       };
     }
 
-    console.log("\n📝 Title:", post.title);
-    console.log("🏢 Organization:", post.organization);
-    console.log("🏷️ Type:", post.type);
+    /* ===============================================
+       DISPLAY
+    =============================================== */
+
+    console.log("\n📝 GENERATED OPPORTUNITY");
+
+    console.log(`🏢 Organization: ${post.companyName}`);
+
+    console.log(`💼 Role: ${post.role}`);
+
+    console.log(`🏷️ Type: ${post.opportunityType}`);
+
+    console.log(`📍 Location: ${post.location}`);
+
+    console.log("\n----- GENERATED POST -----\n");
+
+    console.log(post.content);
+
+    console.log("\n--------------------------\n");
+
+    /* ===============================================
+       VALIDATION
+    =============================================== */
 
     const validation = validatePost(post);
 
     if (!validation.valid) {
       console.error("❌ Validation failed:", validation.reasons.join(", "));
+
       state.totalSkipped++;
+
       await saveState();
+
       return {
         success: false,
         skipped: true,
@@ -1302,6 +2470,10 @@ ${recentPosts || "None"}
         validation: validation.reasons,
       };
     }
+
+    /* ===============================================
+       IMAGE
+    =============================================== */
 
     let imagePath = null;
 
@@ -1311,6 +2483,10 @@ ${recentPosts || "None"}
       console.warn("⚠️ Image generation failed:", error.message);
     }
 
+    /* ===============================================
+       PUBLISH
+    =============================================== */
+
     let result;
 
     try {
@@ -1319,11 +2495,21 @@ ${recentPosts || "None"}
       await cleanupImage(imagePath);
     }
 
+    /* ===============================================
+       SAVE
+    =============================================== */
+
     await savePost(post, result);
 
     console.log("\n✅ CYCLE COMPLETED");
-    if (result.id) console.log(`🆔 ${result.id}`);
-    if (result.link) console.log(`🔗 ${result.link}`);
+
+    if (result.id) {
+      console.log(`🆔 ${result.id}`);
+    }
+
+    if (result.link) {
+      console.log(`🔗 ${result.link}`);
+    }
 
     return {
       success: true,
@@ -1333,15 +2519,28 @@ ${recentPosts || "None"}
     };
   } catch (error) {
     state.totalFailures++;
+
     await saveState();
+
     console.error("\n❌ Cycle error:", error?.stack || error?.message || error);
-    return { success: false, error: error?.message || "Unknown error" };
+
+    return {
+      success: false,
+      error: error?.message || "Unknown error",
+    };
   }
 }
 
+/* =======================================================
+   SAFE RUN
+======================================================= */
+
 async function safeRunCycle() {
   if (cycleRunning) {
-    return { success: false, error: "A post cycle is already running." };
+    return {
+      success: false,
+      error: "A post cycle is already running.",
+    };
   }
 
   cycleRunning = true;
@@ -1358,30 +2557,47 @@ async function safeRunCycle() {
 ======================================================= */
 
 async function initializeLinkedInBot() {
-  if (initialized) return;
+  if (initialized) {
+    return;
+  }
 
   console.log("\n==============================================");
-  console.log("🤖 INITIALIZING LINKEDIN BOT (V2.2.0)");
+
+  console.log("🤖 INITIALIZING LINKEDIN OPPORTUNITY BOT V3.0.0");
+
   console.log("==============================================");
 
   await connectMongo();
+
   await loadState();
 
   console.log(`🧠 Groq: ${GROQ_MODEL}`);
-  console.log(`🔐 LinkedIn OAuth: enabled (personal profile)`);
+
+  console.log("🔐 LinkedIn OAuth: enabled (personal profile)");
+
   console.log(`📡 LinkedIn API: ${LINKEDIN_VERSION}`);
+
   console.log(`🎨 Cloudflare: ${CLOUDFLARE_IMAGE_MODEL}`);
+
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
+
   console.log(`🎯 Daily limit: ${MAX_POSTS_PER_DAY}`);
-  console.log(`📡 Job feed: ${JOB_FEED_URL}`);
+
+  console.log(`📡 Opportunity feeds: ${OPPORTUNITY_FEEDS.length}`);
 
   const token = await getValidLinkedInAccessToken();
+
   const personUrn = await getLinkedInPersonUrn();
+
   console.log(`🔑 LinkedIn authorized: ${token ? "YES" : "NO"}`);
-  if (personUrn) console.log(`👤 Person URN: ${personUrn}`);
+
+  if (personUrn) {
+    console.log(`👤 Person URN: ${personUrn}`);
+  }
 
   initialized = true;
-  console.log("✅ LinkedIn bot initialized.");
+
+  console.log("✅ LinkedIn opportunity bot initialized.");
 }
 
 /* =======================================================
@@ -1390,6 +2606,7 @@ async function initializeLinkedInBot() {
 
 async function runLinkedInBot() {
   await initializeLinkedInBot();
+
   return await safeRunCycle();
 }
 
@@ -1401,23 +2618,39 @@ async function getLinkedInStatus() {
   resetDailyCounter();
 
   const token = await getValidLinkedInAccessToken();
+
   const personUrn = await getLinkedInPersonUrn();
 
   return {
-    service: "linkedin-ai-bot",
-    version: "2.2.0",
+    service: "linkedin-ai-opportunity-bot",
+
+    version: "3.0.0",
+
     timezone: BOT_TIMEZONE,
+
     localDate: getLocalDate(),
+
     postsToday: state.postsToday,
+
     maxPostsPerDay: MAX_POSTS_PER_DAY,
+
     totalPosts: state.totalPosts,
+
     totalFailures: state.totalFailures,
+
     totalSkipped: state.totalSkipped,
+
     cycleRunning,
+
     dryRun: DRY_RUN,
+
     mongoConnected: Boolean(mongoClient),
+
     linkedinAuthorized: Boolean(token),
+
     personUrnStored: Boolean(personUrn),
+
+    opportunityFeeds: OPPORTUNITY_FEEDS.length,
   };
 }
 
@@ -1426,13 +2659,17 @@ async function getLinkedInStatus() {
 ======================================================= */
 
 async function shutdownLinkedInBot() {
-  console.log("🛑 Shutting down LinkedIn bot...");
+  console.log("🛑 Shutting down LinkedIn opportunity bot...");
+
   try {
     await saveState();
   } catch {}
+
   await disconnectMongo();
+
   initialized = false;
-  console.log("👋 LinkedIn bot shutdown complete.");
+
+  console.log("👋 LinkedIn opportunity bot shutdown complete.");
 }
 
 /* =======================================================
