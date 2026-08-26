@@ -10,12 +10,10 @@ dotenv.config();
 
 /*
 =========================================================
-LINKEDIN AI OPPORTUNITY BOT V4.0.0 – SIMPLE POSTER
+LINKEDIN AI OPPORTUNITY BOT V4.1.0 – FIXED MODEL
 =========================================================
-
-Simplified version: just fetch a job/opportunity,
-generate a post (even if incomplete), and publish it.
-No strict validation, no skipping.
+Simplified: posts whatever it finds, even if incomplete.
+Uses a valid Groq model by default.
 =========================================================
 */
 
@@ -27,7 +25,8 @@ const __dirname = path.dirname(__filename);
 ======================================================= */
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+// ✅ FIX: Use a valid Groq model
+const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "Binance-Square-Bot";
@@ -67,7 +66,7 @@ const STATE_BACKUP_FILE = path.join(__dirname, "linkedin-state.backup.json");
 const GENERATED_IMAGE_DIR = path.join(__dirname, "linkedin-generated-images");
 
 /* =======================================================
-   RSS SOURCES
+   RSS SOURCES (same as before)
 ======================================================= */
 
 const RSS_SOURCES = [
@@ -131,7 +130,7 @@ if (!CLOUDFLARE_API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN is missing.");
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 /* =======================================================
-   HELPERS
+   HELPERS (same as before)
 ======================================================= */
 
 function parsePositiveInteger(value, fallback) {
@@ -221,7 +220,7 @@ function isRealUrl(url) {
 }
 
 /* =======================================================
-   MONGODB
+   MONGODB (same as before)
 ======================================================= */
 
 let mongoClient = null;
@@ -275,7 +274,7 @@ async function disconnectMongo() {
 }
 
 /* =======================================================
-   LINKEDIN TOKEN STORAGE
+   LINKEDIN TOKEN STORAGE (same)
 ======================================================= */
 
 async function getLinkedInToken() {
@@ -327,7 +326,7 @@ async function getValidLinkedInAccessToken() {
 }
 
 /* =======================================================
-   OAUTH
+   OAUTH (same)
 ======================================================= */
 
 const oauthStates = new Map();
@@ -435,7 +434,7 @@ async function handleLinkedInAuthCallback({ code, state, error }) {
     const result = await exchangeLinkedInCode(code);
     return {
       statusCode: 200,
-      html: `<!doctype html><html><head><title>LinkedIn Connected</title></head><body><h2>LinkedIn connected successfully.</h2><p>Your LinkedIn authorization token has been saved.</p><p>Person URN: ${escapeHtml(result.personUrn)}</p><p>You can close this window.</p></body></html>`,
+      html: `<!doctype html><html><head><title>LinkedIn Connected</title></head><body><h2>LinkedIn connected successfully.</h2><p>Person URN: ${escapeHtml(result.personUrn)}</p><p>You can close this window.</p></body></html>`,
     };
   } catch (error) {
     console.error("OAuth callback error:", error);
@@ -447,7 +446,7 @@ async function handleLinkedInAuthCallback({ code, state, error }) {
 }
 
 /* =======================================================
-   RSS PARSING
+   RSS PARSING (same)
 ======================================================= */
 
 function decodeXml(value) {
@@ -468,6 +467,8 @@ function stripHtml(value) {
   return String(value || "")
     .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
     .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<(header|footer|nav|aside|svg)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -518,7 +519,7 @@ function inferOpportunityType(title, description, fallback) {
 }
 
 /* =======================================================
-   FETCH RSS SOURCES
+   FETCH RSS SOURCES (same)
 ======================================================= */
 
 async function fetchRssSource(source) {
@@ -627,7 +628,7 @@ async function storeOpportunities(items) {
 }
 
 /* =======================================================
-   SOURCE PAGE EXTRACTION
+   SOURCE PAGE EXTRACTION (same)
 ======================================================= */
 
 function extractMetaContent(html, name) {
@@ -718,7 +719,7 @@ async function enrichOpportunity(opportunity) {
 }
 
 /* =======================================================
-   AI SCHEMA – relaxed (almost all optional)
+   AI SCHEMA (simple, almost all optional)
 ======================================================= */
 
 const OPPORTUNITY_SCHEMA = {
@@ -741,12 +742,12 @@ const OPPORTUNITY_SCHEMA = {
     hashtags: { type: "array", items: { type: "string" } },
     content: { type: "string" },
   },
-  required: ["organization", "role", "content"], // only mandatory fields
+  required: ["organization", "role", "content"],
   additionalProperties: false,
 };
 
 /* =======================================================
-   GENERATION PROMPT – simple
+   GROQ GENERATION – with fallback model
 ======================================================= */
 
 function buildGenerationPrompt(opportunity) {
@@ -786,10 +787,6 @@ If you have minimal information, just state what you know and encourage people t
 Do not fabricate details.
 `;
 }
-
-/* =======================================================
-   GROQ GENERATION – no strict validation
-======================================================= */
 
 function normalizeOpportunity(result) {
   const allowedTypes = new Set([
@@ -832,41 +829,47 @@ function normalizeOpportunity(result) {
   };
 }
 
-async function callGeneration(opportunity, retries = 3) {
+async function callGeneration(opportunity, retries = 2) {
   const prompt = buildGenerationPrompt(opportunity);
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      console.log(`   🧠 Groq attempt ${attempt}/${retries}`);
-      const response = await groq.chat.completions.create({
-        model: GROQ_MODEL,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.5,
-        max_completion_tokens: 1500,
-        reasoning_effort: "low",
-        reasoning_format: "hidden",
-        response_format: {
-          type: "json_schema",
-          json_schema: {
-            name: "linkedin_opportunity",
-            strict: true,
-            schema: OPPORTUNITY_SCHEMA,
+  const models = [GROQ_MODEL, "llama-3.3-70b-versatile", "mixtral-8x7b-32768"];
+  let lastError;
+  for (const model of models) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        console.log(
+          `   🧠 Groq attempt ${attempt}/${retries} with model ${model}`,
+        );
+        const response = await groq.chat.completions.create({
+          model,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.5,
+          max_completion_tokens: 1500,
+          reasoning_effort: "low",
+          reasoning_format: "hidden",
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: "linkedin_opportunity",
+              strict: true,
+              schema: OPPORTUNITY_SCHEMA,
+            },
           },
-        },
-      });
-      const raw = response?.choices?.[0]?.message?.content;
-      if (!raw) throw new Error("Groq returned empty content.");
-      return normalizeOpportunity(JSON.parse(raw));
-    } catch (error) {
-      console.warn(`   ⚠️ Groq attempt failed: ${error.message}`);
-      if (attempt >= retries) throw error;
-      await sleep(1500 * attempt);
+        });
+        const raw = response?.choices?.[0]?.message?.content;
+        if (!raw) throw new Error("Groq returned empty content.");
+        return normalizeOpportunity(JSON.parse(raw));
+      } catch (error) {
+        console.warn(`   ⚠️ Groq (${model}) attempt failed: ${error.message}`);
+        lastError = error;
+        await sleep(1000 * attempt);
+      }
     }
   }
-  throw new Error("Generation failed.");
+  throw lastError || new Error("All Groq models failed.");
 }
 
 /* =======================================================
-   POST BUILDER – simple
+   POST BUILDER (same)
 ======================================================= */
 
 function buildFinalPost(post, opportunity) {
@@ -953,7 +956,7 @@ function buildFinalPost(post, opportunity) {
 }
 
 /* =======================================================
-   IMAGE GENERATION – simple
+   IMAGE GENERATION (same)
 ======================================================= */
 
 function buildImagePrompt(post) {
@@ -1072,7 +1075,7 @@ async function cleanupImage(imagePath) {
 }
 
 /* =======================================================
-   LINKEDIN API
+   LINKEDIN API (same)
 ======================================================= */
 
 async function linkedinRequest(url, options = {}, retries = 3) {
@@ -1209,7 +1212,7 @@ async function createLinkedInPost(text, imageUrn = null) {
 }
 
 /* =======================================================
-   PUBLISH
+   PUBLISH (same)
 ======================================================= */
 
 async function publishToLinkedIn(post, imagePath) {
@@ -1244,7 +1247,7 @@ async function publishToLinkedIn(post, imagePath) {
 }
 
 /* =======================================================
-   STATE
+   STATE (same)
 ======================================================= */
 
 function createDefaultState() {
@@ -1324,7 +1327,7 @@ async function loadState() {
 }
 
 /* =======================================================
-   POST HISTORY
+   POST HISTORY (same)
 ======================================================= */
 
 async function storePostHistory(post, result) {
@@ -1370,16 +1373,14 @@ async function savePost(post, result, originalOpportunity) {
 }
 
 /* =======================================================
-   SELECT AND POST – simplified
+   SELECT AND POST
 ======================================================= */
 
 async function findOpportunity(opportunities) {
   if (!Array.isArray(opportunities) || opportunities.length === 0) return null;
-  // Just take the first one that has a title and URL (after shuffling)
   const shuffled = shuffleArray(opportunities);
   for (const raw of shuffled) {
     if (!raw.title || !raw.url) continue;
-    // Avoid recent duplicates
     const recentTitles = state.history.slice(-20).map((item) =>
       String(item.title || "")
         .toLowerCase()
@@ -1391,11 +1392,17 @@ async function findOpportunity(opportunities) {
   return null;
 }
 
+/* =======================================================
+   MAIN CYCLE
+======================================================= */
+
+let cycleRunning = false;
+
 async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 LINKEDIN AI OPPORTUNITY BOT V4.0.0 – SIMPLE");
+  console.log("🚀 LINKEDIN AI OPPORTUNITY BOT V4.1.0 (FIXED MODEL)");
   console.log("================================================");
   console.log(
     `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
@@ -1423,7 +1430,7 @@ async function runCycle() {
     if (opportunities.length === 0)
       throw new Error("No recent opportunities were found.");
 
-    // Pick one (no strict validation)
+    // Pick one
     const rawOpportunity = await findOpportunity(opportunities);
     if (!rawOpportunity) {
       state.totalSkipped++;
@@ -1438,7 +1445,7 @@ async function runCycle() {
     // Enrich
     const opportunity = await enrichOpportunity(rawOpportunity);
 
-    // Generate post (even if incomplete)
+    // Generate post
     let post;
     try {
       post = await callGeneration(opportunity, 2);
@@ -1497,9 +1504,6 @@ async function runCycle() {
       await cleanupImage(imagePath);
     }
 
-    // Mark used (not strictly needed but good for DB)
-    // await markOpportunityUsed(opportunity);
-
     await savePost(post, result, opportunity);
 
     console.log("\n================================================");
@@ -1527,12 +1531,6 @@ async function runCycle() {
   }
 }
 
-/* =======================================================
-   SAFE RUN
-======================================================= */
-
-let cycleRunning = false;
-
 async function safeRunCycle() {
   if (cycleRunning)
     return { success: false, error: "A post cycle is already running." };
@@ -1542,29 +1540,6 @@ async function safeRunCycle() {
   } finally {
     cycleRunning = false;
   }
-}
-
-/* =======================================================
-   INITIALIZATION
-======================================================= */
-
-async function initializeLinkedInBot() {
-  if (initialized) return;
-  console.log("\n==============================================");
-  console.log("🤖 INITIALIZING LINKEDIN BOT V4.0.0 (SIMPLE)");
-  console.log("==============================================");
-  await connectMongo();
-  await loadState();
-  console.log(`🧠 Groq: ${GROQ_MODEL}`);
-  console.log("🔐 LinkedIn OAuth: enabled");
-  console.log(`🎨 Cloudflare: ${CLOUDFLARE_IMAGE_MODEL}`);
-  console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
-  console.log(`🎯 Daily limit: ${MAX_POSTS_PER_DAY}`);
-  console.log(`🌐 RSS sources: ${RSS_SOURCES.length}`);
-  const token = await getValidLinkedInAccessToken();
-  console.log(`🔑 LinkedIn authorized: ${token ? "YES" : "NO"}`);
-  initialized = true;
-  console.log("✅ LinkedIn bot initialized.");
 }
 
 async function getUnusedDatabaseOpportunities() {
@@ -1582,6 +1557,29 @@ async function getUnusedDatabaseOpportunities() {
 }
 
 /* =======================================================
+   INITIALIZE
+======================================================= */
+
+async function initializeLinkedInBot() {
+  if (initialized) return;
+  console.log("\n==============================================");
+  console.log("🤖 INITIALIZING LINKEDIN BOT V4.1.0");
+  console.log("==============================================");
+  await connectMongo();
+  await loadState();
+  console.log(`🧠 Groq model: ${GROQ_MODEL}`);
+  console.log("🔐 LinkedIn OAuth: enabled");
+  console.log(`🎨 Cloudflare: ${CLOUDFLARE_IMAGE_MODEL}`);
+  console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
+  console.log(`🎯 Daily limit: ${MAX_POSTS_PER_DAY}`);
+  console.log(`🌐 RSS sources: ${RSS_SOURCES.length}`);
+  const token = await getValidLinkedInAccessToken();
+  console.log(`🔑 LinkedIn authorized: ${token ? "YES" : "NO"}`);
+  initialized = true;
+  console.log("✅ LinkedIn bot initialized.");
+}
+
+/* =======================================================
    STATUS
 ======================================================= */
 
@@ -1591,7 +1589,7 @@ async function getLinkedInStatus() {
   const personUrn = await getLinkedInPersonUrn();
   return {
     service: "linkedin-ai-opportunity-bot",
-    version: "4.0.0",
+    version: "4.1.0",
     timezone: BOT_TIMEZONE,
     localDate: getLocalDate(),
     postsToday: state.postsToday,
@@ -1607,10 +1605,6 @@ async function getLinkedInStatus() {
   };
 }
 
-/* =======================================================
-   SHUTDOWN
-======================================================= */
-
 async function shutdownLinkedInBot() {
   console.log("🛑 Shutting down LinkedIn bot...");
   try {
@@ -1621,18 +1615,10 @@ async function shutdownLinkedInBot() {
   console.log("👋 LinkedIn bot shutdown complete.");
 }
 
-/* =======================================================
-   EXTERNAL ENTRY POINT
-======================================================= */
-
 async function runLinkedInBot() {
   await initializeLinkedInBot();
   return await safeRunCycle();
 }
-
-/* =======================================================
-   EXPORTS
-======================================================= */
 
 export {
   runLinkedInBot,
