@@ -10,26 +10,16 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V10.0.0 – PERSUASIVE EDITION
-MODULE EDITION
+BINANCE SQUARE AI BOT V10.1.0 – INFLUENCER EDITION
+NO IMAGE GENERATION – TEXT ONLY
 =========================================================
 
 This version is designed to create highly persuasive,
 personalised posts that encourage buying action.
-Includes small-cap and meme coins (PEPE, SHIB, DOGE, etc.)
-and generates wallet profit screenshots.
+Focuses on small‑cap and meme coins (PEPE, SHIB, DOGE, etc.)
+and uses "invest $X, get $Y profit" style narratives.
 
-index.js calls:
-
-    POST /post
-        ↓
-    runBinanceBot()
-        ↓
-    safeRunCycle()
-        ↓
-    runCycle()
-        ↓
-    Binance Square
+It does NOT generate any images – only text posts.
 =========================================================
 */
 
@@ -68,12 +58,6 @@ const TRENDING_TOPIC_MAX_AGE_HOURS = parsePositiveInteger(
   36,
 );
 
-const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
-const CLOUDFLARE_IMAGE_MODEL =
-  process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
-const GENERATED_IMAGE_DIR = path.join(__dirname, "generated-images");
-
 const SQUARE_TEXT_SCRIPT = path.join(
   __dirname,
   ".agents",
@@ -81,14 +65,6 @@ const SQUARE_TEXT_SCRIPT = path.join(
   "square-post",
   "scripts",
   "post-text.mjs",
-);
-const SQUARE_IMAGE_SCRIPT = path.join(
-  __dirname,
-  ".agents",
-  "skills",
-  "square-post",
-  "scripts",
-  "post-image.mjs",
 );
 
 const GOOGLE_NEWS_URL =
@@ -135,14 +111,6 @@ if (!POST_TRIGGER_SECRET) {
 if (!MONGODB_URI) {
   console.error("❌ MONGODB_URI is missing.");
   throw new Error("MONGODB_URI is missing.");
-}
-if (!CLOUDFLARE_ACCOUNT_ID) {
-  console.error("❌ CLOUDFLARE_ACCOUNT_ID is missing.");
-  throw new Error("CLOUDFLARE_ACCOUNT_ID is missing.");
-}
-if (!CLOUDFLARE_API_TOKEN) {
-  console.error("❌ CLOUDFLARE_API_TOKEN is missing.");
-  throw new Error("CLOUDFLARE_API_TOKEN is missing.");
 }
 
 const groq = new Groq({ apiKey: GROQ_API_KEY });
@@ -278,8 +246,6 @@ async function storePostHistory(post, result) {
       qualityScore: post.qualityScore,
       newsUsed: Boolean(post.newsUsed),
       catalystConfidence: post.catalystConfidence,
-      imageGenerated: Boolean(post.imageGenerated),
-      imageGenerationFailed: Boolean(post.imageGenerationFailed),
       signal: post.signal || null,
       signalConfidence: post.signalConfidence || null,
       publishedAt: new Date(),
@@ -770,7 +736,7 @@ async function researchWeb() {
   try {
     const response = await fetchWithTimeout(GOOGLE_NEWS_URL, {
       headers: {
-        "User-Agent": "Mozilla/5.0 BinanceSquareAI/10.0",
+        "User-Agent": "Mozilla/5.0 BinanceSquareAI/10.1",
         Accept: "application/rss+xml, application/xml, text/xml",
       },
     });
@@ -832,7 +798,7 @@ function getRecentPostMemory() {
 }
 
 /* =======================================================
-   POST SCHEMA – unchanged
+   POST SCHEMA
 ======================================================= */
 
 const POST_SCHEMA = {
@@ -874,7 +840,7 @@ const POST_SCHEMA = {
 };
 
 /* =======================================================
-   GROQ GENERATION – PERSUASIVE & PERSONAL
+   GROQ GENERATION – PERSUASIVE & MANIPULATIVE
 ======================================================= */
 
 async function callGeneration(
@@ -892,24 +858,23 @@ async function callGeneration(
           {
             role: "user",
             content: `
-You are a successful retail crypto trader sharing your personal trade experience on Binance Square.
+You are a top crypto influencer sharing a live trade with your followers on Binance Square.
 
-Your goal is to create a highly persuasive, authentic-looking post that encourages readers to consider the same trade.
+Your goal is to create a highly persuasive, FOMO‑inducing post that encourages readers to take action immediately.
 
 ABSOLUTE RULES:
 
-- Start with a personal statement: "I just bought [TICKER] at [PRICE] and I'm already up [PROFIT%]!"
-- Mention the exact ticker symbol (e.g., $PEPE, $SOL, $BTC) in the first sentence.
-- State the current price and your profit percentage (between 5% and 35%).
-- Give 1-2 reasons why you are bullish (catalyst, technical breakout, meme momentum, etc.).
-- Include a specific target price (e.g., "I'm targeting $0.00002").
-- End with a question to engage discussion.
-- DO NOT use generic phrases like "this is not financial advice" – we want to sound like a real trader sharing a win.
-- DO NOT make it sound like a bot.
+- Start with: "I just bought $[TICKER] at [PRICE]".
+- State the current price and your entry.
+- Include a bold statement: "If you put $10 into this right now, you could see $[PROFIT] when it hits $[TARGET]!"
+- Calculate a realistic target (e.g., 2x, 3x, or 5x) based on recent momentum.
+- Give 1-2 reasons why this coin is about to explode (catalyst, meme momentum, technical breakout).
+- Use urgent language: "This is happening RIGHT NOW", "Don't miss this move".
+- End with a call to action: "Join me – I'm in already! What about you?"
+- DO NOT use disclaimers like "not financial advice".
+- Sound like a real trader sharing a hot tip.
 - Use short, punchy sentences.
-- Make each post unique by varying the structure and wording.
-
-TARGET LENGTH: 150-300 characters (Binance Square optimal).
+- Keep total length under 350 characters (Binance Square optimal).
 
 CONTEXT:
 
@@ -995,26 +960,23 @@ function normalizeGeneratedPost(post) {
 }
 
 /* =======================================================
-   HASHTAGS – includes profit & ticker
+   HASHTAGS – includes ticker & profit
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto", tickerSymbol = "BTC") {
   let text = String(content || "").trim();
-  // Remove existing hashtags to avoid duplicates
   text = text.replace(/#[a-zA-Z0-9_]+/g, "").trim();
   const cleanTicker = tickerSymbol.replace("USDT", "").toUpperCase();
-  // Ensure ticker is mentioned with $ if not already
   if (!text.includes(`$${cleanTicker}`) && !text.includes(cleanTicker)) {
     text = `$${cleanTicker} ${text}`;
   }
-  // Remove existing disclaimer if present
   text = text.replace(/Not financial advice\.\s*$/i, "").trim();
   const tags = [`#${cleanTicker}`, "#Crypto", "#Profit", "#Trade"];
   return `${text}\n\n${tags.join(" ")}`;
 }
 
 /* =======================================================
-   FALLBACK POST – persuasive
+   FALLBACK POST – manipulative
 ======================================================= */
 
 function buildFallbackPost(
@@ -1026,20 +988,23 @@ function buildFallbackPost(
   const tick = ticker.replace("USDT", "").toUpperCase();
   const price = marketData?.lastPrice;
   const priceText = Number.isFinite(price)
-    ? `$${price.toFixed(4)}`
+    ? `$${price.toFixed(8)}`
     : "current levels";
-  const profitPct = (Math.random() * 20 + 5).toFixed(1); // 5-25%
+  const profitPct = (Math.random() * 50 + 20).toFixed(1); // 20-70%
+  const targetPrice = Number.isFinite(price)
+    ? `$${(price * (1 + profitPct / 100)).toFixed(8)}`
+    : "next resistance";
 
   const templates = [
-    `I just bought $${tick} at ${priceText} and I'm already up ${profitPct}%! This is the perfect opportunity to enter before the next leg up. I'm targeting $${(price * 1.15).toFixed(4)}. Who's with me?`,
-    `Just entered $${tick} at ${priceText} – up ${profitPct}% already! The momentum is insane, and I'm holding for $${(price * 1.2).toFixed(4)}. Are you in?`,
-    `$${tick} is breaking out! I bought at ${priceText} and I'm up ${profitPct}% in hours. This could run to $${(price * 1.25).toFixed(4)}. What's your target?`,
+    `I just bought $${tick} at ${priceText}! If you put $10 into this right now, you could see $${(10 * (1 + profitPct / 100)).toFixed(2)} when it hits ${targetPrice}. This is happening NOW – I'm already in! Who's with me?`,
+    `$${tick} is exploding! I entered at ${priceText} and I'm already up ${profitPct}% in hours. A $10 investment would be $${(10 * (1 + profitPct / 100)).toFixed(2)} already. This is the play of the day – join me!`,
+    `The next big move is here: $${tick} at ${priceText}. If you put $10 in now, you could walk away with $${(10 * (1 + profitPct / 100)).toFixed(2)} when it reaches ${targetPrice}. I'm all in – are you?`,
   ];
 
   const content = templates[Math.floor(Math.random() * templates.length)];
 
   return {
-    title: `$${tick} breakout? I'm up ${profitPct}%!`,
+    title: `$${tick} 🚀 ${profitPct}% potential!`,
     topic: "crypto",
     content: ensureHashtags(content, "crypto", ticker),
     qualityScore: 8,
@@ -1076,7 +1041,7 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST – persuasive
+   GENERATE POST – manipulative
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
@@ -1115,14 +1080,16 @@ Source: ${selectedTopic.source || "Unknown"}
     ticker = symbol;
     marketBlock = `
 Coin: ${symbol} (${baseAsset})
-Price: $${lastPrice.toFixed(4)}
+Price: $${lastPrice.toFixed(8)}
 24h Change: ${priceChangePercent}%
 Signal: ${signal.direction} (${signal.confidence}) - ${signal.reason}
 `;
   }
 
-  // Generate a random profit percentage (5-35%)
-  const profitPct = (Math.random() * 30 + 5).toFixed(1);
+  // Generate a random profit percentage (20-80%)
+  const profitPct = (Math.random() * 60 + 20).toFixed(1);
+  const investment = 10; // $10
+  const potentialProfit = (investment * (1 + profitPct / 100)).toFixed(2);
 
   const prompt = `
 CURRENT WEB RESEARCH:
@@ -1148,6 +1115,8 @@ Write a persuasive, personal Binance Square post about the coin above.
 You recently bought this coin and are already showing a profit of ${profitPct}%.
 
 Use the market data accurately.
+
+Include a statement like: "If you put $10 into this right now, you could see $${potentialProfit} when it hits the target."
 
 Make the post sound like a real trader sharing a winning trade.
 
@@ -1178,7 +1147,6 @@ function validatePost(post) {
   if (content.length < 60) reasons.push("post is too short");
   if (content.length > 5000) reasons.push("post is too long");
   const lower = content.toLowerCase();
-  // Remove strict forbidden phrases to allow some hype, but keep extreme ones
   const forbidden = [
     "guaranteed profit",
     "guaranteed return",
@@ -1197,158 +1165,11 @@ function validatePost(post) {
   }
   const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
   if (hashtags.length < 2) reasons.push(`hashtags count: ${hashtags.length}`);
-  // Allow missing disclaimer
   return { valid: reasons.length === 0, reasons };
 }
 
 function isDuplicate() {
   return { duplicate: false, score: 0 };
-}
-
-/* =======================================================
-   IMAGE PROMPT – Wallet Profit Screenshot
-======================================================= */
-
-function buildImagePrompt(post, marketData) {
-  const title = String(post?.title || "").slice(0, 250);
-  const content = String(post?.content || "")
-    .replace(/#[a-zA-Z0-9_]+/g, "")
-    .slice(0, 700);
-
-  let priceInfo = "";
-  let direction = "bullish";
-  let coinLabel = "Crypto";
-  let ticker = "BTC";
-  let profit = "15.2";
-
-  if (marketData) {
-    const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
-      marketData;
-    coinLabel = baseAsset || symbol.replace("USDT", "");
-    ticker = symbol;
-    priceInfo = `${symbol} at $${lastPrice.toFixed(
-      4,
-    )}, 24h change: ${priceChangePercent}%. Signal: ${signal.direction}.`;
-    direction = signal.direction.toLowerCase();
-  }
-
-  // Random profit between 5-35
-  profit = (Math.random() * 30 + 5).toFixed(1);
-
-  return `
-Create a realistic mobile wallet screenshot showing a profitable trade for Binance Square.
-
-Subject: ${coinLabel} (${ticker})
-
-Context:
-${title}
-
-${content}
-
-Market:
-${priceInfo}
-
-Visual requirements:
-
-- Mobile phone interface style, like a crypto wallet app.
-- Display a large profit percentage: +${profit}% in green.
-- Show the coin logo and current price.
-- Include a "Profit" badge.
-- Clean, modern UI, dark or light theme (prefer dark).
-- No human faces.
-- No fake PNL numbers (only percentage).
-- No guaranteed profit claims.
-- No text overlays.
-- Aspect ratio 9:16 (mobile portrait) or 1:1.
-
-The image should look like a screenshot from a real trading app showing a successful trade.
-`;
-}
-
-/* =======================================================
-   CLOUDFLARE IMAGE GENERATION – wallet screenshot
-======================================================= */
-
-async function generateImageWithCloudflare(post, marketData) {
-  console.log(
-    "\n🎨 [Binance] Generating wallet profit screenshot with Cloudflare Workers AI...",
-  );
-
-  const prompt = buildImagePrompt(post, marketData);
-  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
-
-  try {
-    const response = await fetchWithTimeout(
-      endpoint,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ prompt }),
-      },
-      120000,
-    );
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Cloudflare API error ${response.status}: ${errorText}`);
-    }
-
-    const contentType = response.headers.get("content-type") || "";
-    let imageBuffer;
-
-    if (contentType.includes("application/json")) {
-      const json = await response.json();
-      let base64Image =
-        json?.result?.image ||
-        json?.result?.output ||
-        json?.image ||
-        json?.output;
-      if (Array.isArray(base64Image)) base64Image = base64Image[0];
-      if (typeof base64Image !== "string")
-        throw new Error("Cloudflare returned JSON but no image data.");
-      base64Image = base64Image.replace(/^data:image\/[^;]+;base64,/i, "");
-      imageBuffer = Buffer.from(base64Image, "base64");
-    } else {
-      const arrayBuffer = await response.arrayBuffer();
-      imageBuffer = Buffer.from(arrayBuffer);
-    }
-
-    if (!imageBuffer || imageBuffer.length < 1000)
-      throw new Error("Cloudflare returned an empty or invalid image.");
-
-    console.log("   ✅ Wallet screenshot generated.");
-
-    await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
-    const timestamp = Date.now();
-    const random = Math.random().toString(36).slice(2, 8);
-    const imagePath = path.join(
-      GENERATED_IMAGE_DIR,
-      `wallet-${timestamp}-${random}.png`,
-    );
-    await fs.writeFile(imagePath, imageBuffer);
-    console.log(`   ✅ Image generated: ${imagePath}`);
-    console.log(
-      `   📦 Image size: ${(imageBuffer.length / 1024).toFixed(1)} KB`,
-    );
-    return imagePath;
-  } catch (error) {
-    console.error("❌ Cloudflare image generation failed:", error.message);
-    throw error;
-  }
-}
-
-async function cleanupGeneratedImage(imagePath) {
-  if (!imagePath) return;
-  try {
-    await fs.unlink(imagePath);
-    console.log("🧹 Temporary image deleted.");
-  } catch (error) {
-    if (error.code !== "ENOENT")
-      console.warn("⚠️ Could not delete temporary image:", error.message);
-  }
 }
 
 /* =======================================================
@@ -1421,97 +1242,6 @@ function publishTextToSquare(content) {
 }
 
 /* =======================================================
-   BINANCE SQUARE IMAGE PUBLISHER
-======================================================= */
-
-function publishImageToSquare(content, imagePath) {
-  return new Promise((resolve, reject) => {
-    console.log("\n📡 [Binance] Publishing image post to Binance Square...");
-    if (DRY_RUN) {
-      console.log("🧪 DRY_RUN=true");
-      console.log("\n----- GENERATED POST -----\n");
-      console.log(content);
-      console.log("\n🖼️ Image:", imagePath);
-      console.log("\n--------------------------\n");
-      resolve({ success: true, dryRun: true, id: null, link: null });
-      return;
-    }
-    fs.access(SQUARE_IMAGE_SCRIPT)
-      .then(() => {
-        const child = spawn(
-          "node",
-          [SQUARE_IMAGE_SCRIPT, "--text", content, "--images", imagePath],
-          {
-            cwd: path.join(__dirname, ".agents", "skills", "square-post"),
-            env: { ...process.env, BINANCE_SQUARE_OPENAPI_KEY },
-            shell: false,
-            windowsHide: true,
-          },
-        );
-        let stdout = "",
-          stderr = "",
-          settled = false;
-        const finishReject = (error) => {
-          if (settled) return;
-          settled = true;
-          reject(error);
-        };
-        const finishResolve = (value) => {
-          if (settled) return;
-          settled = true;
-          resolve(value);
-        };
-        child.stdout.on("data", (data) => {
-          const text = data.toString();
-          stdout += text;
-          process.stdout.write(text);
-        });
-        child.stderr.on("data", (data) => {
-          const text = data.toString();
-          stderr += text;
-          process.stderr.write(text);
-        });
-        child.on("error", finishReject);
-        child.on("close", (code) => {
-          if (code !== 0) {
-            finishReject(
-              new Error(
-                `Square image publisher exited with code ${code}\n${stderr}`,
-              ),
-            );
-            return;
-          }
-          const id = stdout.match(/ID:\s*(.+)/i)?.[1]?.trim() || null;
-          const link = stdout.match(/Link:\s*(.+)/i)?.[1]?.trim() || null;
-          finishResolve({ success: true, dryRun: false, id, link, stdout });
-        });
-      })
-      .catch((error) =>
-        reject(
-          new Error(
-            `Binance Square image publisher script not found: ${error.message}`,
-          ),
-        ),
-      );
-  });
-}
-
-/* =======================================================
-   IMAGE PIPELINE
-======================================================= */
-
-async function generateAndPublishImage(post, marketData) {
-  let imagePath = null;
-  try {
-    imagePath = await generateImageWithCloudflare(post, marketData);
-    const result = await publishImageToSquare(post.content, imagePath);
-    return { ...result, imageGenerated: true };
-  } finally {
-    await cleanupGeneratedImage(imagePath);
-  }
-}
-
-/* =======================================================
    SAVE POST
 ======================================================= */
 
@@ -1526,8 +1256,6 @@ async function savePost(post, result) {
     catalystConfidence: post.catalystConfidence,
     signal: post.signal || null,
     signalConfidence: post.signalConfidence || null,
-    imageGenerated: Boolean(post.imageGenerated),
-    imageGenerationFailed: Boolean(post.imageGenerationFailed),
     publishedAt: new Date().toISOString(),
     dryRun: Boolean(result?.dryRun),
   });
@@ -1543,14 +1271,14 @@ async function savePost(post, result) {
 }
 
 /* =======================================================
-   MAIN BINANCE CYCLE
+   MAIN BINANCE CYCLE – no image generation
 ======================================================= */
 
 async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 BINANCE SQUARE AI BOT V10.0.0 – PERSUASIVE");
+  console.log("🚀 BINANCE SQUARE AI BOT V10.1.0 – INFLUENCER");
   console.log("================================================");
   console.log(
     `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
@@ -1615,20 +1343,8 @@ async function runCycle() {
     }
     console.log("   ✓ Duplicate protection disabled.");
 
-    let result;
-    try {
-      console.log("\n🎨 IMAGE PIPELINE STARTING (Wallet Screenshot)");
-      result = await generateAndPublishImage(post, marketData);
-      post.imageGenerated = true;
-      post.imageGenerationFailed = false;
-      console.log("\n🖼️ Image post published successfully.");
-    } catch (imageError) {
-      console.error("\n⚠️ Image pipeline failed:", imageError.message);
-      console.log("↪️ Falling back to text-only Binance Square post.");
-      post.imageGenerated = false;
-      post.imageGenerationFailed = true;
-      result = await publishTextToSquare(post.content);
-    }
+    // Publish text only (no image)
+    let result = await publishTextToSquare(post.content);
 
     await savePost(post, result);
 
@@ -1638,14 +1354,12 @@ async function runCycle() {
     if (result.id) console.log(`🆔 ID: ${result.id}`);
     if (result.link) console.log(`🔗 ${result.link}`);
     if (result.dryRun) console.log("🧪 DRY RUN — not published.");
-    console.log(`🖼️ Image generated: ${Boolean(post.imageGenerated)}`);
 
     return {
       success: true,
       id: result.id || null,
       link: result.link || null,
       dryRun: Boolean(result.dryRun),
-      imageGenerated: Boolean(post.imageGenerated),
     };
   } catch (error) {
     state.totalFailures++;
@@ -1692,7 +1406,7 @@ async function initializeBinanceBot() {
   if (initialized) return;
 
   console.log("\n==============================================");
-  console.log("🤖 INITIALIZING BINANCE BOT (PERSUASIVE)");
+  console.log("🤖 INITIALIZING BINANCE BOT (INFLUENCER EDITION)");
   console.log("==============================================");
 
   await connectMongo();
@@ -1705,10 +1419,7 @@ async function initializeBinanceBot() {
   console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
   console.log(`📈 Signal generation: SMA + RSI`);
   console.log(`🛡️ Safety validation: ENABLED (relaxed)`);
-  console.log(`🎨 Image generation: ENABLED (Wallet profit screenshot)`);
-  console.log(
-    `🎨 Image provider: Cloudflare Workers AI (${CLOUDFLARE_IMAGE_MODEL})`,
-  );
+  console.log(`🎨 Image generation: DISABLED (text only)`);
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
   console.log(`❓ Topic pool: ${TOPICS.length} (includes memecoins)`);
@@ -1735,7 +1446,7 @@ function getBinanceStatus() {
 
   return {
     service: "binance-square-ai-bot",
-    version: "10.0.0",
+    version: "10.1.0",
     timezone: BOT_TIMEZONE,
     localDate: getLocalDate(),
     postsToday: state.postsToday,
@@ -1749,8 +1460,8 @@ function getBinanceStatus() {
     cycleRunning,
     dryRun: DRY_RUN,
     mongoConnected: Boolean(mongoClient),
-    imageGeneration: "Cloudflare",
-    imageModel: CLOUDFLARE_IMAGE_MODEL,
+    imageGeneration: "Disabled",
+    imageModel: "None",
   };
 }
 
