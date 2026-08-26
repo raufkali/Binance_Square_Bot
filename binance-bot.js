@@ -10,12 +10,14 @@ dotenv.config();
 
 /*
 =========================================================
-BINANCE SQUARE AI BOT V9.3.0
+BINANCE SQUARE AI BOT V10.0.0 – PERSUASIVE EDITION
 MODULE EDITION
 =========================================================
 
-This file contains ONLY Binance bot logic.
-The HTTP server is handled by index.js.
+This version is designed to create highly persuasive,
+personalised posts that encourage buying action.
+Includes small-cap and meme coins (PEPE, SHIB, DOGE, etc.)
+and generates wallet profit screenshots.
 
 index.js calls:
 
@@ -92,7 +94,7 @@ const SQUARE_IMAGE_SCRIPT = path.join(
 const GOOGLE_NEWS_URL =
   "https://news.google.com/rss/search?q=" +
   encodeURIComponent(
-    "crypto OR bitcoin OR ethereum OR binance OR solana OR XRP",
+    "crypto OR bitcoin OR ethereum OR binance OR solana OR XRP OR PEPE OR SHIB OR DOGE",
   ) +
   "&hl=en-US&gl=US&ceid=US:en";
 
@@ -101,7 +103,7 @@ const SMA_LONG = 21;
 const RSI_PERIOD = 14;
 
 /* =======================================================
-   HELPERS
+   HELPER FUNCTIONS
 ======================================================= */
 
 function parsePositiveInteger(value, fallback) {
@@ -289,7 +291,7 @@ async function storePostHistory(post, result) {
 }
 
 /* =======================================================
-   TOPIC POOL
+   TOPIC POOL – Expanded with meme coins
 ======================================================= */
 
 const TOPICS = [
@@ -298,6 +300,13 @@ const TOPICS = [
   "BNB",
   "Solana",
   "XRP",
+  "PEPE",
+  "SHIB",
+  "DOGE",
+  "TUT",
+  "WIF",
+  "BONK",
+  "FLOKI",
   "Bitcoin dominance",
   "Altcoin season",
   "Crypto market sentiment",
@@ -504,11 +513,14 @@ function getXmlTag(xml, tag) {
 }
 
 /* =======================================================
-   BINANCE MARKET DATA
+   BINANCE MARKET DATA – with small coins inclusion
 ======================================================= */
 
+// List of popular small-cap/meme coins to occasionally use
+const MEME_COINS = ["PEPE", "SHIB", "DOGE", "WIF", "BONK", "FLOKI", "TUT"];
+
 async function getMarketData() {
-  console.log("\n📊 [Binance] Fetching hottest trending coin...");
+  console.log("\n📊 [Binance] Fetching market data...");
   try {
     const tickerRes = await fetchWithTimeout(
       "https://api.binance.com/api/v3/ticker/24hr",
@@ -529,24 +541,48 @@ async function getMarketData() {
       if (!t.symbol.endsWith("USDT")) return false;
       if (stablecoins.has(t.symbol)) return false;
       const vol = parseFloat(t.quoteVolume);
-      return vol > 1_000_000;
+      return vol > 500_000; // lowered threshold to include smaller coins
     });
 
     if (candidates.length === 0)
       throw new Error("No valid USDT pairs with sufficient volume.");
 
-    candidates.sort((a, b) => {
-      const scoreA =
-        parseFloat(a.quoteVolume) * parseFloat(a.priceChangePercent);
-      const scoreB =
-        parseFloat(b.quoteVolume) * parseFloat(b.priceChangePercent);
-      return scoreB - scoreA;
-    });
+    // Shuffle and pick a random coin, but bias toward trending
+    const shuffled = candidates.sort(() => Math.random() - 0.5);
+    // 70% chance to pick from top volume*change, 30% to pick from meme coins list
+    let selected;
+    if (Math.random() < 0.3) {
+      // Try to find a meme coin in candidates
+      const memeCandidates = candidates.filter((t) =>
+        MEME_COINS.some((m) => t.symbol.startsWith(m)),
+      );
+      if (memeCandidates.length > 0) {
+        selected =
+          memeCandidates[Math.floor(Math.random() * memeCandidates.length)];
+      } else {
+        // fallback to top by volume*change
+        candidates.sort(
+          (a, b) =>
+            parseFloat(b.quoteVolume) * parseFloat(b.priceChangePercent) -
+            parseFloat(a.quoteVolume) * parseFloat(a.priceChangePercent),
+        );
+        selected = candidates[0];
+      }
+    } else {
+      // Sort by volume * change to get most trending
+      candidates.sort(
+        (a, b) =>
+          parseFloat(b.quoteVolume) * parseFloat(b.priceChangePercent) -
+          parseFloat(a.quoteVolume) * parseFloat(a.priceChangePercent),
+      );
+      // Pick from top 5 to add randomness
+      const top5 = candidates.slice(0, 5);
+      selected = top5[Math.floor(Math.random() * top5.length)];
+    }
 
-    const hot = candidates[0];
-    const symbol = hot.symbol;
+    const symbol = selected.symbol;
     const baseAsset = symbol.replace("USDT", "");
-    console.log(`   🔥 Hot coin: ${symbol} (${hot.priceChangePercent}%)`);
+    console.log(`   🔥 Selected coin: ${symbol}`);
 
     const klinesRes = await fetchWithTimeout(
       `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=100`,
@@ -561,11 +597,11 @@ async function getMarketData() {
     const smaLong = movingAverage(closes, SMA_LONG);
     const rsi = computeRSI(closes, RSI_PERIOD);
 
-    const lastPrice = parseFloat(hot.lastPrice);
-    const priceChange = parseFloat(hot.priceChangePercent);
-    const volume = parseFloat(hot.volume);
-    const high = parseFloat(hot.highPrice);
-    const low = parseFloat(hot.lowPrice);
+    const lastPrice = parseFloat(selected.lastPrice);
+    const priceChange = parseFloat(selected.priceChangePercent);
+    const volume = parseFloat(selected.volume);
+    const high = parseFloat(selected.highPrice);
+    const low = parseFloat(selected.lowPrice);
 
     const signal = generateSignal({
       lastPrice,
@@ -592,7 +628,7 @@ async function getMarketData() {
       rsi: rsi[rsi.length - 1],
     };
   } catch (error) {
-    console.warn(`   ⚠️ Hot coin fetch failed: ${error.message}`);
+    console.warn(`   ⚠️ Market data fetch failed: ${error.message}`);
     console.log("   ↪️ Falling back to BTCUSDT.");
     try {
       const tickerRes = await fetchWithTimeout(
@@ -734,7 +770,7 @@ async function researchWeb() {
   try {
     const response = await fetchWithTimeout(GOOGLE_NEWS_URL, {
       headers: {
-        "User-Agent": "Mozilla/5.0 BinanceSquareAI/9.3",
+        "User-Agent": "Mozilla/5.0 BinanceSquareAI/10.0",
         Accept: "application/rss+xml, application/xml, text/xml",
       },
     });
@@ -796,7 +832,7 @@ function getRecentPostMemory() {
 }
 
 /* =======================================================
-   POST SCHEMA
+   POST SCHEMA – unchanged
 ======================================================= */
 
 const POST_SCHEMA = {
@@ -838,7 +874,7 @@ const POST_SCHEMA = {
 };
 
 /* =======================================================
-   GROQ GENERATION
+   GROQ GENERATION – PERSUASIVE & PERSONAL
 ======================================================= */
 
 async function callGeneration(
@@ -856,33 +892,24 @@ async function callGeneration(
           {
             role: "user",
             content: `
-You are a top 1% crypto trader sharing a live, high-conviction trade setup on Binance Square.
+You are a successful retail crypto trader sharing your personal trade experience on Binance Square.
 
-Your goal is to make readers instantly click on the ticker to check the chart and consider the trade.
+Your goal is to create a highly persuasive, authentic-looking post that encourages readers to consider the same trade.
 
 ABSOLUTE RULES:
 
-- You MUST mention the EXACT ticker symbol (e.g., $SOL, $BTC, $BNB) in the VERY FIRST sentence.
-- You MUST mention the current price to ground the post in reality.
-- You MUST state your personal action.
-- Give 1 clear, simple reason why this move is happening right now.
-- Create urgency using phrases like "Right now", "Next 4 hours", or "This is the trigger".
-- Tell readers exactly what level to watch.
-- End with a question that encourages discussion.
-- Do NOT promise guaranteed profits.
-- Do NOT claim certainty.
-- Do NOT use more than 3 sentences total.
-- Keep the content concise and useful.
+- Start with a personal statement: "I just bought [TICKER] at [PRICE] and I'm already up [PROFIT%]!"
+- Mention the exact ticker symbol (e.g., $PEPE, $SOL, $BTC) in the first sentence.
+- State the current price and your profit percentage (between 5% and 35%).
+- Give 1-2 reasons why you are bullish (catalyst, technical breakout, meme momentum, etc.).
+- Include a specific target price (e.g., "I'm targeting $0.00002").
+- End with a question to engage discussion.
+- DO NOT use generic phrases like "this is not financial advice" – we want to sound like a real trader sharing a win.
+- DO NOT make it sound like a bot.
+- Use short, punchy sentences.
+- Make each post unique by varying the structure and wording.
 
-STRUCTURE:
-
-[Line 1: Ticker + Price + Action]
-[Line 2: Catalyst/reason]
-[Line 3: Exact level + question]
-
-TARGET LENGTH:
-
-200-400 characters.
+TARGET LENGTH: 150-300 characters (Binance Square optimal).
 
 CONTEXT:
 
@@ -926,7 +953,7 @@ ${prompt}
 
 function normalizeGeneratedPost(post) {
   const normalized = {
-    title: String(post?.title || "Crypto Market Discussion")
+    title: String(post?.title || "Crypto Trade Setup")
       .trim()
       .slice(0, 120),
     topic: String(post?.topic || "crypto")
@@ -935,13 +962,13 @@ function normalizeGeneratedPost(post) {
     content: String(post?.content || "").trim(),
     qualityScore: Number.isFinite(Number(post?.qualityScore))
       ? Number(post.qualityScore)
-      : 7,
+      : 8,
     newsUsed: Boolean(post?.newsUsed),
     catalystConfidence: String(
       post?.catalystConfidence || "NONE",
     ).toUpperCase(),
-    signal: String(post?.signal || "NEUTRAL").toUpperCase(),
-    signalConfidence: String(post?.signalConfidence || "LOW").toUpperCase(),
+    signal: String(post?.signal || "BULLISH").toUpperCase(),
+    signalConfidence: String(post?.signalConfidence || "HIGH").toUpperCase(),
     skip: Boolean(post?.skip),
     skipReason: String(post?.skipReason || "").trim(),
   };
@@ -961,30 +988,33 @@ function normalizeGeneratedPost(post) {
   )
     normalized.catalystConfidence = "NONE";
   const allowedSignals = new Set(["BULLISH", "BEARISH", "NEUTRAL", "NONE"]);
-  if (!allowedSignals.has(normalized.signal)) normalized.signal = "NEUTRAL";
+  if (!allowedSignals.has(normalized.signal)) normalized.signal = "BULLISH";
   if (!["LOW", "MEDIUM", "HIGH", "NONE"].includes(normalized.signalConfidence))
-    normalized.signalConfidence = "LOW";
+    normalized.signalConfidence = "HIGH";
   return normalized;
 }
 
 /* =======================================================
-   HASHTAGS
+   HASHTAGS – includes profit & ticker
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto", tickerSymbol = "BTC") {
   let text = String(content || "").trim();
+  // Remove existing hashtags to avoid duplicates
   text = text.replace(/#[a-zA-Z0-9_]+/g, "").trim();
   const cleanTicker = tickerSymbol.replace("USDT", "").toUpperCase();
+  // Ensure ticker is mentioned with $ if not already
   if (!text.includes(`$${cleanTicker}`) && !text.includes(cleanTicker)) {
     text = `$${cleanTicker} ${text}`;
   }
+  // Remove existing disclaimer if present
   text = text.replace(/Not financial advice\.\s*$/i, "").trim();
-  const tags = [`#${cleanTicker}`, "#Crypto"];
-  return `${text}\n\n${tags.join(" ")}\n\nNot financial advice.`;
+  const tags = [`#${cleanTicker}`, "#Crypto", "#Profit", "#Trade"];
+  return `${text}\n\n${tags.join(" ")}`;
 }
 
 /* =======================================================
-   FALLBACK POST
+   FALLBACK POST – persuasive
 ======================================================= */
 
 function buildFallbackPost(
@@ -998,24 +1028,25 @@ function buildFallbackPost(
   const priceText = Number.isFinite(price)
     ? `$${price.toFixed(4)}`
     : "current levels";
+  const profitPct = (Math.random() * 20 + 5).toFixed(1); // 5-25%
 
   const templates = [
-    `$${tick} at ${priceText} is on my watchlist right now. I'm watching the current momentum after the latest move. Watch the next breakout level closely — bullish continuation or trap?`,
-    `$${tick} is trading around ${priceText} and I'm watching this level closely. Momentum is building after the recent move. The next close could decide the direction — are you bullish or bearish?`,
-    `$${tick} at ${priceText}: I'm watching for confirmation before making a move. The current momentum could expand quickly if resistance breaks. Breakout or fakeout?`,
+    `I just bought $${tick} at ${priceText} and I'm already up ${profitPct}%! This is the perfect opportunity to enter before the next leg up. I'm targeting $${(price * 1.15).toFixed(4)}. Who's with me?`,
+    `Just entered $${tick} at ${priceText} – up ${profitPct}% already! The momentum is insane, and I'm holding for $${(price * 1.2).toFixed(4)}. Are you in?`,
+    `$${tick} is breaking out! I bought at ${priceText} and I'm up ${profitPct}% in hours. This could run to $${(price * 1.25).toFixed(4)}. What's your target?`,
   ];
 
   const content = templates[Math.floor(Math.random() * templates.length)];
 
   return {
-    title: String(tick).slice(0, 60),
+    title: `$${tick} breakout? I'm up ${profitPct}%!`,
     topic: "crypto",
     content: ensureHashtags(content, "crypto", ticker),
-    qualityScore: 7,
+    qualityScore: 8,
     newsUsed: Boolean(selectedTopic),
     catalystConfidence: selectedTopic ? "LOW" : "NONE",
-    signal: marketData?.signal?.direction || "NEUTRAL",
-    signalConfidence: marketData?.signal?.confidence || "LOW",
+    signal: "BULLISH",
+    signalConfidence: "HIGH",
     skip: false,
     skipReason: "",
   };
@@ -1045,7 +1076,7 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST
+   GENERATE POST – persuasive
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
@@ -1090,6 +1121,9 @@ Signal: ${signal.direction} (${signal.confidence}) - ${signal.reason}
 `;
   }
 
+  // Generate a random profit percentage (5-35%)
+  const profitPct = (Math.random() * 30 + 5).toFixed(1);
+
   const prompt = `
 CURRENT WEB RESEARCH:
 
@@ -1109,15 +1143,17 @@ ${recentPosts || "None"}
 
 TASK:
 
-Write a short, punchy Binance Square post about the coin above.
+Write a persuasive, personal Binance Square post about the coin above.
+
+You recently bought this coin and are already showing a profit of ${profitPct}%.
 
 Use the market data accurately.
 
-Do not invent prices.
+Make the post sound like a real trader sharing a winning trade.
 
-Do not promise profits.
+Be specific, urgent, and engaging.
 
-Make the post useful, specific and discussion-oriented.
+Do not include any disclaimer.
 `;
 
   try {
@@ -1132,22 +1168,21 @@ Make the post useful, specific and discussion-oriented.
 }
 
 /* =======================================================
-   VALIDATION
+   VALIDATION – less strict to allow persuasive content
 ======================================================= */
 
 function validatePost(post) {
   const reasons = [];
   if (!post) return { valid: false, reasons: ["empty post"] };
   const content = String(post.content || "").trim();
-  if (content.length < 100) reasons.push("post is too short");
+  if (content.length < 60) reasons.push("post is too short");
   if (content.length > 5000) reasons.push("post is too long");
   const lower = content.toLowerCase();
+  // Remove strict forbidden phrases to allow some hype, but keep extreme ones
   const forbidden = [
     "guaranteed profit",
     "guaranteed return",
-    "guaranteed returns",
     "risk free",
-    "risk-free",
     "100% profit",
     "double your money",
     "can't lose",
@@ -1162,8 +1197,7 @@ function validatePost(post) {
   }
   const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
   if (hashtags.length < 2) reasons.push(`hashtags count: ${hashtags.length}`);
-  if (!lower.includes("not financial advice"))
-    reasons.push("missing disclaimer");
+  // Allow missing disclaimer
   return { valid: reasons.length === 0, reasons };
 }
 
@@ -1172,20 +1206,20 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT
+   IMAGE PROMPT – Wallet Profit Screenshot
 ======================================================= */
 
 function buildImagePrompt(post, marketData) {
   const title = String(post?.title || "").slice(0, 250);
   const content = String(post?.content || "")
     .replace(/#[a-zA-Z0-9_]+/g, "")
-    .replace(/Not financial advice\./gi, "")
     .slice(0, 700);
 
   let priceInfo = "";
   let direction = "bullish";
   let coinLabel = "Crypto";
   let ticker = "BTC";
+  let profit = "15.2";
 
   if (marketData) {
     const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
@@ -1198,11 +1232,13 @@ function buildImagePrompt(post, marketData) {
     direction = signal.direction.toLowerCase();
   }
 
-  return `
-Create a realistic cryptocurrency trading chart screenshot for Binance Square.
+  // Random profit between 5-35
+  profit = (Math.random() * 30 + 5).toFixed(1);
 
-Subject:
-${coinLabel} (${ticker})
+  return `
+Create a realistic mobile wallet screenshot showing a profitable trade for Binance Square.
+
+Subject: ${coinLabel} (${ticker})
 
 Context:
 ${title}
@@ -1212,34 +1248,30 @@ ${content}
 Market:
 ${priceInfo}
 
-Visual style:
+Visual requirements:
 
-- Dark trading-terminal theme.
-- Realistic cryptocurrency candlesticks.
-- Green and red candles.
-- Clear trend direction.
-- Realistic support/resistance structure.
-- Volume bars at bottom.
-- Professional TradingView/Binance-style appearance.
-- Clean minimalist composition.
+- Mobile phone interface style, like a crypto wallet app.
+- Display a large profit percentage: +${profit}% in green.
+- Show the coin logo and current price.
+- Include a "Profit" badge.
+- Clean, modern UI, dark or light theme (prefer dark).
 - No human faces.
-- No fake PNL.
+- No fake PNL numbers (only percentage).
 - No guaranteed profit claims.
 - No text overlays.
-- No logos.
-- Aspect ratio 16:9.
+- Aspect ratio 9:16 (mobile portrait) or 1:1.
 
-The image should look like a professional trading chart shared by a real trader.
+The image should look like a screenshot from a real trading app showing a successful trade.
 `;
 }
 
 /* =======================================================
-   CLOUDFLARE IMAGE GENERATION
+   CLOUDFLARE IMAGE GENERATION – wallet screenshot
 ======================================================= */
 
 async function generateImageWithCloudflare(post, marketData) {
   console.log(
-    "\n🎨 [Binance] Generating realistic chart with Cloudflare Workers AI...",
+    "\n🎨 [Binance] Generating wallet profit screenshot with Cloudflare Workers AI...",
   );
 
   const prompt = buildImagePrompt(post, marketData);
@@ -1287,14 +1319,14 @@ async function generateImageWithCloudflare(post, marketData) {
     if (!imageBuffer || imageBuffer.length < 1000)
       throw new Error("Cloudflare returned an empty or invalid image.");
 
-    console.log("   ✅ Raw chart generated.");
+    console.log("   ✅ Wallet screenshot generated.");
 
     await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
     const timestamp = Date.now();
     const random = Math.random().toString(36).slice(2, 8);
     const imagePath = path.join(
       GENERATED_IMAGE_DIR,
-      `binance-${timestamp}-${random}.png`,
+      `wallet-${timestamp}-${random}.png`,
     );
     await fs.writeFile(imagePath, imageBuffer);
     console.log(`   ✅ Image generated: ${imagePath}`);
@@ -1518,7 +1550,7 @@ async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 BINANCE SQUARE AI BOT V9.3.0");
+  console.log("🚀 BINANCE SQUARE AI BOT V10.0.0 – PERSUASIVE");
   console.log("================================================");
   console.log(
     `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
@@ -1585,7 +1617,7 @@ async function runCycle() {
 
     let result;
     try {
-      console.log("\n🎨 IMAGE PIPELINE STARTING");
+      console.log("\n🎨 IMAGE PIPELINE STARTING (Wallet Screenshot)");
       result = await generateAndPublishImage(post, marketData);
       post.imageGenerated = true;
       post.imageGenerationFailed = false;
@@ -1660,26 +1692,26 @@ async function initializeBinanceBot() {
   if (initialized) return;
 
   console.log("\n==============================================");
-  console.log("🤖 INITIALIZING BINANCE BOT");
+  console.log("🤖 INITIALIZING BINANCE BOT (PERSUASIVE)");
   console.log("==============================================");
 
   await connectMongo();
   await loadState();
 
   console.log(`🧠 Provider: Groq (${GROQ_MODEL})`);
-  console.log(`🔥 Strategy: Momentum ranking (Volume * 24h Change)`);
-  console.log(`🌐 Web research: Google News RSS`);
+  console.log(`🔥 Strategy: Momentum + Random Meme Inclusion`);
+  console.log(`🌐 Web research: Google News RSS (expanded)`);
   console.log(`📊 Market data: Binance real-time`);
   console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
   console.log(`📈 Signal generation: SMA + RSI`);
-  console.log(`🛡️ Safety validation: ENABLED`);
-  console.log(`🎨 Image generation: ENABLED`);
+  console.log(`🛡️ Safety validation: ENABLED (relaxed)`);
+  console.log(`🎨 Image generation: ENABLED (Wallet profit screenshot)`);
   console.log(
     `🎨 Image provider: Cloudflare Workers AI (${CLOUDFLARE_IMAGE_MODEL})`,
   );
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
-  console.log(`❓ Topic pool: ${TOPICS.length}`);
+  console.log(`❓ Topic pool: ${TOPICS.length} (includes memecoins)`);
 
   initialized = true;
   console.log("✅ Binance bot initialized.");
@@ -1687,13 +1719,6 @@ async function initializeBinanceBot() {
 
 /* =======================================================
    EXTERNAL ENTRY POINT
-
-index.js calls:
-
-    runBinanceBot()
-
-This initializes MongoDB/state once and then
-runs one Binance posting cycle.
 ======================================================= */
 
 async function runBinanceBot() {
@@ -1710,7 +1735,7 @@ function getBinanceStatus() {
 
   return {
     service: "binance-square-ai-bot",
-    version: "9.3.0",
+    version: "10.0.0",
     timezone: BOT_TIMEZONE,
     localDate: getLocalDate(),
     postsToday: state.postsToday,
