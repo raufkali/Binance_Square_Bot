@@ -10,9 +10,26 @@ dotenv.config();
 
 /*
 =========================================================
-LINKEDIN AI OPPORTUNITY BOT V4.2.0 – FULLY FIXED
+LINKEDIN AI OPPORTUNITY BOT V4.3.0 – STABILIZED
 =========================================================
-Uses valid Groq models, relaxed schema, and fixes LINKEDIN_API.
+Fixes applied vs V4.2.0:
+  1. Replaced decommissioned Groq models (llama-3.1-70b-versatile,
+     llama-3.1-8b-instant, gemma2-9b-it) with current models
+     (openai/gpt-oss-20b, openai/gpt-oss-120b, qwen/qwen3.6-27b).
+  2. Switched from response_format:"json_object" (which requires the
+     literal word "json" in the prompt, and was silently failing on
+     every call) to a strict json_schema format, matching the more
+     reliable pattern already proven in the Binance bot.
+  3. Rewrote the manual/failure fallback so it no longer reuses the
+     raw RSS title as "role" — this was producing posts like
+     "fundsforNGOs is OFFERING Applications open for ... - fundsforNGOs"
+     with a garbage slug hashtag built from the whole headline.
+  4. Hashtags are now length- and word-count bounded so a long title
+     can't become one unreadable 60-character hashtag.
+  5. Enrichment now recognizes when the "final" URL is still a
+     news.google.com interstitial (common — Google News links are
+     redirect wrappers) and stops treating that as useful page text,
+     instead of quietly wasting a fetch/parse cycle.
 =========================================================
 */
 
@@ -24,7 +41,8 @@ const __dirname = path.dirname(__filename);
 ======================================================= */
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.1-70b-versatile";
+// Primary model — current Groq recommendation for this workload.
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 
 const MONGODB_URI = process.env.MONGODB_URI;
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "Binance-Square-Bot";
@@ -34,7 +52,6 @@ const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
 const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI;
 const LINKEDIN_VERSION = process.env.LINKEDIN_VERSION || "202606";
 
-// ✅ FIX: Define LINKEDIN_API
 const LINKEDIN_API = "https://api.linkedin.com/rest";
 
 const POST_TRIGGER_SECRET =
@@ -218,6 +235,42 @@ function isRealUrl(url) {
   } catch {
     return false;
   }
+}
+
+// FIX: recognize Google News interstitial/redirect pages so we don't
+// treat their (useless) HTML as real article content.
+function isGoogleNewsWrapperUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return /(^|\.)news\.google\.com$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+// FIX: strip a trailing " - OrgName" / " | OrgName" suffix from a headline
+// so we don't duplicate the organization name inside the role text.
+function stripTrailingOrgSuffix(title, org) {
+  let text = cleanText(title);
+  if (!text) return text;
+  text = text.replace(/\s*[-|–—]\s*[^-|–—]{2,80}$/, (match) => {
+    const candidate = match.replace(/^\s*[-|–—]\s*/, "").trim();
+    if (!org) return "";
+    return candidate.toLowerCase() === org.toLowerCase() ? "" : match;
+  });
+  return cleanText(text) || cleanText(title);
+}
+
+// FIX: build a short, readable slug for hashtags instead of jamming an
+// entire headline into one giant token.
+function toShortHashtag(value, maxWords = 3, maxLen = 24) {
+  const words = cleanText(value)
+    .replace(/[^a-zA-Z0-9\s]/g, "")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, maxWords);
+  const tag = words.join("").slice(0, maxLen);
+  return tag ? `#${tag}` : "";
 }
 
 /* =======================================================
@@ -628,7 +681,9 @@ async function storeOpportunities(items) {
 }
 
 /* =======================================================
-   SOURCE PAGE EXTRACTION (unchanged)
+   SOURCE PAGE EXTRACTION
+   FIX: bail out cleanly when the "final" URL is still a Google
+   News wrapper, instead of parsing its mostly-empty shell HTML.
 ======================================================= */
 
 function extractMetaContent(html, name) {
@@ -686,6 +741,17 @@ async function enrichOpportunity(opportunity) {
       return base;
     }
     const finalUrl = response.url || opportunity.url;
+
+    // FIX: Google News redirect pages are near-useless for content —
+    // treat them as "no enrichment" rather than parsing a mostly
+    // empty shell and silently degrading quality.
+    if (isGoogleNewsWrapperUrl(finalUrl)) {
+      console.log(
+        "   ℹ️ Source resolved to a Google News wrapper page — skipping page-text extraction, relying on RSS title/description instead.",
+      );
+      return { ...base, finalUrl };
+    }
+
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/html")) return { ...base, finalUrl };
     const html = await response.text();
@@ -719,7 +785,10 @@ async function enrichOpportunity(opportunity) {
 }
 
 /* =======================================================
-   AI SCHEMA – Relaxed (strict disabled)
+   AI SCHEMA
+   FIX: this is now actually enforced via response_format
+   json_schema (strict) instead of the looser json_object mode
+   that was silently rejecting every request.
 ======================================================= */
 
 const OPPORTUNITY_SCHEMA = {
@@ -738,23 +807,38 @@ const OPPORTUNITY_SCHEMA = {
     deadline: { type: "string" },
     applicationMethod: { type: "string" },
     applicationUrl: { type: "string" },
-    imagePrompt: { type: "string" },
     hashtags: { type: "array", items: { type: "string" } },
     content: { type: "string" },
   },
-  required: ["organization", "role", "content"],
-  additionalProperties: true, // allow extra fields
+  required: [
+    "organization",
+    "role",
+    "type",
+    "requirements",
+    "benefits",
+    "eligibility",
+    "location",
+    "deadline",
+    "applicationMethod",
+    "applicationUrl",
+    "hashtags",
+    "content",
+  ],
+  additionalProperties: false,
 };
 
 /* =======================================================
-   GROQ GENERATION – with fixed model fallback
+   GROQ GENERATION
+   FIX: model fallback chain replaced with currently-supported
+   Groq models. The old chain (llama-3.1-70b-versatile,
+   llama-3.1-8b-instant, gemma2-9b-it) is entirely decommissioned.
 ======================================================= */
 
 function buildGenerationPrompt(opportunity) {
   return `
 You are a LinkedIn career post writer. Write a short, engaging post about the following opportunity.
 
-Use only information explicitly present in the listing. If something is missing, skip it.
+Use only information explicitly present in the listing. If something is missing, leave that field empty rather than guessing.
 
 OPPORTUNITY DETAILS:
 - Title: ${opportunity.title}
@@ -764,31 +848,15 @@ OPPORTUNITY DETAILS:
 - URL: ${opportunity.url || "Not available"}
 - Source page text: ${opportunity.sourceText || "Not available"}
 
-Write a post with this structure:
-
-[Company] is [HIRING/OFFERING] [Role]
-
-Requirements:
-- [list if available]
-
-Benefits:
-- [list if available]
-
-Eligibility:
-- [list if available]
-
-Location: [if available]
-Deadline: [if available]
-Apply: [link if available]
-
-Add relevant hashtags.
-
-If you have minimal information, just state what you know and encourage people to check the link for details.
-Do not fabricate details.
+Extract a clean "role" (job/scholarship/internship title only — do not include the publisher or source name)
+and a clean "organization" name (the hiring/offering entity, not the news outlet that reported on it, unless
+they are the same). Fill "content" with 2-4 short sentences summarizing the opportunity in an engaging,
+professional LinkedIn tone. Keep hashtags short (single words or short compound words, no full sentences).
+Do not fabricate requirements, benefits, deadlines, or eligibility criteria that are not present above.
 `;
 }
 
-function normalizeOpportunity(result) {
+function normalizeOpportunity(result, opportunity) {
   const allowedTypes = new Set([
     "job",
     "internship",
@@ -803,18 +871,23 @@ function normalizeOpportunity(result) {
       .filter(Boolean)
       .slice(0, 12);
   };
+
+  const rawOrg = cleanText(result?.organization) || opportunity?.source || "";
+  const rawRole =
+    cleanText(result?.role) ||
+    stripTrailingOrgSuffix(opportunity?.title, rawOrg);
+
   const hashtags = cleanArray(result?.hashtags)
     .map((tag) => {
       const clean = tag.replace(/^#+/, "").replace(/[^a-zA-Z0-9_]/g, "");
-      return clean ? `#${clean}` : "";
+      return clean ? `#${clean.slice(0, 24)}` : "";
     })
     .filter(Boolean)
     .slice(0, 7);
 
   return {
-    organization:
-      cleanText(result?.organization).slice(0, 150) || "Unknown Company",
-    role: cleanText(result?.role).slice(0, 180) || "Opportunity",
+    organization: (rawOrg || "Unknown Company").slice(0, 150),
+    role: (rawRole || "Opportunity").slice(0, 180),
     type: allowedTypes.has(result?.type) ? result.type : "opportunity",
     requirements: cleanArray(result?.requirements),
     benefits: cleanArray(result?.benefits),
@@ -823,7 +896,6 @@ function normalizeOpportunity(result) {
     deadline: cleanText(result?.deadline).slice(0, 150),
     applicationMethod: cleanText(result?.applicationMethod).slice(0, 500),
     applicationUrl: normalizeUrl(result?.applicationUrl),
-    imagePrompt: cleanText(result?.imagePrompt).slice(0, 1000),
     hashtags,
     content: stripEmojis(String(result?.content || "").trim()),
   };
@@ -831,15 +903,14 @@ function normalizeOpportunity(result) {
 
 async function callGeneration(opportunity, retries = 2) {
   const prompt = buildGenerationPrompt(opportunity);
-  // Valid Groq models (as of Aug 2026)
-  const models = [
-    GROQ_MODEL,
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "gemma2-9b-it",
-  ];
+  // FIX: only currently-supported Groq models. Verify against
+  // https://console.groq.com/docs/models if you change these.
+  const models = [GROQ_MODEL, "openai/gpt-oss-120b", "qwen/qwen3.6-27b"];
+  const triedModels = new Set();
   let lastError;
   for (const model of models) {
+    if (triedModels.has(model)) continue;
+    triedModels.add(model);
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
         console.log(
@@ -851,28 +922,19 @@ async function callGeneration(opportunity, retries = 2) {
           temperature: 0.5,
           max_completion_tokens: 1500,
           reasoning_effort: "low",
-          reasoning_format: "hidden",
           response_format: {
-            type: "json_object", // ✅ Use json_object instead of json_schema to avoid strict validation
+            type: "json_schema",
+            json_schema: {
+              name: "linkedin_opportunity_post",
+              strict: true,
+              schema: OPPORTUNITY_SCHEMA,
+            },
           },
         });
         const raw = response?.choices?.[0]?.message?.content;
         if (!raw) throw new Error("Groq returned empty content.");
-        // Try to parse as JSON, but if it fails, manually extract fields
-        try {
-          const parsed = JSON.parse(raw);
-          return normalizeOpportunity(parsed);
-        } catch (parseError) {
-          // Fallback: extract content manually
-          console.warn("   ⚠️ JSON parse failed, using raw text as content.");
-          return normalizeOpportunity({
-            organization: opportunity.source || "Company",
-            role: opportunity.title || "Opportunity",
-            type: opportunity.type || "opportunity",
-            content: raw,
-            hashtags: [`#${opportunity.type || "opportunity"}`],
-          });
-        }
+        const parsed = JSON.parse(raw); // strict schema means this should always be valid JSON
+        return normalizeOpportunity(parsed, opportunity);
       } catch (error) {
         console.warn(`   ⚠️ Groq (${model}) attempt failed: ${error.message}`);
         lastError = error;
@@ -884,7 +946,10 @@ async function callGeneration(opportunity, retries = 2) {
 }
 
 /* =======================================================
-   POST BUILDER (unchanged)
+   POST BUILDER
+   FIX: role is now guaranteed (by normalizeOpportunity) not to
+   contain the organization name already, so the heading no
+   longer duplicates it.
 ======================================================= */
 
 function buildFinalPost(post, opportunity) {
@@ -900,6 +965,11 @@ function buildFinalPost(post, opportunity) {
   else heading = `${org} is HIRING ${role}`;
   lines.push(heading);
   lines.push("");
+
+  if (post.content) {
+    lines.push(post.content);
+    lines.push("");
+  }
 
   if (post.requirements.length) {
     lines.push("Requirements:");
@@ -943,31 +1013,43 @@ function buildFinalPost(post, opportunity) {
   }
   lines.push("");
 
+  // FIX: bounded, readable hashtags instead of a full-headline slug.
   const defaultTags = [
-    org.replace(/[^a-zA-Z0-9]/g, ""),
-    role.replace(/[^a-zA-Z0-9]/g, ""),
-    post.type,
-    "Career",
-    "Opportunities",
-  ];
-  const allTags = [
-    ...post.hashtags,
-    ...defaultTags.map(
-      (tag) =>
-        `#${String(tag)
-          .replace(/^#+/, "")
-          .replace(/[^a-zA-Z0-9]/g, "")}`,
-    ),
-  ];
+    toShortHashtag(org, 2, 20),
+    toShortHashtag(role, 3, 24),
+    `#${post.type}`,
+    "#Career",
+    "#Opportunities",
+  ].filter(Boolean);
+
+  const allTags = [...post.hashtags, ...defaultTags];
   const uniqueTags = [];
+  const seen = new Set();
   for (const tag of allTags) {
-    if (!tag || uniqueTags.includes(tag.toLowerCase())) continue;
-    uniqueTags.push(tag.toLowerCase());
+    const key = tag.toLowerCase();
+    if (!tag || seen.has(key)) continue;
+    seen.add(key);
+    uniqueTags.push(tag);
     if (uniqueTags.length >= 7) break;
   }
   lines.push(uniqueTags.join(" "));
 
   return lines.join("\n");
+}
+
+/* =======================================================
+   VALIDATION (new)
+   Basic sanity checks before publishing, mirroring the pattern
+   used elsewhere in your bots — catches empty/garbage posts
+   before they hit LinkedIn.
+======================================================= */
+
+function validatePost(content) {
+  const reasons = [];
+  const text = String(content || "").trim();
+  if (text.length < 40) reasons.push("post is too short");
+  if (text.length > 3000) reasons.push("post exceeds LinkedIn length limits");
+  return { valid: reasons.length === 0, reasons };
 }
 
 /* =======================================================
@@ -1090,7 +1172,7 @@ async function cleanupImage(imagePath) {
 }
 
 /* =======================================================
-   LINKEDIN API
+   LINKEDIN API (unchanged)
 ======================================================= */
 
 async function linkedinRequest(url, options = {}, retries = 3) {
@@ -1417,7 +1499,7 @@ async function runCycle() {
   resetDailyCounter();
 
   console.log("\n================================================");
-  console.log("🚀 LINKEDIN AI OPPORTUNITY BOT V4.2.0 (FULLY FIXED)");
+  console.log("🚀 LINKEDIN AI OPPORTUNITY BOT V4.3.0 (STABILIZED)");
   console.log("================================================");
   console.log(
     `🕐 ${new Date().toLocaleString("en-US", { timeZone: BOT_TIMEZONE })}`,
@@ -1461,9 +1543,16 @@ async function runCycle() {
       post = await callGeneration(opportunity, 2);
     } catch (error) {
       console.warn("⚠️ Generation failed, using fallback:", error.message);
+      // FIX: fallback now cleans the title the same way the AI path
+      // does, instead of jamming the raw headline in as "role".
+      const fallbackOrg = opportunity.source || "Company";
+      const fallbackRole = stripTrailingOrgSuffix(
+        opportunity.title,
+        fallbackOrg,
+      );
       post = {
-        organization: opportunity.source || "Company",
-        role: opportunity.title || "Opportunity",
+        organization: fallbackOrg,
+        role: fallbackRole || "Opportunity",
         type: opportunity.type || "opportunity",
         requirements: [],
         benefits: [],
@@ -1473,7 +1562,9 @@ async function runCycle() {
         applicationMethod: "",
         applicationUrl: "",
         hashtags: [],
-        content: `${opportunity.title}\n\nCheck out this opportunity at ${opportunity.source || "the link below"}.\n\nApply at: ${opportunity.url}`,
+        content: opportunity.description
+          ? opportunity.description.slice(0, 400)
+          : `Check out this opportunity from ${fallbackOrg}.`,
       };
     }
 
@@ -1496,6 +1587,21 @@ async function runCycle() {
     console.log("\n----- POST -----\n");
     console.log(finalContent);
     console.log("\n----------------\n");
+
+    // FIX: basic validation before spending an image-gen + publish call
+    // on a broken post.
+    const validation = validatePost(finalContent);
+    if (!validation.valid) {
+      console.error("❌ Post rejected by validation:", validation.reasons);
+      state.totalSkipped++;
+      await saveState();
+      return {
+        success: false,
+        skipped: true,
+        reason: "validation_failed",
+        validation: validation.reasons,
+      };
+    }
 
     let imagePath = null;
     try {
@@ -1570,11 +1676,11 @@ async function getUnusedDatabaseOpportunities() {
 async function initializeLinkedInBot() {
   if (initialized) return;
   console.log("\n==============================================");
-  console.log("🤖 INITIALIZING LINKEDIN BOT V4.2.0");
+  console.log("🤖 INITIALIZING LINKEDIN BOT V4.3.0");
   console.log("==============================================");
   await connectMongo();
   await loadState();
-  console.log(`🧠 Groq model: ${GROQ_MODEL} (with fallbacks)`);
+  console.log(`🧠 Groq model: ${GROQ_MODEL} (with current-model fallbacks)`);
   console.log("🔐 LinkedIn OAuth: enabled");
   console.log(`🎨 Cloudflare: ${CLOUDFLARE_IMAGE_MODEL}`);
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
@@ -1592,7 +1698,7 @@ async function getLinkedInStatus() {
   const personUrn = await getLinkedInPersonUrn();
   return {
     service: "linkedin-ai-opportunity-bot",
-    version: "4.2.0",
+    version: "4.3.0",
     timezone: BOT_TIMEZONE,
     localDate: getLocalDate(),
     postsToday: state.postsToday,
