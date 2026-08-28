@@ -1,40 +1,40 @@
-name: LinkedIn Opportunity Scheduler
+# name: LinkedIn Opportunity Scheduler
 
-on:
-  # Runs every 6 hours
-  schedule:
-    - cron: "0 */6 * * *"
+# on:
+#   # Runs every 6 hours
+#   schedule:
+#     - cron: "0 */6 * * *"
 
-  # Allows manual testing
-  workflow_dispatch:
+#   # Allows manual testing
+#   workflow_dispatch:
 
-concurrency:
-  group: linkedin-opportunity-scheduler
-  cancel-in-progress: false
+# concurrency:
+#   group: linkedin-opportunity-scheduler
+#   cancel-in-progress: false
 
-jobs:
-  trigger-linkedin:
-    runs-on: ubuntu-latest
+# jobs:
+#   trigger-linkedin:
+#     runs-on: ubuntu-latest
 
-    steps:
-      # =====================================================
-      # Trigger LinkedIn Opportunity Bot
-      # =====================================================
-      - name: Trigger LinkedIn Bot
-        shell: bash
-        run: |
-          echo "🚀 Triggering LinkedIn Opportunity Bot..."
+#     steps:
+#       # =====================================================
+#       # Trigger LinkedIn Opportunity Bot
+#       # =====================================================
+#       - name: Trigger LinkedIn Bot
+#         shell: bash
+#         run: |
+#           echo "🚀 Triggering LinkedIn Opportunity Bot..."
 
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.LINKEDIN_POST_TRIGGER_SECRET }}" \
-            -H "Content-Type: application/json" \
-            --data '{}' \
-            --fail \
-            --show-error \
-            --silent \
-            --output response.json \
-            "https://binance-square-bot-loi6.onrender.com/linkedin/post"
+#           curl -X POST \
+#             -H "Authorization: Bearer ${{ secrets.LINKEDIN_POST_TRIGGER_SECRET }}" \
+#             -H "Content-Type: application/json" \
+#             --data '{}' \
+#             --fail \
+#             --show-error \
+#             --silent \
+#             --output response.json \
+#             "https://binance-square-bot-loi6.onrender.com/linkedin/post"
 
-          echo ""
-          echo "📡 LinkedIn response:"
-          cat response.json
+#           echo ""
+#           echo "📡 LinkedIn response:"
+#           cat response.json
