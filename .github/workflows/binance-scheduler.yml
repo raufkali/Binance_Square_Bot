@@ -1,11 +1,12 @@
 name: Binance Square Scheduler
 
 on:
-  # Runs every 4 hours
+  # Run every 6 hours at:
+  # 00:00, 06:00, 12:00, 18:00 UTC
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 */6 * * *"
 
-  # Allows manual testing
+  # Allow manual testing from GitHub Actions
   workflow_dispatch:
 
 concurrency:
@@ -17,24 +18,48 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # =====================================================
-      # Trigger Binance Square Bot
-      # =====================================================
       - name: Trigger Binance Square Bot
         shell: bash
+        env:
+          POST_TRIGGER_SECRET: ${{ secrets.POST_TRIGGER_SECRET }}
         run: |
-          echo "🚀 Triggering Binance Square Bot..."
+          set -e
 
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.POST_TRIGGER_SECRET }}" \
-            -H "Content-Type: application/json" \
+          echo "========================================="
+          echo "🚀 Triggering Binance Square Bot"
+          echo "========================================="
+          echo "🕐 Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          if [ -z "$POST_TRIGGER_SECRET" ]; then
+            echo "❌ POST_TRIGGER_SECRET is not configured!"
+            exit 1
+          fi
+
+          echo "📡 Sending request to Render..."
+
+          HTTP_CODE=$(curl \
+            --request POST \
+            --header "Authorization: Bearer $POST_TRIGGER_SECRET" \
+            --header "Content-Type: application/json" \
             --data '{}' \
-            --fail \
-            --show-error \
+            --fail-with-body \
             --silent \
+            --show-error \
             --output response.json \
-            "https://binance-square-bot-loi6.onrender.com/post"
+            --write-out "%{http_code}" \
+            "https://binance-square-bot-loi6.onrender.com/post")
 
           echo ""
-          echo "📡 Binance response:"
+          echo "📡 HTTP Status: $HTTP_CODE"
+          echo "📄 Binance response:"
           cat response.json
+
+          echo ""
+          echo "========================================="
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ Binance Square Bot triggered successfully!"
+          else
+            echo "❌ Binance Square Bot returned HTTP $HTTP_CODE"
+            exit 1
+          fi
