@@ -11,24 +11,7 @@ dotenv.config();
 /*
 =========================================================
 BINANCE SQUARE AI BOT V10.0.0 – PERSUASIVE EDITION
-MODULE EDITION – LOW‑CAP FOCUS
-=========================================================
-
-This version is tailored to promote low‑price, high‑potential coins
-from a curated list. Posts are persuasive, include clear predictions
-(go long/short/hold), and come with clean 1:1 images.
-
-index.js calls:
-
-    POST /post
-        ↓
-    runBinanceBot()
-        ↓
-    safeRunCycle()
-        ↓
-    runCycle()
-        ↓
-    Binance Square
+MODULE EDITION – LOW‑CAP FOCUS (FIXED)
 =========================================================
 */
 
@@ -102,7 +85,7 @@ const SMA_LONG = 21;
 const RSI_PERIOD = 14;
 
 /* =======================================================
-   LOW-PRICE COIN LIST (from your file)
+   LOW-PRICE COIN LIST (100 coins)
 ======================================================= */
 
 const LOW_PRICE_COINS = [
@@ -258,12 +241,10 @@ let mongoClient = null;
 let db = null;
 let trendingTopicsCollection = null;
 let postHistoryCollection = null;
-
 let initialized = false;
 
 async function connectMongo() {
   if (mongoClient) return;
-
   mongoClient = new MongoClient(MONGODB_URI, { maxPoolSize: 5 });
   await mongoClient.connect();
   db = mongoClient.db(MONGODB_DB_NAME);
@@ -292,7 +273,7 @@ async function disconnectMongo() {
 }
 
 /* =======================================================
-   TRENDING TOPICS
+   TRENDING TOPICS (unchanged)
 ======================================================= */
 
 function fingerprintTopic(title) {
@@ -306,7 +287,6 @@ function fingerprintTopic(title) {
 async function storeTrendingTopics(newsItems) {
   if (!Array.isArray(newsItems) || newsItems.length === 0) return;
   if (!trendingTopicsCollection) return;
-
   const operations = newsItems.map((item) => ({
     updateOne: {
       filter: { fingerprint: fingerprintTopic(item.title) },
@@ -339,7 +319,6 @@ async function storeTrendingTopics(newsItems) {
 
 async function pullTrendingTopic() {
   if (!trendingTopicsCollection) return null;
-
   const cutoff = new Date(
     Date.now() - TRENDING_TOPIC_MAX_AGE_HOURS * 60 * 60 * 1000,
   );
@@ -358,7 +337,6 @@ async function pullTrendingTopic() {
 
 async function pruneStaleTopics() {
   if (!trendingTopicsCollection) return;
-
   const cutoff = new Date(
     Date.now() - TRENDING_TOPIC_MAX_AGE_HOURS * 4 * 60 * 60 * 1000,
   );
@@ -371,7 +349,6 @@ async function pruneStaleTopics() {
 
 async function storePostHistory(post, result) {
   if (!postHistoryCollection) return;
-
   try {
     await postHistoryCollection.insertOne({
       id: result?.id || null,
@@ -394,14 +371,7 @@ async function storePostHistory(post, result) {
 }
 
 /* =======================================================
-   TOPIC POOL – Now uses the LOW_PRICE_COINS list
-======================================================= */
-
-// We no longer need the old TOPICS array; we'll use LOW_PRICE_COINS
-// in the generation prompt directly.
-
-/* =======================================================
-   STATE
+   STATE (unchanged)
 ======================================================= */
 
 const STATE_FILE = path.join(__dirname, "bot-state.json");
@@ -486,7 +456,6 @@ async function loadState() {
   } catch {
     console.warn("⚠️ [Binance] Primary state unavailable.");
   }
-
   if (!loaded) {
     try {
       const raw = await fs.readFile(STATE_BACKUP_FILE, "utf8");
@@ -500,7 +469,6 @@ async function loadState() {
       console.log("ℹ️ [Binance] No usable state file found.");
     }
   }
-
   normalizeState();
   resetDailyCounter();
   if (!loaded) {
@@ -510,7 +478,7 @@ async function loadState() {
 }
 
 /* =======================================================
-   FETCH WITH TIMEOUT
+   FETCH WITH TIMEOUT (unchanged)
 ======================================================= */
 
 async function fetchWithTimeout(
@@ -528,7 +496,7 @@ async function fetchWithTimeout(
 }
 
 /* =======================================================
-   XML HELPERS
+   XML HELPERS (unchanged)
 ======================================================= */
 
 function decodeXml(value) {
@@ -559,7 +527,7 @@ function getXmlTag(xml, tag) {
 }
 
 /* =======================================================
-   BINANCE MARKET DATA – prioritises low‑price coins
+   BINANCE MARKET DATA (prioritises low‑price coins)
 ======================================================= */
 
 async function getMarketData() {
@@ -590,7 +558,6 @@ async function getMarketData() {
     if (candidates.length === 0)
       throw new Error("No valid USDT pairs with sufficient volume.");
 
-    // ----- MODIFICATION: prioritise our low‑price coins (80% chance) -----
     const lowPriceSymbols = new Set(LOW_PRICE_COINS.map((c) => c + "USDT"));
     const lowCandidates = candidates.filter((t) =>
       lowPriceSymbols.has(t.symbol),
@@ -598,11 +565,9 @@ async function getMarketData() {
 
     let selected;
     if (Math.random() < 0.8 && lowCandidates.length > 0) {
-      // 80% chance to pick from the low-price list
       selected =
         lowCandidates[Math.floor(Math.random() * lowCandidates.length)];
     } else {
-      // fallback: choose from all candidates (or low if available) using volume*change
       const pool = lowCandidates.length > 0 ? lowCandidates : candidates;
       pool.sort(
         (a, b) =>
@@ -612,7 +577,6 @@ async function getMarketData() {
       const top5 = pool.slice(0, 5);
       selected = top5[Math.floor(Math.random() * top5.length)];
     }
-    // ----------------------------------------------------------------
 
     const symbol = selected.symbol;
     const baseAsset = symbol.replace("USDT", "");
@@ -841,7 +805,6 @@ async function researchWeb() {
   return { news, marketData };
 }
 
-// Helper to pick a random coin from LOW_PRICE_COINS (fallback topic)
 function getRandomCoin() {
   return LOW_PRICE_COINS[Math.floor(Math.random() * LOW_PRICE_COINS.length)];
 }
@@ -910,7 +873,7 @@ const POST_SCHEMA = {
 };
 
 /* =======================================================
-   GROQ GENERATION – PERSUASIVE, FOMO, PREDICTIONS
+   GROQ GENERATION – PERSUASIVE, FOMO, PREDICTIONS, AI HASHTAGS
 ======================================================= */
 
 async function callGeneration(
@@ -944,6 +907,8 @@ ABSOLUTE RULES:
 - **Give a specific price target** (e.g., "I see $0.05 in the next week").
 - **Mention the current price** and a short reason (technical breakout, catalyst, momentum).
 - **End with a question** to encourage comments (e.g., "Who's buying with me?").
+- **DO NOT** mention "Bitcoin", "BTC", or any other coin that is not the exact one you are talking about. The post must be exclusively about the given coin.
+- **Include 3-4 relevant hashtags** at the end (e.g., #PEPE #Memecoin #Breakout). Do NOT use generic ones like #Crypto or #Profit unless they are truly relevant to the post.
 - **DO NOT** use generic disclaimers like "not financial advice" – sound like a real trader sharing a conviction.
 - **DO NOT** make it sound like a bot.
 - Use short, punchy sentences.
@@ -1035,26 +1000,13 @@ function normalizeGeneratedPost(post) {
 }
 
 /* =======================================================
-   HASHTAGS – includes profit & ticker (kept as is)
+   HASHTAGS – REMOVED – we let the AI generate them
 ======================================================= */
 
-function ensureHashtags(content, topic = "crypto", tickerSymbol = "BTC") {
-  let text = String(content || "").trim();
-  // Remove existing hashtags to avoid duplicates
-  text = text.replace(/#[a-zA-Z0-9_]+/g, "").trim();
-  const cleanTicker = tickerSymbol.replace("USDT", "").toUpperCase();
-  // Ensure ticker is mentioned with $ if not already
-  if (!text.includes(`$${cleanTicker}`) && !text.includes(cleanTicker)) {
-    text = `$${cleanTicker} ${text}`;
-  }
-  // Remove existing disclaimer if present
-  text = text.replace(/Not financial advice\.\s*$/i, "").trim();
-  const tags = [`#${cleanTicker}`, "#Crypto", "#Profit", "#Trade"];
-  return `${text}\n\n${tags.join(" ")}`;
-}
+// No ensureHashtags function – AI includes hashtags in content.
 
 /* =======================================================
-   FALLBACK POST – persuasive
+   FALLBACK POST – now with AI‑style hashtags
 ======================================================= */
 
 function buildFallbackPost(
@@ -1068,7 +1020,6 @@ function buildFallbackPost(
   const priceText = Number.isFinite(price)
     ? `$${price.toFixed(4)}`
     : "current levels";
-  // Random target (up 15-30%)
   const targetMultiplier = 1.15 + Math.random() * 0.15;
   const targetPrice = Number.isFinite(price) ? price * targetMultiplier : price;
   const targetText = Number.isFinite(targetPrice)
@@ -1084,11 +1035,13 @@ function buildFallbackPost(
   ];
   const opener = openers[Math.floor(Math.random() * openers.length)];
   const direction = Math.random() > 0.3 ? "LONG" : "HOLD";
-  const content = `${opener} Current price: ${priceText}. I'm going **${direction}** with a target of ${targetText}. Momentum is building – who's with me?`;
+  // Generate 3 relevant hashtags
+  const tags = [`#${tick}`, "#Crypto", "#Trade"].join(" ");
+  const content = `${opener} Current price: ${priceText}. I'm going **${direction}** with a target of ${targetText}. Momentum is building – who's with me?\n\n${tags}`;
   return {
     title: `$${tick} breakout?`,
     topic: "crypto",
-    content: ensureHashtags(content, "crypto", ticker),
+    content,
     qualityScore: 8,
     newsUsed: Boolean(selectedTopic),
     catalystConfidence: selectedTopic ? "LOW" : "NONE",
@@ -1100,7 +1053,7 @@ function buildFallbackPost(
 }
 
 /* =======================================================
-   SELECT TOPIC – now uses LOW_PRICE_COINS for fallback
+   SELECT TOPIC
 ======================================================= */
 
 async function selectTopic(newsResearch) {
@@ -1123,13 +1076,12 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST – persuasive, FOMO, predictions
+   GENERATE POST – now without forced hashtags
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
   const recentPosts = getRecentPostMemory();
   const selectedTopic = await selectTopic(newsResearch);
-  // Use a random coin from our list as fallback
   const fallbackCoin = getRandomCoin();
 
   console.log("\n🎯 [Binance] Selected topic:");
@@ -1169,23 +1121,7 @@ Signal: ${signal.direction} (${signal.confidence}) - ${signal.reason}
 `;
   }
 
-  // Use a random coin from LOW_PRICE_COINS as the primary focus (override ticker if needed)
-  // We'll pick one and use it, but we also have marketData ticker.
-  // If marketData already gives a coin from our list, use that; otherwise pick a random one.
   const coinSymbol = marketData?.symbol?.replace("USDT", "") || fallbackCoin;
-  const coinTicker = coinSymbol + "USDT";
-  // Override ticker to our chosen coin (if we have market data for it, use that; else we'll still use the ticker symbol)
-  // We'll set ticker to the coinSymbol for the prompt, but for price we may have to use fallback if no marketData.
-  // In practice, we already have marketData with a selected coin (likely from our list).
-  // So we just use that.
-
-  // Generate a random target price if marketData exists
-  let targetPrice = null;
-  if (marketData?.lastPrice) {
-    const multiplier = 1.1 + Math.random() * 0.25; // 10-35% up
-    targetPrice = marketData.lastPrice * multiplier;
-  }
-
   const prompt = `
 CURRENT WEB RESEARCH:
 
@@ -1211,13 +1147,14 @@ Write a persuasive, urgent Binance Square post about the coin from the market da
 - Do not include any disclaimer.
 - Include a clear prediction (LONG/SHORT/HOLD) and a price target.
 - Start with a unique opening line (do not repeat).
+- **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about the chosen coin.
+- **Include 3-4 relevant hashtags** at the end, unique to this coin and the message.
 
-The coin is ${coinSymbol}. Current price: ${marketData?.lastPrice?.toFixed(4) || "unknown"}. 
-Suggested target: ${targetPrice ? `$${targetPrice.toFixed(4)}` : "higher"}.
+The coin is ${coinSymbol}. Current price: ${marketData?.lastPrice?.toFixed(4) || "unknown"}.
 `;
   try {
     const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
-    post.content = ensureHashtags(post.content, post.topic, ticker);
+    // No forced hashtags – the AI has already included them.
     return post;
   } catch (error) {
     console.error("⚠️ Groq generation failed:", error.message);
@@ -1227,7 +1164,7 @@ Suggested target: ${targetPrice ? `$${targetPrice.toFixed(4)}` : "higher"}.
 }
 
 /* =======================================================
-   VALIDATION – less strict
+   VALIDATION – relaxed
 ======================================================= */
 
 function validatePost(post) {
@@ -1253,8 +1190,10 @@ function validatePost(post) {
   for (const phrase of forbidden) {
     if (lower.includes(phrase)) reasons.push(`forbidden phrase: ${phrase}`);
   }
+  // Hashtag check now optional – we'll just warn but not reject
   const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
-  if (hashtags.length < 2) reasons.push(`hashtags count: ${hashtags.length}`);
+  if (hashtags.length < 2)
+    console.warn("⚠️ Few hashtags detected – AI may have omitted them.");
   return { valid: reasons.length === 0, reasons };
 }
 
@@ -1263,16 +1202,16 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT – Clean 1:1, no extra details
+   IMAGE PROMPT – Clean 1:1, no extra details, correct ticker
 ======================================================= */
 
-function buildImagePrompt(post, marketData) {
-  const ticker = marketData?.symbol?.replace("USDT", "") || "BTC";
+function buildImagePrompt(post, marketData, coinSymbol) {
+  // Use the explicit coinSymbol passed from market data or fallback
+  const ticker = coinSymbol || marketData?.symbol?.replace("USDT", "") || "BTC";
   const price = marketData?.lastPrice?.toFixed(4) || "0.00";
   const direction = marketData?.signal?.direction?.toLowerCase() || "bullish";
   const arrow =
     direction === "bullish" ? "⬆️" : direction === "bearish" ? "⬇️" : "➡️";
-  // Generate a simple target (15-35% higher)
   let target = "";
   if (marketData?.lastPrice) {
     const multiplier = 1.15 + Math.random() * 0.2;
@@ -1304,15 +1243,15 @@ Generate a **simple, clean, 1:1 square image** for a crypto social media post.
 }
 
 /* =======================================================
-   CLOUDFLARE IMAGE GENERATION
+   CLOUDFLARE IMAGE GENERATION – passes correct coin
 ======================================================= */
 
-async function generateImageWithCloudflare(post, marketData) {
+async function generateImageWithCloudflare(post, marketData, coinSymbol) {
   console.log(
     "\n🎨 [Binance] Generating wallet profit screenshot with Cloudflare Workers AI...",
   );
 
-  const prompt = buildImagePrompt(post, marketData);
+  const prompt = buildImagePrompt(post, marketData, coinSymbol);
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
 
   try {
@@ -1357,17 +1296,17 @@ async function generateImageWithCloudflare(post, marketData) {
     if (!imageBuffer || imageBuffer.length < 1000)
       throw new Error("Cloudflare returned an empty or invalid image.");
 
-    console.log("   ✅ Wallet screenshot generated.");
+    console.log("   ✅ Image generated.");
 
     await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
     const timestamp = Date.now();
     const random = Math.random().toString(36).slice(2, 8);
     const imagePath = path.join(
       GENERATED_IMAGE_DIR,
-      `wallet-${timestamp}-${random}.png`,
+      `coin-${timestamp}-${random}.png`,
     );
     await fs.writeFile(imagePath, imageBuffer);
-    console.log(`   ✅ Image generated: ${imagePath}`);
+    console.log(`   ✅ Image saved: ${imagePath}`);
     console.log(
       `   📦 Image size: ${(imageBuffer.length / 1024).toFixed(1)} KB`,
     );
@@ -1390,7 +1329,7 @@ async function cleanupGeneratedImage(imagePath) {
 }
 
 /* =======================================================
-   BINANCE SQUARE TEXT PUBLISHER
+   PUBLISHERS (unchanged)
 ======================================================= */
 
 function publishTextToSquare(content) {
@@ -1457,10 +1396,6 @@ function publishTextToSquare(content) {
       );
   });
 }
-
-/* =======================================================
-   BINANCE SQUARE IMAGE PUBLISHER
-======================================================= */
 
 function publishImageToSquare(content, imagePath) {
   return new Promise((resolve, reject) => {
@@ -1535,13 +1470,13 @@ function publishImageToSquare(content, imagePath) {
 }
 
 /* =======================================================
-   IMAGE PIPELINE
+   IMAGE PIPELINE – passes coinSymbol correctly
 ======================================================= */
 
-async function generateAndPublishImage(post, marketData) {
+async function generateAndPublishImage(post, marketData, coinSymbol) {
   let imagePath = null;
   try {
-    imagePath = await generateImageWithCloudflare(post, marketData);
+    imagePath = await generateImageWithCloudflare(post, marketData, coinSymbol);
     const result = await publishImageToSquare(post.content, imagePath);
     return { ...result, imageGenerated: true };
   } finally {
@@ -1654,9 +1589,10 @@ async function runCycle() {
     console.log("   ✓ Duplicate protection disabled.");
 
     let result;
+    const coinSymbol = marketData?.symbol?.replace("USDT", "") || "BTC";
     try {
-      console.log("\n🎨 IMAGE PIPELINE STARTING (Wallet Screenshot)");
-      result = await generateAndPublishImage(post, marketData);
+      console.log("\n🎨 IMAGE PIPELINE STARTING (Square Image)");
+      result = await generateAndPublishImage(post, marketData, coinSymbol);
       post.imageGenerated = true;
       post.imageGenerationFailed = false;
       console.log("\n🖼️ Image post published successfully.");
