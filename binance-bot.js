@@ -627,61 +627,9 @@ async function getMarketData() {
     };
   } catch (error) {
     console.warn(`   ⚠️ Market data fetch failed: ${error.message}`);
-    console.log("   ↪️ Falling back to BTCUSDT.");
-    try {
-      const tickerRes = await fetchWithTimeout(
-        "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT",
-        {},
-        10000,
-      );
-      if (!tickerRes.ok) throw new Error(`BTC ticker HTTP ${tickerRes.status}`);
-      const ticker = await tickerRes.json();
-      const klinesRes = await fetchWithTimeout(
-        "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1h&limit=100",
-        {},
-        10000,
-      );
-      if (!klinesRes.ok) throw new Error(`BTC klines HTTP ${klinesRes.status}`);
-      const klines = await klinesRes.json();
-      const closes = klines.map((candle) => parseFloat(candle[4]));
-      const smaShort = movingAverage(closes, SMA_SHORT);
-      const smaLong = movingAverage(closes, SMA_LONG);
-      const rsi = computeRSI(closes, RSI_PERIOD);
-      const lastPrice = parseFloat(ticker.lastPrice);
-      const priceChange = parseFloat(ticker.priceChangePercent);
-      const volume = parseFloat(ticker.volume);
-      const high = parseFloat(ticker.highPrice);
-      const low = parseFloat(ticker.lowPrice);
-      const signal = generateSignal({
-        lastPrice,
-        priceChange,
-        smaShort: smaShort[smaShort.length - 1],
-        smaLong: smaLong[smaLong.length - 1],
-        rsi: rsi[rsi.length - 1],
-      });
-      console.log(
-        `   ✅ FALLBACK: BTCUSDT $${lastPrice.toFixed(2)} (${priceChange}%)`,
-      );
-      return {
-        symbol: "BTCUSDT",
-        baseAsset: "Bitcoin",
-        lastPrice,
-        priceChangePercent: priceChange,
-        volume,
-        high,
-        low,
-        signal,
-        smaShort: smaShort[smaShort.length - 1],
-        smaLong: smaLong[smaLong.length - 1],
-        rsi: rsi[rsi.length - 1],
-      };
-    } catch (fallbackError) {
-      console.error(
-        "❌ Fallback to BTCUSDT also failed:",
-        fallbackError.message,
-      );
-      return null;
-    }
+    // Instead of falling back to BTC, we return null so that generatePost picks a random coin.
+    console.log("   ↪️ No market data – will use random low‑cap coin.");
+    return null;
   }
 }
 
@@ -831,7 +779,8 @@ function getRecentPostMemory() {
 }
 
 /* =======================================================
-   POST SCHEMA – unchanged
+   POST SCHEMA – topic enum expanded with common coins?
+   Actually we keep it as is, but we'll force AI to use one.
 ======================================================= */
 
 const POST_SCHEMA = {
@@ -873,7 +822,7 @@ const POST_SCHEMA = {
 };
 
 /* =======================================================
-   GROQ GENERATION – PERSUASIVE, FOMO, PREDICTIONS, AI HASHTAGS
+   GROQ GENERATION – now forces allowed topic & no BTC unless coin is BTC
 ======================================================= */
 
 async function callGeneration(
@@ -898,23 +847,23 @@ Your goal is to create a highly persuasive, authentic-looking post that encourag
 ABSOLUTE RULES:
 
 - **Start with a unique, attention‑grabbing line** – never repeat the same opener. Examples:
-  - "If you don't buy $[TICKER] now, you will regret it in 24 hours."
-  - "Thank me later – this coin is about to explode."
-  - "The next 10x is here. Don't sleep on $[TICKER]."
-  - "I've been watching this one for weeks – now is the time."
-  - "Buy $[TICKER] or you'll wish you had."
+  "If you don't buy $[TICKER] now, you will regret it in 24 hours."
+  "Thank me later – this coin is about to explode."
+  "The next 10x is here. Don't sleep on $[TICKER]."
+  "I've been watching this one for weeks – now is the time."
+  "Buy $[TICKER] or you'll wish you had."
 - **State a clear prediction**: "I'm going LONG" / "SHORT" / "HOLD".
 - **Give a specific price target** (e.g., "I see $0.05 in the next week").
 - **Mention the current price** and a short reason (technical breakout, catalyst, momentum).
 - **End with a question** to encourage comments (e.g., "Who's buying with me?").
-- **DO NOT** mention "Bitcoin", "BTC", or any other coin that is not the exact one you are talking about. The post must be exclusively about the given coin.
+- **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about the given coin.
 - **Include 3-4 relevant hashtags** at the end (e.g., #PEPE #Memecoin #Breakout). Do NOT use generic ones like #Crypto or #Profit unless they are truly relevant to the post.
-- **DO NOT** use generic disclaimers like "not financial advice" – sound like a real trader sharing a conviction.
-- **DO NOT** make it sound like a bot.
+- **DO NOT** use generic disclaimers like "not financial advice".
+- **Topic field:** Must be one of: "bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto". If the coin is not one of the first five, use "crypto". Always pick one of these exact strings.
 - Use short, punchy sentences.
 - Make each post unique by varying the structure and wording.
 
-TARGET LENGTH: 150-300 characters (Binance Square optimal).
+TARGET LENGTH: 150-300 characters.
 
 CONTEXT:
 
@@ -1000,31 +949,24 @@ function normalizeGeneratedPost(post) {
 }
 
 /* =======================================================
-   HASHTAGS – REMOVED – we let the AI generate them
+   HASHTAGS – removed; AI generates its own
 ======================================================= */
 
-// No ensureHashtags function – AI includes hashtags in content.
+// No ensureHashtags function.
 
 /* =======================================================
-   FALLBACK POST – now with AI‑style hashtags
+   FALLBACK POST – uses random coin, not BTC
 ======================================================= */
 
-function buildFallbackPost(
-  selectedTopic,
-  fallbackCoin,
-  ticker = "BTC",
-  marketData = null,
-) {
-  const tick = ticker.replace("USDT", "").toUpperCase();
+function buildFallbackPost(selectedTopic, fallbackCoin, marketData = null) {
+  const tick = fallbackCoin; // already a symbol like "ATOM"
   const price = marketData?.lastPrice;
   const priceText = Number.isFinite(price)
     ? `$${price.toFixed(4)}`
     : "current levels";
   const targetMultiplier = 1.15 + Math.random() * 0.15;
-  const targetPrice = Number.isFinite(price) ? price * targetMultiplier : price;
-  const targetText = Number.isFinite(targetPrice)
-    ? `$${targetPrice.toFixed(4)}`
-    : "higher";
+  const targetPrice = Number.isFinite(price) ? price * targetMultiplier : null;
+  const targetText = targetPrice ? `$${targetPrice.toFixed(4)}` : "higher";
 
   const openers = [
     `If you don't buy $${tick} now, you will regret it in 24 hours.`,
@@ -1035,7 +977,6 @@ function buildFallbackPost(
   ];
   const opener = openers[Math.floor(Math.random() * openers.length)];
   const direction = Math.random() > 0.3 ? "LONG" : "HOLD";
-  // Generate 3 relevant hashtags
   const tags = [`#${tick}`, "#Crypto", "#Trade"].join(" ");
   const content = `${opener} Current price: ${priceText}. I'm going **${direction}** with a target of ${targetText}. Momentum is building – who's with me?\n\n${tags}`;
   return {
@@ -1053,7 +994,7 @@ function buildFallbackPost(
 }
 
 /* =======================================================
-   SELECT TOPIC
+   SELECT TOPIC (unchanged)
 ======================================================= */
 
 async function selectTopic(newsResearch) {
@@ -1076,13 +1017,20 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST – now without forced hashtags
+   GENERATE POST – always uses a coin from LOW_PRICE_COINS
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
   const recentPosts = getRecentPostMemory();
   const selectedTopic = await selectTopic(newsResearch);
-  const fallbackCoin = getRandomCoin();
+
+  // Determine the coin to talk about
+  let coinSymbol;
+  if (marketData) {
+    coinSymbol = marketData.symbol.replace("USDT", "");
+  } else {
+    coinSymbol = getRandomCoin();
+  }
 
   console.log("\n🎯 [Binance] Selected topic:");
   if (selectedTopic) {
@@ -1093,7 +1041,7 @@ async function generatePost(newsResearch, marketData) {
       }`,
     );
   } else {
-    console.log(`   💡 ${fallbackCoin}`);
+    console.log(`   💡 ${coinSymbol}`);
   }
 
   let researchBlock = "NO CURRENT WEB RESEARCH AVAILABLE.";
@@ -1107,12 +1055,9 @@ Source: ${selectedTopic.source || "Unknown"}
   }
 
   let marketBlock = "NO MARKET DATA AVAILABLE.";
-  let ticker = "BTC";
-
   if (marketData) {
     const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
       marketData;
-    ticker = symbol;
     marketBlock = `
 Coin: ${symbol} (${baseAsset})
 Price: $${lastPrice.toFixed(4)}
@@ -1121,7 +1066,6 @@ Signal: ${signal.direction} (${signal.confidence}) - ${signal.reason}
 `;
   }
 
-  const coinSymbol = marketData?.symbol?.replace("USDT", "") || fallbackCoin;
   const prompt = `
 CURRENT WEB RESEARCH:
 
@@ -1131,7 +1075,7 @@ MARKET DATA:
 
 ${marketBlock}
 
-FALLBACK COIN (if no market data): ${fallbackCoin}
+COIN TO TALK ABOUT: ${coinSymbol}
 
 RECENT POSTS:
 
@@ -1139,7 +1083,7 @@ ${recentPosts || "None"}
 
 TASK:
 
-Write a persuasive, urgent Binance Square post about the coin from the market data (or fallback coin if no data).
+Write a persuasive, urgent Binance Square post about the coin ${coinSymbol}.
 
 - Use the market data accurately if available.
 - Make the post sound like a real trader sharing a high‑conviction trade.
@@ -1147,19 +1091,19 @@ Write a persuasive, urgent Binance Square post about the coin from the market da
 - Do not include any disclaimer.
 - Include a clear prediction (LONG/SHORT/HOLD) and a price target.
 - Start with a unique opening line (do not repeat).
-- **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about the chosen coin.
+- **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about ${coinSymbol}.
 - **Include 3-4 relevant hashtags** at the end, unique to this coin and the message.
+- **Topic field:** Must be one of: "bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto". Use "crypto" if the coin doesn't fit the others.
 
-The coin is ${coinSymbol}. Current price: ${marketData?.lastPrice?.toFixed(4) || "unknown"}.
+The coin is ${coinSymbol}.
 `;
   try {
     const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
-    // No forced hashtags – the AI has already included them.
     return post;
   } catch (error) {
     console.error("⚠️ Groq generation failed:", error.message);
     console.log("↪️ Building fallback post.");
-    return buildFallbackPost(selectedTopic, fallbackCoin, ticker, marketData);
+    return buildFallbackPost(selectedTopic, coinSymbol, marketData);
   }
 }
 
@@ -1190,10 +1134,6 @@ function validatePost(post) {
   for (const phrase of forbidden) {
     if (lower.includes(phrase)) reasons.push(`forbidden phrase: ${phrase}`);
   }
-  // Hashtag check now optional – we'll just warn but not reject
-  const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
-  if (hashtags.length < 2)
-    console.warn("⚠️ Few hashtags detected – AI may have omitted them.");
   return { valid: reasons.length === 0, reasons };
 }
 
@@ -1202,12 +1142,11 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT – Clean 1:1, no extra details, correct ticker
+   IMAGE PROMPT – clean 1:1, uses correct coin
 ======================================================= */
 
-function buildImagePrompt(post, marketData, coinSymbol) {
-  // Use the explicit coinSymbol passed from market data or fallback
-  const ticker = coinSymbol || marketData?.symbol?.replace("USDT", "") || "BTC";
+function buildImagePrompt(marketData, coinSymbol) {
+  const ticker = coinSymbol || "BTC";
   const price = marketData?.lastPrice?.toFixed(4) || "0.00";
   const direction = marketData?.signal?.direction?.toLowerCase() || "bullish";
   const arrow =
@@ -1237,21 +1176,17 @@ Generate a **simple, clean, 1:1 square image** for a crypto social media post.
 - Use a sleek gradient background (dark blue/purple to black).
 - Keep it **clean** – only the elements listed above.
 - No fake PNL or percentage gains.
-
-**Reference**: A typical crypto chart card on TradingView, but minimal.
 `;
 }
 
 /* =======================================================
-   CLOUDFLARE IMAGE GENERATION – passes correct coin
+   CLOUDFLARE IMAGE GENERATION
 ======================================================= */
 
-async function generateImageWithCloudflare(post, marketData, coinSymbol) {
-  console.log(
-    "\n🎨 [Binance] Generating wallet profit screenshot with Cloudflare Workers AI...",
-  );
+async function generateImageWithCloudflare(marketData, coinSymbol) {
+  console.log("\n🎨 [Binance] Generating image with Cloudflare Workers AI...");
 
-  const prompt = buildImagePrompt(post, marketData, coinSymbol);
+  const prompt = buildImagePrompt(marketData, coinSymbol);
   const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
 
   try {
@@ -1470,13 +1405,13 @@ function publishImageToSquare(content, imagePath) {
 }
 
 /* =======================================================
-   IMAGE PIPELINE – passes coinSymbol correctly
+   IMAGE PIPELINE
 ======================================================= */
 
 async function generateAndPublishImage(post, marketData, coinSymbol) {
   let imagePath = null;
   try {
-    imagePath = await generateImageWithCloudflare(post, marketData, coinSymbol);
+    imagePath = await generateImageWithCloudflare(marketData, coinSymbol);
     const result = await publishImageToSquare(post.content, imagePath);
     return { ...result, imageGenerated: true };
   } finally {
@@ -1485,7 +1420,7 @@ async function generateAndPublishImage(post, marketData, coinSymbol) {
 }
 
 /* =======================================================
-   SAVE POST
+   SAVE POST (unchanged)
 ======================================================= */
 
 async function savePost(post, result) {
@@ -1516,7 +1451,7 @@ async function savePost(post, result) {
 }
 
 /* =======================================================
-   MAIN BINANCE CYCLE
+   MAIN CYCLE – now passes coinSymbol to image
 ======================================================= */
 
 async function runCycle() {
@@ -1589,7 +1524,17 @@ async function runCycle() {
     console.log("   ✓ Duplicate protection disabled.");
 
     let result;
-    const coinSymbol = marketData?.symbol?.replace("USDT", "") || "BTC";
+    // Determine coin symbol for image
+    let coinSymbol = "BTC";
+    if (marketData) {
+      coinSymbol = marketData.symbol.replace("USDT", "");
+    } else {
+      // fallback: extract from post content? we can get from prompt? easier: we stored it in generatePost but not returned.
+      // We'll extract from post content (look for $[COIN])
+      const match = post.content.match(/\$([A-Z]+)/);
+      if (match) coinSymbol = match[1];
+    }
+
     try {
       console.log("\n🎨 IMAGE PIPELINE STARTING (Square Image)");
       result = await generateAndPublishImage(post, marketData, coinSymbol);
@@ -1631,7 +1576,7 @@ async function runCycle() {
 }
 
 /* =======================================================
-   SAFE CYCLE WRAPPER
+   SAFE CYCLE WRAPPER, INIT, STATUS, SHUTDOWN (unchanged)
 ======================================================= */
 
 let cycleRunning = false;
@@ -1657,10 +1602,6 @@ async function safeRunCycle() {
     cycleRunning = false;
   }
 }
-
-/* =======================================================
-   INITIALIZATION
-======================================================= */
 
 async function initializeBinanceBot() {
   if (initialized) return;
@@ -1691,22 +1632,13 @@ async function initializeBinanceBot() {
   console.log("✅ Binance bot initialized.");
 }
 
-/* =======================================================
-   EXTERNAL ENTRY POINT
-======================================================= */
-
 async function runBinanceBot() {
   await initializeBinanceBot();
   return await safeRunCycle();
 }
 
-/* =======================================================
-   OPTIONAL STATUS
-======================================================= */
-
 function getBinanceStatus() {
   resetDailyCounter();
-
   return {
     service: "binance-square-ai-bot",
     version: "10.0.0",
@@ -1728,10 +1660,6 @@ function getBinanceStatus() {
   };
 }
 
-/* =======================================================
-   SHUTDOWN SUPPORT
-======================================================= */
-
 async function shutdownBinanceBot() {
   console.log("🛑 Shutting down Binance bot...");
   try {
@@ -1743,10 +1671,6 @@ async function shutdownBinanceBot() {
   initialized = false;
   console.log("👋 Binance bot shutdown complete.");
 }
-
-/* =======================================================
-   EXPORTS
-======================================================= */
 
 export {
   runBinanceBot,
