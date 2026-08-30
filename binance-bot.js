@@ -11,13 +11,12 @@ dotenv.config();
 /*
 =========================================================
 BINANCE SQUARE AI BOT V10.0.0 – PERSUASIVE EDITION
-MODULE EDITION
+MODULE EDITION – LOW‑CAP FOCUS
 =========================================================
 
-This version is designed to create highly persuasive,
-personalised posts that encourage buying action.
-Includes small-cap and meme coins (PEPE, SHIB, DOGE, etc.)
-and generates wallet profit screenshots.
+This version is tailored to promote low‑price, high‑potential coins
+from a curated list. Posts are persuasive, include clear predictions
+(go long/short/hold), and come with clean 1:1 images.
 
 index.js calls:
 
@@ -101,6 +100,110 @@ const GOOGLE_NEWS_URL =
 const SMA_SHORT = 9;
 const SMA_LONG = 21;
 const RSI_PERIOD = 14;
+
+/* =======================================================
+   LOW-PRICE COIN LIST (from your file)
+======================================================= */
+
+const LOW_PRICE_COINS = [
+  "XRP",
+  "ADA",
+  "DOGE",
+  "TRX",
+  "POL",
+  "PEPE",
+  "SHIB",
+  "XLM",
+  "VET",
+  "HBAR",
+  "ALGO",
+  "SAND",
+  "MANA",
+  "GRT",
+  "GALA",
+  "FLOKI",
+  "BONK",
+  "JASMY",
+  "CHZ",
+  "IOTA",
+  "VTHOR",
+  "BAT",
+  "ONE",
+  "IOST",
+  "COTI",
+  "ENJ",
+  "ZIL",
+  "ZRX",
+  "ONT",
+  "ONG",
+  "SNT",
+  "CVC",
+  "REQ",
+  "SKL",
+  "CTSI",
+  "STORJ",
+  "LRC",
+  "CKB",
+  "RVN",
+  "DGB",
+  "IDEX",
+  "CHR",
+  "SYS",
+  "ARPA",
+  "DENT",
+  "HOT",
+  "WIN",
+  "LSK",
+  "API3",
+  "ANKR",
+  "STEEM",
+  "HIVE",
+  "AERGO",
+  "PUNDIX",
+  "XEC",
+  "PROM",
+  "ZK",
+  "STRK",
+  "ZKL",
+  "ZRO",
+  "ENA",
+  "SUI",
+  "SEI",
+  "INJ",
+  "APT",
+  "ARB",
+  "OP",
+  "ATOM",
+  "EOS",
+  "XTZ",
+  "KAVA",
+  "CELO",
+  "IOTX",
+  "MASK",
+  "MAGIC",
+  "IMX",
+  "AXS",
+  "APE",
+  "RENDER",
+  "FET",
+  "OCEAN",
+  "AGIX",
+  "TRAC",
+  "RLC",
+  "PHA",
+  "NMR",
+  "LPT",
+  "GNO",
+  "SAFE",
+  "ZETA",
+  "HMSTR",
+  "NOT",
+  "WIF",
+  "BABYDOGE",
+  "BRETT",
+  "TURBO",
+  "TOSHI",
+];
 
 /* =======================================================
    HELPER FUNCTIONS
@@ -291,68 +394,11 @@ async function storePostHistory(post, result) {
 }
 
 /* =======================================================
-   TOPIC POOL – Expanded with meme coins
+   TOPIC POOL – Now uses the LOW_PRICE_COINS list
 ======================================================= */
 
-const TOPICS = [
-  "Bitcoin",
-  "Ethereum",
-  "BNB",
-  "Solana",
-  "XRP",
-  "PEPE",
-  "SHIB",
-  "DOGE",
-  "TUT",
-  "WIF",
-  "BONK",
-  "FLOKI",
-  "Bitcoin dominance",
-  "Altcoin season",
-  "Crypto market sentiment",
-  "Bull markets",
-  "Bear markets",
-  "Crypto market cycles",
-  "Bitcoin adoption",
-  "Ethereum ecosystem",
-  "Solana ecosystem",
-  "BNB ecosystem",
-  "DeFi",
-  "Web3",
-  "Crypto whales",
-  "Crypto liquidity",
-  "Crypto volatility",
-  "Trading psychology",
-  "Risk management",
-  "Common crypto trading mistakes",
-  "Long-term crypto investing",
-  "Crypto portfolio management",
-  "Blockchain adoption",
-  "Crypto regulation",
-  "Institutional crypto adoption",
-  "Bitcoin ETFs",
-  "Ethereum ETFs",
-  "Stablecoins",
-  "Layer 1 blockchains",
-  "Layer 2 networks",
-  "Decentralized exchanges",
-  "Centralized exchanges",
-  "Memecoins",
-  "Crypto security",
-  "Crypto wallets",
-  "Self custody",
-  "On-chain activity",
-  "Crypto market momentum",
-  "Support and resistance",
-  "Technical analysis concepts",
-  "Crypto fundamentals",
-  "Bitcoin halving",
-  "Ethereum upgrades",
-  "Blockchain scalability",
-  "Crypto payments",
-  "Real-world blockchain applications",
-  "Future of cryptocurrency",
-];
+// We no longer need the old TOPICS array; we'll use LOW_PRICE_COINS
+// in the generation prompt directly.
 
 /* =======================================================
    STATE
@@ -513,11 +559,8 @@ function getXmlTag(xml, tag) {
 }
 
 /* =======================================================
-   BINANCE MARKET DATA – with small coins inclusion
+   BINANCE MARKET DATA – prioritises low‑price coins
 ======================================================= */
-
-// List of popular small-cap/meme coins to occasionally use
-const MEME_COINS = ["PEPE", "SHIB", "DOGE", "WIF", "BONK", "FLOKI", "TUT"];
 
 async function getMarketData() {
   console.log("\n📊 [Binance] Fetching market data...");
@@ -541,44 +584,35 @@ async function getMarketData() {
       if (!t.symbol.endsWith("USDT")) return false;
       if (stablecoins.has(t.symbol)) return false;
       const vol = parseFloat(t.quoteVolume);
-      return vol > 500_000; // lowered threshold to include smaller coins
+      return vol > 500_000;
     });
 
     if (candidates.length === 0)
       throw new Error("No valid USDT pairs with sufficient volume.");
 
-    // Shuffle and pick a random coin, but bias toward trending
-    const shuffled = candidates.sort(() => Math.random() - 0.5);
-    // 70% chance to pick from top volume*change, 30% to pick from meme coins list
+    // ----- MODIFICATION: prioritise our low‑price coins (80% chance) -----
+    const lowPriceSymbols = new Set(LOW_PRICE_COINS.map((c) => c + "USDT"));
+    const lowCandidates = candidates.filter((t) =>
+      lowPriceSymbols.has(t.symbol),
+    );
+
     let selected;
-    if (Math.random() < 0.3) {
-      // Try to find a meme coin in candidates
-      const memeCandidates = candidates.filter((t) =>
-        MEME_COINS.some((m) => t.symbol.startsWith(m)),
-      );
-      if (memeCandidates.length > 0) {
-        selected =
-          memeCandidates[Math.floor(Math.random() * memeCandidates.length)];
-      } else {
-        // fallback to top by volume*change
-        candidates.sort(
-          (a, b) =>
-            parseFloat(b.quoteVolume) * parseFloat(b.priceChangePercent) -
-            parseFloat(a.quoteVolume) * parseFloat(a.priceChangePercent),
-        );
-        selected = candidates[0];
-      }
+    if (Math.random() < 0.8 && lowCandidates.length > 0) {
+      // 80% chance to pick from the low-price list
+      selected =
+        lowCandidates[Math.floor(Math.random() * lowCandidates.length)];
     } else {
-      // Sort by volume * change to get most trending
-      candidates.sort(
+      // fallback: choose from all candidates (or low if available) using volume*change
+      const pool = lowCandidates.length > 0 ? lowCandidates : candidates;
+      pool.sort(
         (a, b) =>
           parseFloat(b.quoteVolume) * parseFloat(b.priceChangePercent) -
           parseFloat(a.quoteVolume) * parseFloat(a.priceChangePercent),
       );
-      // Pick from top 5 to add randomness
-      const top5 = candidates.slice(0, 5);
+      const top5 = pool.slice(0, 5);
       selected = top5[Math.floor(Math.random() * top5.length)];
     }
+    // ----------------------------------------------------------------
 
     const symbol = selected.symbol;
     const baseAsset = symbol.replace("USDT", "");
@@ -807,9 +841,11 @@ async function researchWeb() {
   return { news, marketData };
 }
 
-function getRandomTopic() {
-  return TOPICS[Math.floor(Math.random() * TOPICS.length)];
+// Helper to pick a random coin from LOW_PRICE_COINS (fallback topic)
+function getRandomCoin() {
+  return LOW_PRICE_COINS[Math.floor(Math.random() * LOW_PRICE_COINS.length)];
 }
+
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -874,7 +910,7 @@ const POST_SCHEMA = {
 };
 
 /* =======================================================
-   GROQ GENERATION – PERSUASIVE & PERSONAL
+   GROQ GENERATION – PERSUASIVE, FOMO, PREDICTIONS
 ======================================================= */
 
 async function callGeneration(
@@ -894,18 +930,22 @@ async function callGeneration(
             content: `
 You are a successful retail crypto trader sharing your personal trade experience on Binance Square.
 
-Your goal is to create a highly persuasive, authentic-looking post that encourages readers to consider the same trade.
+Your goal is to create a highly persuasive, authentic-looking post that encourages readers to take action.
 
 ABSOLUTE RULES:
 
-- Start with a personal statement: "I just bought [TICKER] at [PRICE] and I'm already up [PROFIT%]!"
-- Mention the exact ticker symbol (e.g., $PEPE, $SOL, $BTC) in the first sentence.
-- State the current price and your profit percentage (between 5% and 35%).
-- Give 1-2 reasons why you are bullish (catalyst, technical breakout, meme momentum, etc.).
-- Include a specific target price (e.g., "I'm targeting $0.00002").
-- End with a question to engage discussion.
-- DO NOT use generic phrases like "this is not financial advice" – we want to sound like a real trader sharing a win.
-- DO NOT make it sound like a bot.
+- **Start with a unique, attention‑grabbing line** – never repeat the same opener. Examples:
+  - "If you don't buy $[TICKER] now, you will regret it in 24 hours."
+  - "Thank me later – this coin is about to explode."
+  - "The next 10x is here. Don't sleep on $[TICKER]."
+  - "I've been watching this one for weeks – now is the time."
+  - "Buy $[TICKER] or you'll wish you had."
+- **State a clear prediction**: "I'm going LONG" / "SHORT" / "HOLD".
+- **Give a specific price target** (e.g., "I see $0.05 in the next week").
+- **Mention the current price** and a short reason (technical breakout, catalyst, momentum).
+- **End with a question** to encourage comments (e.g., "Who's buying with me?").
+- **DO NOT** use generic disclaimers like "not financial advice" – sound like a real trader sharing a conviction.
+- **DO NOT** make it sound like a bot.
 - Use short, punchy sentences.
 - Make each post unique by varying the structure and wording.
 
@@ -995,7 +1035,7 @@ function normalizeGeneratedPost(post) {
 }
 
 /* =======================================================
-   HASHTAGS – includes profit & ticker
+   HASHTAGS – includes profit & ticker (kept as is)
 ======================================================= */
 
 function ensureHashtags(content, topic = "crypto", tickerSymbol = "BTC") {
@@ -1019,7 +1059,7 @@ function ensureHashtags(content, topic = "crypto", tickerSymbol = "BTC") {
 
 function buildFallbackPost(
   selectedTopic,
-  fallbackTopic,
+  fallbackCoin,
   ticker = "BTC",
   marketData = null,
 ) {
@@ -1028,24 +1068,31 @@ function buildFallbackPost(
   const priceText = Number.isFinite(price)
     ? `$${price.toFixed(4)}`
     : "current levels";
-  const profitPct = (Math.random() * 20 + 5).toFixed(1); // 5-25%
+  // Random target (up 15-30%)
+  const targetMultiplier = 1.15 + Math.random() * 0.15;
+  const targetPrice = Number.isFinite(price) ? price * targetMultiplier : price;
+  const targetText = Number.isFinite(targetPrice)
+    ? `$${targetPrice.toFixed(4)}`
+    : "higher";
 
-  const templates = [
-    `I just bought $${tick} at ${priceText} and I'm already up ${profitPct}%! This is the perfect opportunity to enter before the next leg up. I'm targeting $${(price * 1.15).toFixed(4)}. Who's with me?`,
-    `Just entered $${tick} at ${priceText} – up ${profitPct}% already! The momentum is insane, and I'm holding for $${(price * 1.2).toFixed(4)}. Are you in?`,
-    `$${tick} is breaking out! I bought at ${priceText} and I'm up ${profitPct}% in hours. This could run to $${(price * 1.25).toFixed(4)}. What's your target?`,
+  const openers = [
+    `If you don't buy $${tick} now, you will regret it in 24 hours.`,
+    `Thank me later – $${tick} is about to explode.`,
+    `The next 10x is here. Don't sleep on $${tick}.`,
+    `I've been watching $${tick} for weeks – now is the time.`,
+    `Buy $${tick} or you'll wish you had.`,
   ];
-
-  const content = templates[Math.floor(Math.random() * templates.length)];
-
+  const opener = openers[Math.floor(Math.random() * openers.length)];
+  const direction = Math.random() > 0.3 ? "LONG" : "HOLD";
+  const content = `${opener} Current price: ${priceText}. I'm going **${direction}** with a target of ${targetText}. Momentum is building – who's with me?`;
   return {
-    title: `$${tick} breakout? I'm up ${profitPct}%!`,
+    title: `$${tick} breakout?`,
     topic: "crypto",
     content: ensureHashtags(content, "crypto", ticker),
     qualityScore: 8,
     newsUsed: Boolean(selectedTopic),
     catalystConfidence: selectedTopic ? "LOW" : "NONE",
-    signal: "BULLISH",
+    signal: direction === "LONG" ? "BULLISH" : "NEUTRAL",
     signalConfidence: "HIGH",
     skip: false,
     skipReason: "",
@@ -1053,7 +1100,7 @@ function buildFallbackPost(
 }
 
 /* =======================================================
-   SELECT TOPIC
+   SELECT TOPIC – now uses LOW_PRICE_COINS for fallback
 ======================================================= */
 
 async function selectTopic(newsResearch) {
@@ -1076,13 +1123,14 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST – persuasive
+   GENERATE POST – persuasive, FOMO, predictions
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
   const recentPosts = getRecentPostMemory();
   const selectedTopic = await selectTopic(newsResearch);
-  const fallbackTopic = getRandomTopic();
+  // Use a random coin from our list as fallback
+  const fallbackCoin = getRandomCoin();
 
   console.log("\n🎯 [Binance] Selected topic:");
   if (selectedTopic) {
@@ -1093,7 +1141,7 @@ async function generatePost(newsResearch, marketData) {
       }`,
     );
   } else {
-    console.log(`   💡 ${fallbackTopic}`);
+    console.log(`   💡 ${fallbackCoin}`);
   }
 
   let researchBlock = "NO CURRENT WEB RESEARCH AVAILABLE.";
@@ -1121,8 +1169,22 @@ Signal: ${signal.direction} (${signal.confidence}) - ${signal.reason}
 `;
   }
 
-  // Generate a random profit percentage (5-35%)
-  const profitPct = (Math.random() * 30 + 5).toFixed(1);
+  // Use a random coin from LOW_PRICE_COINS as the primary focus (override ticker if needed)
+  // We'll pick one and use it, but we also have marketData ticker.
+  // If marketData already gives a coin from our list, use that; otherwise pick a random one.
+  const coinSymbol = marketData?.symbol?.replace("USDT", "") || fallbackCoin;
+  const coinTicker = coinSymbol + "USDT";
+  // Override ticker to our chosen coin (if we have market data for it, use that; else we'll still use the ticker symbol)
+  // We'll set ticker to the coinSymbol for the prompt, but for price we may have to use fallback if no marketData.
+  // In practice, we already have marketData with a selected coin (likely from our list).
+  // So we just use that.
+
+  // Generate a random target price if marketData exists
+  let targetPrice = null;
+  if (marketData?.lastPrice) {
+    const multiplier = 1.1 + Math.random() * 0.25; // 10-35% up
+    targetPrice = marketData.lastPrice * multiplier;
+  }
 
   const prompt = `
 CURRENT WEB RESEARCH:
@@ -1133,9 +1195,7 @@ MARKET DATA:
 
 ${marketBlock}
 
-FALLBACK TOPIC:
-
-${fallbackTopic}
+FALLBACK COIN (if no market data): ${fallbackCoin}
 
 RECENT POSTS:
 
@@ -1143,19 +1203,18 @@ ${recentPosts || "None"}
 
 TASK:
 
-Write a persuasive, personal Binance Square post about the coin above.
+Write a persuasive, urgent Binance Square post about the coin from the market data (or fallback coin if no data).
 
-You recently bought this coin and are already showing a profit of ${profitPct}%.
+- Use the market data accurately if available.
+- Make the post sound like a real trader sharing a high‑conviction trade.
+- Be specific, urgent, and engaging.
+- Do not include any disclaimer.
+- Include a clear prediction (LONG/SHORT/HOLD) and a price target.
+- Start with a unique opening line (do not repeat).
 
-Use the market data accurately.
-
-Make the post sound like a real trader sharing a winning trade.
-
-Be specific, urgent, and engaging.
-
-Do not include any disclaimer.
+The coin is ${coinSymbol}. Current price: ${marketData?.lastPrice?.toFixed(4) || "unknown"}. 
+Suggested target: ${targetPrice ? `$${targetPrice.toFixed(4)}` : "higher"}.
 `;
-
   try {
     const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
     post.content = ensureHashtags(post.content, post.topic, ticker);
@@ -1163,12 +1222,12 @@ Do not include any disclaimer.
   } catch (error) {
     console.error("⚠️ Groq generation failed:", error.message);
     console.log("↪️ Building fallback post.");
-    return buildFallbackPost(selectedTopic, fallbackTopic, ticker, marketData);
+    return buildFallbackPost(selectedTopic, fallbackCoin, ticker, marketData);
   }
 }
 
 /* =======================================================
-   VALIDATION – less strict to allow persuasive content
+   VALIDATION – less strict
 ======================================================= */
 
 function validatePost(post) {
@@ -1178,7 +1237,6 @@ function validatePost(post) {
   if (content.length < 60) reasons.push("post is too short");
   if (content.length > 5000) reasons.push("post is too long");
   const lower = content.toLowerCase();
-  // Remove strict forbidden phrases to allow some hype, but keep extreme ones
   const forbidden = [
     "guaranteed profit",
     "guaranteed return",
@@ -1197,7 +1255,6 @@ function validatePost(post) {
   }
   const hashtags = content.match(/#[a-zA-Z0-9_]+/g) || [];
   if (hashtags.length < 2) reasons.push(`hashtags count: ${hashtags.length}`);
-  // Allow missing disclaimer
   return { valid: reasons.length === 0, reasons };
 }
 
@@ -1206,67 +1263,48 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT – Wallet Profit Screenshot
+   IMAGE PROMPT – Clean 1:1, no extra details
 ======================================================= */
 
 function buildImagePrompt(post, marketData) {
-  const title = String(post?.title || "").slice(0, 250);
-  const content = String(post?.content || "")
-    .replace(/#[a-zA-Z0-9_]+/g, "")
-    .slice(0, 700);
-
-  let priceInfo = "";
-  let direction = "bullish";
-  let coinLabel = "Crypto";
-  let ticker = "BTC";
-  let profit = "15.2";
-
-  if (marketData) {
-    const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
-      marketData;
-    coinLabel = baseAsset || symbol.replace("USDT", "");
-    ticker = symbol;
-    priceInfo = `${symbol} at $${lastPrice.toFixed(
-      4,
-    )}, 24h change: ${priceChangePercent}%. Signal: ${signal.direction}.`;
-    direction = signal.direction.toLowerCase();
+  const ticker = marketData?.symbol?.replace("USDT", "") || "BTC";
+  const price = marketData?.lastPrice?.toFixed(4) || "0.00";
+  const direction = marketData?.signal?.direction?.toLowerCase() || "bullish";
+  const arrow =
+    direction === "bullish" ? "⬆️" : direction === "bearish" ? "⬇️" : "➡️";
+  // Generate a simple target (15-35% higher)
+  let target = "";
+  if (marketData?.lastPrice) {
+    const multiplier = 1.15 + Math.random() * 0.2;
+    const targetPrice = marketData.lastPrice * multiplier;
+    target = `Target: $${targetPrice.toFixed(4)}`;
+  } else {
+    target = "Target: higher";
   }
 
-  // Random profit between 5-35
-  profit = (Math.random() * 30 + 5).toFixed(1);
-
   return `
-Create a realistic mobile wallet screenshot showing a profitable trade for Binance Square.
+Generate a **simple, clean, 1:1 square image** for a crypto social media post.
 
-Subject: ${coinLabel} (${ticker})
+**Style**: Minimalist, dark theme, neon accents (like a trading terminal).
+**Content**:
+- Large coin symbol: $${ticker} (centered)
+- Current price: $${price}
+- A bold arrow (${arrow}) indicating the predicted direction
+- A subtle price target label: "${target}"
 
-Context:
-${title}
+**Requirements**:
+- Aspect ratio: **1:1** (square)
+- No human faces, no text paragraphs, no wallet UI.
+- Use a sleek gradient background (dark blue/purple to black).
+- Keep it **clean** – only the elements listed above.
+- No fake PNL or percentage gains.
 
-${content}
-
-Market:
-${priceInfo}
-
-Visual requirements:
-
-- Mobile phone interface style, like a crypto wallet app.
-- Display a large profit percentage: +${profit}% in green.
-- Show the coin logo and current price.
-- Include a "Profit" badge.
-- Clean, modern UI, dark or light theme (prefer dark).
-- No human faces.
-- No fake PNL numbers (only percentage).
-- No guaranteed profit claims.
-- No text overlays.
-- Aspect ratio 9:16 (mobile portrait) or 1:1.
-
-The image should look like a screenshot from a real trading app showing a successful trade.
+**Reference**: A typical crypto chart card on TradingView, but minimal.
 `;
 }
 
 /* =======================================================
-   CLOUDFLARE IMAGE GENERATION – wallet screenshot
+   CLOUDFLARE IMAGE GENERATION
 ======================================================= */
 
 async function generateImageWithCloudflare(post, marketData) {
@@ -1699,19 +1737,19 @@ async function initializeBinanceBot() {
   await loadState();
 
   console.log(`🧠 Provider: Groq (${GROQ_MODEL})`);
-  console.log(`🔥 Strategy: Momentum + Random Meme Inclusion`);
+  console.log(`🔥 Strategy: Momentum + Low‑Cap Coin Focus`);
   console.log(`🌐 Web research: Google News RSS (expanded)`);
   console.log(`📊 Market data: Binance real-time`);
   console.log(`💾 Trending topic storage: MongoDB (${MONGODB_DB_NAME})`);
   console.log(`📈 Signal generation: SMA + RSI`);
   console.log(`🛡️ Safety validation: ENABLED (relaxed)`);
-  console.log(`🎨 Image generation: ENABLED (Wallet profit screenshot)`);
+  console.log(`🎨 Image generation: ENABLED (clean 1:1 square)`);
   console.log(
     `🎨 Image provider: Cloudflare Workers AI (${CLOUDFLARE_IMAGE_MODEL})`,
   );
   console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
   console.log(`🎯 Maximum: ${MAX_POSTS_PER_DAY}/day`);
-  console.log(`❓ Topic pool: ${TOPICS.length} (includes memecoins)`);
+  console.log(`🪙 Low‑price coin pool: ${LOW_PRICE_COINS.length} coins`);
 
   initialized = true;
   console.log("✅ Binance bot initialized.");
