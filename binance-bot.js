@@ -5,6 +5,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { MongoClient } from "mongodb";
+import sharp from "sharp";
 
 dotenv.config();
 
@@ -200,6 +201,24 @@ function parsePositiveInteger(value, fallback) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function formatCryptoPrice(price) {
+  const num = Number(price);
+  if (isNaN(num) || num <= 0) return "$0.00";
+  if (num >= 1000) {
+    return `$${num.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+  if (num >= 1) {
+    return `$${num.toFixed(4).replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0000$/, "")}`;
+  }
+  if (num >= 0.01) {
+    return `$${num.toFixed(5).replace(/(\.\d*?[1-9])0+$/, "$1")}`;
+  }
+  if (num >= 0.0001) {
+    return `$${num.toFixed(6).replace(/(\.\d*?[1-9])0+$/, "$1")}`;
+  }
+  return `$${num.toFixed(8).replace(/(\.\d*?[1-9])0+$/, "$1")}`;
 }
 
 /* =======================================================
@@ -547,6 +566,9 @@ async function getMarketData() {
       "DAIUSDT",
       "FDUSDUSDT",
       "BUSDUSDT",
+      "EURUSDT",
+      "GBPUSDT",
+      "AEURUSDT",
     ]);
     const candidates = allTickers.filter((t) => {
       if (!t.symbol.endsWith("USDT")) return false;
@@ -563,19 +585,52 @@ async function getMarketData() {
       lowPriceSymbols.has(t.symbol),
     );
 
+    // Filter gainers and losers to ensure both LONG and SHORT opportunities
+    const gainers = candidates.filter(
+      (t) => parseFloat(t.priceChangePercent) > 1.5,
+    );
+    const losers = candidates.filter(
+      (t) => parseFloat(t.priceChangePercent) < -1.5,
+    );
+
     let selected;
-    if (Math.random() < 0.8 && lowCandidates.length > 0) {
-      selected =
-        lowCandidates[Math.floor(Math.random() * lowCandidates.length)];
-    } else {
-      const pool = lowCandidates.length > 0 ? lowCandidates : candidates;
-      pool.sort(
+    // 50% chance to target a low-cap coin, otherwise pick from gainers/losers/general pool
+    const huntShort = Math.random() < 0.5;
+
+    if (Math.random() < 0.7 && lowCandidates.length > 0) {
+      if (huntShort) {
+        const lowLosers = lowCandidates.filter(
+          (t) => parseFloat(t.priceChangePercent) < 0,
+        );
+        selected =
+          lowLosers.length > 0
+            ? lowLosers[Math.floor(Math.random() * lowLosers.length)]
+            : lowCandidates[Math.floor(Math.random() * lowCandidates.length)];
+      } else {
+        const lowGainers = lowCandidates.filter(
+          (t) => parseFloat(t.priceChangePercent) > 0,
+        );
+        selected =
+          lowGainers.length > 0
+            ? lowGainers[Math.floor(Math.random() * lowGainers.length)]
+            : lowCandidates[Math.floor(Math.random() * lowCandidates.length)];
+      }
+    } else if (huntShort && losers.length > 0) {
+      losers.sort(
         (a, b) =>
-          parseFloat(b.quoteVolume) * parseFloat(b.priceChangePercent) -
-          parseFloat(a.quoteVolume) * parseFloat(a.priceChangePercent),
+          parseFloat(a.priceChangePercent) - parseFloat(b.priceChangePercent),
       );
-      const top5 = pool.slice(0, 5);
-      selected = top5[Math.floor(Math.random() * top5.length)];
+      const topLosers = losers.slice(0, 10);
+      selected = topLosers[Math.floor(Math.random() * topLosers.length)];
+    } else if (!huntShort && gainers.length > 0) {
+      gainers.sort(
+        (a, b) =>
+          parseFloat(b.priceChangePercent) - parseFloat(a.priceChangePercent),
+      );
+      const topGainers = gainers.slice(0, 10);
+      selected = topGainers[Math.floor(Math.random() * topGainers.length)];
+    } else {
+      selected = candidates[Math.floor(Math.random() * candidates.length)];
     }
 
     const symbol = selected.symbol;
@@ -598,32 +653,75 @@ async function getMarketData() {
     const lastPrice = parseFloat(selected.lastPrice);
     const priceChange = parseFloat(selected.priceChangePercent);
     const volume = parseFloat(selected.volume);
+    const quoteVolume = parseFloat(selected.quoteVolume);
     const high = parseFloat(selected.highPrice);
     const low = parseFloat(selected.lowPrice);
+
+    const currentSmaShort = smaShort[smaShort.length - 1];
+    const currentSmaLong = smaLong[smaLong.length - 1];
+    const currentRsi = rsi[rsi.length - 1];
 
     const signal = generateSignal({
       lastPrice,
       priceChange,
-      smaShort: smaShort[smaShort.length - 1],
-      smaLong: smaLong[smaLong.length - 1],
-      rsi: rsi[rsi.length - 1],
+      smaShort: currentSmaShort,
+      smaLong: currentSmaLong,
+      rsi: currentRsi,
     });
 
-    console.log(`   ✅ ${symbol} $${lastPrice.toFixed(4)} (${priceChange}%)`);
-    console.log(`   📈 Signal: ${signal.direction} (${signal.confidence})`);
+    // Realistic predictions / targets based on direction and market volatility
+    const volatilityFactor = Math.max(
+      0.06,
+      Math.min(0.2, Math.abs(priceChange) * 0.5 * 0.01 + 0.08),
+    );
+    const slFactor = volatilityFactor * 0.45; // ~1:2.2 Risk/Reward ratio
+
+    let targetPrice, stopLoss;
+    if (signal.tradeType === "SHORT" || signal.direction === "BEARISH") {
+      targetPrice = lastPrice * (1 - volatilityFactor);
+      stopLoss = lastPrice * (1 + slFactor);
+    } else {
+      targetPrice = lastPrice * (1 + volatilityFactor);
+      stopLoss = lastPrice * (1 - slFactor);
+    }
+
+    const formattedPrice = formatCryptoPrice(lastPrice);
+    const formattedTarget = formatCryptoPrice(targetPrice);
+    const formattedStopLoss = formatCryptoPrice(stopLoss);
+    const formattedHigh = formatCryptoPrice(high);
+    const formattedLow = formatCryptoPrice(low);
+
+    console.log(
+      `   ✅ ${symbol} ${formattedPrice} (${priceChange > 0 ? "+" : ""}${priceChange}%)`,
+    );
+    console.log(
+      `   📈 Trade: ${signal.tradeType} [${signal.direction}] (${signal.confidence})`,
+    );
+    console.log(
+      `   🎯 Target: ${formattedTarget} | Stop Loss: ${formattedStopLoss}`,
+    );
 
     return {
       symbol,
       baseAsset,
       lastPrice,
+      formattedPrice,
+      targetPrice,
+      formattedTarget,
+      stopLoss,
+      formattedStopLoss,
       priceChangePercent: priceChange,
       volume,
+      quoteVolume,
       high,
+      formattedHigh,
       low,
+      formattedLow,
       signal,
-      smaShort: smaShort[smaShort.length - 1],
-      smaLong: smaLong[smaLong.length - 1],
-      rsi: rsi[rsi.length - 1],
+      tradeType: signal.tradeType,
+      smaShort: currentSmaShort,
+      smaLong: currentSmaLong,
+      rsi: currentRsi,
     };
   } catch (error) {
     console.warn(`   ⚠️ Market data fetch failed: ${error.message}`);
@@ -673,36 +771,53 @@ function generateSignal({ lastPrice, priceChange, smaShort, smaLong, rsi }) {
   let direction = "NEUTRAL";
   let confidence = "LOW";
   let reason = "";
-  if (smaShort > smaLong && rsi < 70 && priceChange > 0) {
-    direction = "BULLISH";
-    confidence = "HIGH";
-    reason = "SMA crossover bullish, RSI not overbought.";
-  } else if (smaShort < smaLong && rsi > 30 && priceChange < 0) {
+  let tradeType = "LONG";
+
+  if (rsi > 72) {
     direction = "BEARISH";
+    tradeType = "SHORT";
     confidence = "HIGH";
-    reason = "SMA crossover bearish, RSI not oversold.";
-  } else if (smaShort > smaLong) {
+    reason = "Severely overbought RSI with heavy rejection resistance.";
+  } else if (rsi < 28) {
     direction = "BULLISH";
-    confidence = "MEDIUM";
-    reason = "Short-term SMA above long-term SMA.";
+    tradeType = "LONG";
+    confidence = "HIGH";
+    reason = "Oversold RSI in demand zone with bounce accumulation.";
+  } else if (smaShort < smaLong && priceChange < 0) {
+    direction = "BEARISH";
+    tradeType = "SHORT";
+    confidence = "HIGH";
+    reason =
+      "Death cross on moving averages with bearish breakdown momentum.";
+  } else if (smaShort > smaLong && priceChange > 0) {
+    direction = "BULLISH";
+    tradeType = "LONG";
+    confidence = "HIGH";
+    reason =
+      "Golden cross on moving averages with bullish breakout momentum.";
   } else if (smaShort < smaLong) {
     direction = "BEARISH";
+    tradeType = "SHORT";
     confidence = "MEDIUM";
-    reason = "Short-term SMA below long-term SMA.";
-  } else {
-    reason = "No clear trend.";
-    confidence = "LOW";
-  }
-  if (rsi > 80) {
-    direction = "BEARISH";
-    confidence = "HIGH";
-    reason = "RSI overbought.";
-  } else if (rsi < 20) {
+    reason = "Short-term SMA trading below long-term trendline.";
+  } else if (smaShort > smaLong) {
     direction = "BULLISH";
-    confidence = "HIGH";
-    reason = "RSI oversold.";
+    tradeType = "LONG";
+    confidence = "MEDIUM";
+    reason = "Short-term SMA trading above long-term trendline.";
+  } else if (priceChange < 0) {
+    direction = "BEARISH";
+    tradeType = "SHORT";
+    confidence = "MEDIUM";
+    reason = "Negative 24h price trend with increasing selling pressure.";
+  } else {
+    direction = "BULLISH";
+    tradeType = "LONG";
+    confidence = "MEDIUM";
+    reason = "Positive 24h price trend with steady buyer interest.";
   }
-  return { direction, confidence, reason };
+
+  return { direction, tradeType, confidence, reason };
 }
 
 /* =======================================================
@@ -839,30 +954,35 @@ async function callGeneration(
           {
             role: "user",
             content: `
-You are a successful retail crypto trader sharing your personal trade experience on Binance Square.
+You are an experienced, high-conviction retail crypto trader sharing your real-time trade execution on Binance Square.
 
-Your goal is to create a highly persuasive, authentic-looking post that encourages readers to take action.
+Your goal is to create an authentic, persuasive, high-engagement trade setup post that clearly outlines either a LONG or a SHORT position.
 
 ABSOLUTE RULES:
 
-- **Start with a unique, attention‑grabbing line** – never repeat the same opener. Examples:
-  "If you don't buy $[TICKER] now, you will regret it in 24 hours."
-  "Thank me later – this coin is about to explode."
-  "The next 10x is here. Don't sleep on $[TICKER]."
-  "I've been watching this one for weeks – now is the time."
-  "Buy $[TICKER] or you'll wish you had."
-- **State a clear prediction**: "I'm going LONG" / "SHORT" / "HOLD".
-- **Give a specific price target** (e.g., "I see $0.05 in the next week").
-- **Mention the current price** and a short reason (technical breakout, catalyst, momentum).
-- **End with a question** to encourage comments (e.g., "Who's buying with me?").
-- **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about the given coin.
-- **Include 3-4 relevant hashtags** at the end (e.g., #PEPE #Memecoin #Breakout). Do NOT use generic ones like #Crypto or #Profit unless they are truly relevant to the post.
+- **Direction & Prediction**: State clearly whether you are going **LONG** or **SHORT** based on the provided trade setup.
+- **Start with a unique, punchy opening line**:
+  - FOR LONG SETUPS:
+    "Massive breakout forming on $[TICKER] – going LONG."
+    "Bulls are stepping in heavy on $[TICKER]. Next leg up incoming."
+    "Clean support bounce on $[TICKER] – loading my LONG position here."
+    "Accumulation phase complete on $[TICKER]. Don't sleep on this move."
+    "Thank me later – $[TICKER] is preparing for an explosive move up."
+  - FOR SHORT SETUPS:
+    "Rejection confirmed on $[TICKER] – opening a high-conviction SHORT."
+    "Bears are taking full control of $[TICKER]. Major breakdown in progress."
+    "I'm shorting $[TICKER] right now. Key support just broke down."
+    "Bulls are exhausted on $[TICKER] – taking a heavy SHORT position."
+    "Warning: $[TICKER] is facing massive sell pressure. Going SHORT with targets below."
+- **Exact Prices**: Use the **EXACT** Current Price, Target Price, and Stop Loss provided in the context. Do NOT invent or alter prices.
+- **Trade Details**: Mention the current entry price, the target price (higher for LONG, lower for SHORT), stop-loss level, and a concise technical reason (e.g. RSI, moving average crossover/breakdown, resistance rejection, support break).
+- **End with an engaging question** for the community (e.g., "Are you shorting this with me or catching the knife?", "Who's riding this long breakout with me?").
+- **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about the given coin $[TICKER].
+- **Include 3-4 relevant hashtags** at the end (e.g., #PEPE #CryptoTrading #ShortSetup #BinanceSquare).
 - **DO NOT** use generic disclaimers like "not financial advice".
-- **Topic field:** Must be one of: "bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto". If the coin is not one of the first five, use "crypto". Always pick one of these exact strings.
-- Use short, punchy sentences.
-- Make each post unique by varying the structure and wording.
-
-TARGET LENGTH: 150-300 characters.
+- **Topic field:** Must be one of: "bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto". If the coin is not one of the first five, use "crypto".
+- Use short, punchy, confident sentences.
+- TARGET LENGTH: 160-350 characters.
 
 CONTEXT:
 
@@ -870,7 +990,7 @@ ${prompt}
 `,
           },
         ],
-        temperature: 0.9,
+        temperature: 0.85,
         max_completion_tokens: maxTokens,
         reasoning_effort: "low",
         reasoning_format: "hidden",
@@ -954,38 +1074,76 @@ function normalizeGeneratedPost(post) {
 // No ensureHashtags function.
 
 /* =======================================================
-   FALLBACK POST – uses random coin, not BTC
+   FALLBACK POST – supports both LONG and SHORT
 ======================================================= */
 
 function buildFallbackPost(selectedTopic, fallbackCoin, marketData = null) {
-  const tick = fallbackCoin; // already a symbol like "ATOM"
-  const price = marketData?.lastPrice;
-  const priceText = Number.isFinite(price)
-    ? `$${price.toFixed(4)}`
-    : "current levels";
-  const targetMultiplier = 1.15 + Math.random() * 0.15;
-  const targetPrice = Number.isFinite(price) ? price * targetMultiplier : null;
-  const targetText = targetPrice ? `$${targetPrice.toFixed(4)}` : "higher";
+  const tick = fallbackCoin;
+  const isShort =
+    marketData?.tradeType === "SHORT" ||
+    marketData?.signal?.direction === "BEARISH" ||
+    Math.random() < 0.5;
 
-  const openers = [
-    `If you don't buy $${tick} now, you will regret it in 24 hours.`,
-    `Thank me later – $${tick} is about to explode.`,
-    `The next 10x is here. Don't sleep on $${tick}.`,
-    `I've been watching $${tick} for weeks – now is the time.`,
-    `Buy $${tick} or you'll wish you had.`,
-  ];
-  const opener = openers[Math.floor(Math.random() * openers.length)];
-  const direction = Math.random() > 0.3 ? "LONG" : "HOLD";
-  const tags = [`#${tick}`, "#Crypto", "#Trade"].join(" ");
-  const content = `${opener} Current price: ${priceText}. I'm going **${direction}** with a target of ${targetText}. Momentum is building – who's with me?\n\n${tags}`;
+  const priceText = marketData?.formattedPrice || "market price";
+  const targetText =
+    marketData?.formattedTarget ||
+    (marketData?.lastPrice
+      ? formatCryptoPrice(
+          isShort
+            ? marketData.lastPrice * 0.88
+            : marketData.lastPrice * 1.14,
+        )
+      : "target");
+  const stopText =
+    marketData?.formattedStopLoss ||
+    (marketData?.lastPrice
+      ? formatCryptoPrice(
+          isShort
+            ? marketData.lastPrice * 1.05
+            : marketData.lastPrice * 0.95,
+        )
+      : "stop loss");
+
+  let opener, direction, signal, tags, content;
+
+  if (isShort) {
+    const shortOpeners = [
+      `Rejection confirmed on $${tick} – opening a high-conviction SHORT.`,
+      `Bears taking full control of $${tick}. Breakdown underway.`,
+      `I'm shorting $${tick} right now. Support just failed.`,
+      `Bulls exhausted on $${tick} – entering SHORT position.`,
+    ];
+    opener = shortOpeners[Math.floor(Math.random() * shortOpeners.length)];
+    direction = "SHORT";
+    signal = "BEARISH";
+    tags = [`#${tick}`, "#ShortSetup", "#CryptoTrading", "#BinanceSquare"].join(
+      " ",
+    );
+    content = `${opener} Current price: ${priceText}. I'm going **SHORT** with a target of ${targetText} and Stop Loss at ${stopText}. Selling pressure is accelerating – who's with me?\n\n${tags}`;
+  } else {
+    const longOpeners = [
+      `Massive breakout forming on $${tick} – going LONG.`,
+      `Bulls stepping in heavy on $${tick}. Next leg up incoming.`,
+      `Clean support bounce on $${tick} – loading LONG position here.`,
+      `Accumulation complete on $${tick}. Momentum is building fast.`,
+    ];
+    opener = longOpeners[Math.floor(Math.random() * longOpeners.length)];
+    direction = "LONG";
+    signal = "BULLISH";
+    tags = [`#${tick}`, "#Altcoins", "#CryptoTrading", "#BinanceSquare"].join(
+      " ",
+    );
+    content = `${opener} Current price: ${priceText}. I'm going **LONG** with a target of ${targetText} and Stop Loss at ${stopText}. Breakout momentum is active – who's riding this?\n\n${tags}`;
+  }
+
   return {
-    title: `$${tick} breakout?`,
+    title: `$${tick} ${direction} Setup`,
     topic: "crypto",
     content,
     qualityScore: 8,
     newsUsed: Boolean(selectedTopic),
     catalystConfidence: selectedTopic ? "LOW" : "NONE",
-    signal: direction === "LONG" ? "BULLISH" : "NEUTRAL",
+    signal,
     signalConfidence: "HIGH",
     skip: false,
     skipReason: "",
@@ -1016,7 +1174,7 @@ async function selectTopic(newsResearch) {
 }
 
 /* =======================================================
-   GENERATE POST – always uses a coin from LOW_PRICE_COINS
+   GENERATE POST – always uses coin and exact prices
 ======================================================= */
 
 async function generatePost(newsResearch, marketData) {
@@ -1031,7 +1189,7 @@ async function generatePost(newsResearch, marketData) {
     coinSymbol = getRandomCoin();
   }
 
-  console.log("\n🎯 [Binance] Selected topic:");
+  console.log("\n🎯 [Binance] Selected coin & topic:");
   if (selectedTopic) {
     console.log(`   📰 ${selectedTopic.title}`);
     console.log(
@@ -1039,9 +1197,8 @@ async function generatePost(newsResearch, marketData) {
         selectedTopic.fromDb ? "MongoDB trending store" : "live RSS"
       }`,
     );
-  } else {
-    console.log(`   💡 ${coinSymbol}`);
   }
+  console.log(`   🪙 Coin: $${coinSymbol}`);
 
   let researchBlock = "NO CURRENT WEB RESEARCH AVAILABLE.";
   if (selectedTopic) {
@@ -1055,13 +1212,29 @@ Source: ${selectedTopic.source || "Unknown"}
 
   let marketBlock = "NO MARKET DATA AVAILABLE.";
   if (marketData) {
-    const { symbol, baseAsset, lastPrice, priceChangePercent, signal } =
-      marketData;
+    const {
+      symbol,
+      baseAsset,
+      formattedPrice,
+      formattedTarget,
+      formattedStopLoss,
+      formattedHigh,
+      formattedLow,
+      priceChangePercent,
+      signal,
+      tradeType,
+      rsi,
+    } = marketData;
     marketBlock = `
 Coin: ${symbol} (${baseAsset})
-Price: $${lastPrice.toFixed(4)}
-24h Change: ${priceChangePercent}%
-Signal: ${signal.direction} (${signal.confidence}) - ${signal.reason}
+Trade Position: ${tradeType} (${signal.direction})
+Current Entry Price: ${formattedPrice}
+Target Price: ${formattedTarget}
+Stop Loss: ${formattedStopLoss}
+24h High: ${formattedHigh} | 24h Low: ${formattedLow}
+24h Price Change: ${priceChangePercent > 0 ? "+" : ""}${priceChangePercent}%
+Technical Indicators: RSI(14) = ${rsi.toFixed(1)}, Signal: ${signal.direction} (${signal.confidence})
+Technical Reason: ${signal.reason}
 `;
   }
 
@@ -1070,7 +1243,7 @@ CURRENT WEB RESEARCH:
 
 ${researchBlock}
 
-MARKET DATA:
+REAL-TIME MARKET DATA & TRADE SETUP:
 
 ${marketBlock}
 
@@ -1082,19 +1255,21 @@ ${recentPosts || "None"}
 
 TASK:
 
-Write a persuasive, urgent Binance Square post about the coin ${coinSymbol}.
+Write a persuasive, authentic, urgent Binance Square trade setup post for ${coinSymbol}.
 
-- Use the market data accurately if available.
-- Make the post sound like a real trader sharing a high‑conviction trade.
-- Be specific, urgent, and engaging.
+- Trade direction: ${marketData?.tradeType || "LONG"}.
+- Use the EXACT prices:
+  • Entry Price: ${marketData?.formattedPrice || "current levels"}
+  • Target Price: ${marketData?.formattedTarget || "target levels"}
+  • Stop Loss: ${marketData?.formattedStopLoss || "invalidation level"}
+- Explain the clear reasoning (breakout vs rejection, momentum, RSI, or catalyst).
+- Start with a unique, punchy opening line.
 - Do not include any disclaimer.
-- Include a clear prediction (LONG/SHORT/HOLD) and a price target.
-- Start with a unique opening line (do not repeat).
 - **Do NOT mention "Bitcoin", "BTC", or any other coin** – only talk about ${coinSymbol}.
-- **Include 3-4 relevant hashtags** at the end, unique to this coin and the message.
-- **Topic field:** Must be one of: "bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto". Use "crypto" if the coin doesn't fit the others.
+- **Include 3-4 relevant hashtags** at the end (e.g. #${coinSymbol} #Crypto #${marketData?.tradeType === "SHORT" ? "ShortSetup" : "Breakout"} #BinanceSquare).
+- **Topic field:** Must be one of: "bitcoin", "ethereum", "bnb", "solana", "xrp", "market", "crypto".
 
-The coin is ${coinSymbol}.
+Coin: ${coinSymbol}.
 `;
   try {
     const post = await callGeneration(prompt, GENERATION_MAX_TOKENS, 3);
@@ -1141,59 +1316,99 @@ function isDuplicate() {
 }
 
 /* =======================================================
-   IMAGE PROMPT – completely rewritten for accuracy
+   IMAGE PROMPT – direction-matched 3D crypto visuals
 ======================================================= */
 
 function buildImagePrompt(marketData, coinSymbol) {
-  // Ensure we have a valid coin symbol
-  const ticker = coinSymbol || "BTC";
+  const ticker = (coinSymbol || "BTC").toUpperCase();
+  const isShort =
+    marketData?.tradeType === "SHORT" ||
+    marketData?.signal?.direction === "BEARISH";
 
-  // Get price and target
-  let price, targetPrice;
-  if (marketData?.lastPrice) {
-    price = marketData.lastPrice;
-    // Target: 15-35% higher (matching the bullish signal)
-    const multiplier = 1.15 + Math.random() * 0.2;
-    targetPrice = price * multiplier;
+  if (isShort) {
+    return `Cinematic 3D render of a futuristic glowing ${ticker} cryptocurrency token in deep space, intense ruby crimson red neon lighting, holographic bearish red candlestick charts plunging downward in the background, sharp technical breakdown lines, high-tech cyber trading analytics terminal, dark obsidian background, 8k resolution, octane render, photorealistic, depth of field, dramatic cinematic lighting.`;
   } else {
-    // Generate realistic fallback based on coin type
-    const tickerUpper = ticker.toUpperCase();
-    if (["PEPE", "SHIB", "BONK", "FLOKI", "BABYDOGE"].includes(tickerUpper)) {
-      price = 0.00001 + Math.random() * 0.001;
-    } else if (["XRP", "ADA", "DOGE", "TRX", "XLM"].includes(tickerUpper)) {
-      price = 0.1 + Math.random() * 0.5;
-    } else {
-      price = 0.5 + Math.random() * 5;
-    }
-    targetPrice = price * (1.15 + Math.random() * 0.35);
+    return `Cinematic 3D render of a futuristic glowing ${ticker} cryptocurrency token in deep space, vibrant emerald green and electric cyan neon lighting, holographic bullish green candlestick charts climbing upward in the background, sharp technical breakout lines, high-tech cyber trading analytics terminal, sleek dark background, 8k resolution, octane render, photorealistic, depth of field, dramatic cinematic lighting.`;
   }
+}
 
-  const direction = marketData?.signal?.direction?.toLowerCase() || "bullish";
-  const arrow =
-    direction === "bullish" ? "▲" : direction === "bearish" ? "▼" : "◆";
+/* =======================================================
+   SHARP TRADE HUD OVERLAY – crisp, real market data
+======================================================= */
 
-  const formattedPrice = price.toFixed(6);
-  const formattedTarget = targetPrice.toFixed(6);
+async function overlayTradeHUD(imageBuffer, marketData, coinSymbol) {
+  try {
+    const meta = await sharp(imageBuffer).metadata();
+    const width = meta.width || 1024;
+    const height = meta.height || 1024;
 
-  return `
-Generate a **clean, 1:1 square image** (Instagram post size) for a crypto social media post.
+    const ticker = (coinSymbol || "CRYPTO").toUpperCase();
+    const isShort =
+      marketData?.tradeType === "SHORT" ||
+      marketData?.signal?.direction === "BEARISH";
 
-The image must be a **dark, minimalist card** with the following elements clearly visible and correctly spelled:
+    const badgeColor = isShort ? "#FF3B30" : "#00E676";
+    const badgeBg = isShort
+      ? "rgba(255, 59, 48, 0.25)"
+      : "rgba(0, 230, 118, 0.25)";
+    const badgeBorder = isShort ? "#FF3B30" : "#00E676";
+    const badgeText = isShort ? "🔴 SHORT SETUP" : "🟢 LONG SETUP";
 
-1. At the top, in large, bold neon-green font: **$${ticker}**
-2. In the center, a large green upward arrow: **${arrow}**
-3. Below the arrow, in white text: **Price: $${formattedPrice}**
-4. At the bottom, in smaller gray text: **Target: $${formattedTarget}**
+    const entry = marketData?.formattedPrice || "Market";
+    const target = marketData?.formattedTarget || "Target";
+    const stop = marketData?.formattedStopLoss || "Stop Loss";
 
-Background: a sleek dark gradient (dark blue to black) with subtle glow effects.
+    const svg = `
+    <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="cardGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#0a0e17" stop-opacity="0.94"/>
+          <stop offset="100%" stop-color="#141c2e" stop-opacity="0.90"/>
+        </linearGradient>
+        <linearGradient id="topGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" stop-color="#000000" stop-opacity="0.7"/>
+          <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
 
-**IMPORTANT:** 
-- The text must be **exact** – no typos, no wrong numbers.
-- Use a clean, professional style similar to a TradingView price card.
-- No extra text, no human faces, no wallet UI.
-- Aspect ratio: **1:1**.
-- Make the coin symbol prominent and easy to read.
-`;
+      <!-- Top bar shade -->
+      <rect x="0" y="0" width="${width}" height="180" fill="url(#topGrad)"/>
+
+      <!-- Top Header Pill -->
+      <g transform="translate(48, 48)">
+        <rect x="0" y="0" width="390" height="64" rx="32" fill="#0f172a" fill-opacity="0.88" stroke="#334155" stroke-width="2"/>
+        <text x="32" y="42" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="28" fill="#FFFFFF">$${ticker}</text>
+        <rect x="180" y="10" width="190" height="44" rx="22" fill="${badgeBg}" stroke="${badgeBorder}" stroke-width="2"/>
+        <text x="275" y="38" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="18" fill="${badgeColor}" text-anchor="middle">${badgeText}</text>
+      </g>
+
+      <!-- Bottom Info Card -->
+      <g transform="translate(48, ${height - 200})">
+        <rect x="0" y="0" width="${width - 96}" height="145" rx="24" fill="url(#cardGrad)" stroke="#334155" stroke-width="2"/>
+
+        <!-- Entry Column -->
+        <text x="40" y="46" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="16" fill="#94A3B8" letter-spacing="1">ENTRY</text>
+        <text x="40" y="92" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FFFFFF">${entry}</text>
+
+        <!-- Target Column -->
+        <text x="${(width - 96) * 0.37}" y="46" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="16" fill="${badgeColor}" letter-spacing="1">TARGET</text>
+        <text x="${(width - 96) * 0.37}" y="92" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="${badgeColor}">${target}</text>
+
+        <!-- Stop Loss Column -->
+        <text x="${(width - 96) * 0.70}" y="46" font-family="Arial, Helvetica, sans-serif" font-weight="bold" font-size="16" fill="#EF4444" letter-spacing="1">STOP LOSS</text>
+        <text x="${(width - 96) * 0.70}" y="92" font-family="Arial, Helvetica, sans-serif" font-weight="900" font-size="26" fill="#FCA5A5">${stop}</text>
+      </g>
+    </svg>
+    `;
+
+    return await sharp(imageBuffer)
+      .composite([{ input: Buffer.from(svg) }])
+      .png()
+      .toBuffer();
+  } catch (error) {
+    console.warn("⚠️ Sharp HUD overlay warning:", error.message);
+    return imageBuffer;
+  }
 }
 
 /* =======================================================
@@ -1248,7 +1463,12 @@ async function generateImageWithCloudflare(marketData, coinSymbol) {
     if (!imageBuffer || imageBuffer.length < 1000)
       throw new Error("Cloudflare returned an empty or invalid image.");
 
-    console.log("   ✅ Image generated.");
+    console.log("   ✅ AI 3D Image generated. Applying Trade HUD overlay...");
+    const finalBuffer = await overlayTradeHUD(
+      imageBuffer,
+      marketData,
+      coinSymbol,
+    );
 
     await fs.mkdir(GENERATED_IMAGE_DIR, { recursive: true });
     const timestamp = Date.now();
@@ -1257,10 +1477,10 @@ async function generateImageWithCloudflare(marketData, coinSymbol) {
       GENERATED_IMAGE_DIR,
       `coin-${timestamp}-${random}.png`,
     );
-    await fs.writeFile(imagePath, imageBuffer);
-    console.log(`   ✅ Image saved: ${imagePath}`);
+    await fs.writeFile(imagePath, finalBuffer);
+    console.log(`   ✅ Image saved with HUD: ${imagePath}`);
     console.log(
-      `   📦 Image size: ${(imageBuffer.length / 1024).toFixed(1)} KB`,
+      `   📦 Image size: ${(finalBuffer.length / 1024).toFixed(1)} KB`,
     );
     return imagePath;
   } catch (error) {
