@@ -5,37 +5,27 @@ import {
   runBinanceBot,
   getBinanceStatus,
   shutdownBinanceBot,
-  POST_TRIGGER_SECRET as BINANCE_POST_TRIGGER_SECRET,
+  POST_TRIGGER_SECRET,
 } from "./binance-bot.js";
-
-import {
-  runLinkedInBot,
-  getLinkedInStatus,
-  shutdownLinkedInBot,
-  getLinkedInAuthorizationUrl,
-  handleLinkedInAuthCallback,
-  POST_TRIGGER_SECRET as LINKEDIN_POST_TRIGGER_SECRET,
-} from "./linkedin-bot.js";
 
 dotenv.config();
 
 /*
 =========================================================
-COMBINED SERVER — ONE PROCESS, ONE PORT
+BINANCE SQUARE BOT SERVER
+=========================================================
+
+ONE PROCESS
+ONE PORT
+ONE BOT
 
 Routes:
 
-  GET  /                         -> combined health/status
-  GET  /health                   -> combined health/status
-  GET  /auth/linkedin            -> start LinkedIn OAuth
-  GET  /auth/linkedin/callback   -> finish LinkedIn OAuth
-  POST /post                     -> trigger Binance Square cycle
-  POST /linkedin/post            -> trigger LinkedIn cycle
+GET  /
+GET  /health
 
-Each bot keeps its own secret, its own MongoDB
-collections, its own state file, and its own posting
-logic exactly as before. This file only owns the HTTP
-server and routes requests to the right bot module.
+POST /post
+
 =========================================================
 */
 
@@ -43,65 +33,85 @@ const PORT = parsePositiveInteger(process.env.PORT, 3000);
 
 function parsePositiveInteger(value, fallback) {
   const number = Number(value);
-  if (Number.isInteger(number) && number > 0) return number;
+
+  if (Number.isInteger(number) && number > 0) {
+    return number;
+  }
+
   return fallback;
 }
 
 /* =======================================================
-   AUTH HELPERS
+   AUTH
 ======================================================= */
 
-function isAuthorized(req, secret) {
+function isAuthorized(req) {
   const authorization = req.headers.authorization;
-  if (typeof authorization !== "string" || !secret) return false;
-  return authorization === `Bearer ${secret}`;
+
+  if (typeof authorization !== "string" || !POST_TRIGGER_SECRET) {
+    return false;
+  }
+
+  return authorization === `Bearer ${POST_TRIGGER_SECRET}`;
 }
+
+/* =======================================================
+   REQUEST BODY
+======================================================= */
 
 async function readRequestBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
     let finished = false;
 
-    const finishReject = (error) => {
+    function rejectOnce(error) {
       if (finished) return;
+
       finished = true;
+
       reject(error);
-    };
-    const finishResolve = () => {
+    }
+
+    function resolveOnce() {
       if (finished) return;
+
       finished = true;
+
       resolve(body);
-    };
+    }
 
     req.on("data", (chunk) => {
       body += chunk.toString();
+
       if (body.length > 10000) {
-        finishReject(new Error("Request body too large."));
+        rejectOnce(new Error("Request body too large."));
+
         req.destroy();
       }
     });
-    req.on("end", finishResolve);
-    req.on("error", finishReject);
+
+    req.on("end", resolveOnce);
+
+    req.on("error", rejectOnce);
   });
 }
+
+/* =======================================================
+   RESPONSES
+======================================================= */
 
 function sendJSON(res, statusCode, data) {
   if (res.headersSent) return;
+
   res.writeHead(statusCode, {
     "Content-Type": "application/json; charset=utf-8",
+
     "Cache-Control": "no-store",
+
     "X-Content-Type-Options": "nosniff",
   });
-  res.end(JSON.stringify(data, null, 2));
-}
 
-function sendHTML(res, statusCode, html) {
-  if (res.headersSent) return;
-  res.writeHead(statusCode, {
-    "Content-Type": "text/html; charset=utf-8",
-    "Cache-Control": "no-store",
-  });
-  res.end(html);
+  res.end(JSON.stringify(data, null, 2));
 }
 
 /* =======================================================
@@ -109,76 +119,52 @@ function sendHTML(res, statusCode, html) {
 ======================================================= */
 
 let httpServer = null;
-let binanceCycleInFlight = false;
-let linkedinCycleInFlight = false;
+
+let cycleInFlight = false;
 
 async function startServer() {
   httpServer = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://${req.headers.host}`);
 
-      /* ---------------------------------------------
-         COMBINED HEALTH CHECK
-      --------------------------------------------- */
+      /* =========================================
+             HEALTH
+          ========================================= */
+
       if (
         req.method === "GET" &&
         (url.pathname === "/" || url.pathname === "/health")
       ) {
-        const [binance, linkedin] = await Promise.all([
-          Promise.resolve(getBinanceStatus()).catch((error) => ({
-            error: error.message,
-          })),
-          getLinkedInStatus().catch((error) => ({ error: error.message })),
-        ]);
-
         return sendJSON(res, 200, {
           status: "alive",
+
           uptime: process.uptime(),
-          binance,
-          linkedin,
+
+          binance: getBinanceStatus(),
         });
       }
 
-      /* ---------------------------------------------
-         LINKEDIN OAUTH START
-      --------------------------------------------- */
-      if (req.method === "GET" && url.pathname === "/auth/linkedin") {
-        const authUrl = getLinkedInAuthorizationUrl();
-        res.writeHead(302, { Location: authUrl });
-        return res.end();
-      }
+      /* =========================================
+             BINANCE POST
+          ========================================= */
 
-      /* ---------------------------------------------
-         LINKEDIN OAUTH CALLBACK
-      --------------------------------------------- */
-      if (req.method === "GET" && url.pathname === "/auth/linkedin/callback") {
-        const code = url.searchParams.get("code");
-        const state = url.searchParams.get("state");
-        const error = url.searchParams.get("error");
-
-        const { statusCode, html } = await handleLinkedInAuthCallback({
-          code,
-          state,
-          error,
-        });
-
-        return sendHTML(res, statusCode, html);
-      }
-
-      /* ---------------------------------------------
-         BINANCE TRIGGER
-      --------------------------------------------- */
       if (req.method === "POST" && url.pathname === "/post") {
-        console.log("\n📥 POST /post (Binance) trigger received.");
+        console.log("\n📥 POST /post trigger received.");
 
-        if (!isAuthorized(req, BINANCE_POST_TRIGGER_SECRET)) {
-          console.log("❌ Unauthorized Binance trigger.");
-          return sendJSON(res, 401, { success: false, error: "Unauthorized." });
+        if (!isAuthorized(req)) {
+          console.log("❌ Unauthorized trigger.");
+
+          return sendJSON(res, 401, {
+            success: false,
+
+            error: "Unauthorized.",
+          });
         }
 
-        if (binanceCycleInFlight) {
+        if (cycleInFlight) {
           return sendJSON(res, 409, {
             success: false,
+
             error: "A Binance post cycle is already running.",
           });
         }
@@ -186,86 +172,58 @@ async function startServer() {
         try {
           await readRequestBody(req);
         } catch (error) {
-          return sendJSON(res, 400, { success: false, error: error.message });
+          return sendJSON(res, 400, {
+            success: false,
+
+            error: error.message,
+          });
         }
 
-        binanceCycleInFlight = true;
+        cycleInFlight = true;
+
         try {
           const result = await runBinanceBot();
-          return sendJSON(res, result.success || result.skipped ? 200 : 500, {
-            ...result,
-          });
+
+          const statusCode = result.success || result.skipped ? 200 : 500;
+
+          return sendJSON(res, statusCode, result);
         } finally {
-          binanceCycleInFlight = false;
+          cycleInFlight = false;
         }
       }
 
-      /* ---------------------------------------------
-         LINKEDIN TRIGGER
-      --------------------------------------------- */
-      if (req.method === "POST" && url.pathname === "/linkedin/post") {
-        console.log("\n📥 POST /linkedin/post trigger received.");
+      /* =========================================
+             404
+          ========================================= */
 
-        if (!isAuthorized(req, LINKEDIN_POST_TRIGGER_SECRET)) {
-          console.log("❌ Unauthorized LinkedIn trigger.");
-          return sendJSON(res, 401, { success: false, error: "Unauthorized." });
-        }
-
-        if (linkedinCycleInFlight) {
-          return sendJSON(res, 409, {
-            success: false,
-            error: "A LinkedIn post cycle is already running.",
-          });
-        }
-
-        try {
-          await readRequestBody(req);
-        } catch (error) {
-          return sendJSON(res, 400, { success: false, error: error.message });
-        }
-
-        linkedinCycleInFlight = true;
-        try {
-          const result = await runLinkedInBot();
-          return sendJSON(res, result.success || result.skipped ? 200 : 500, {
-            ...result,
-          });
-        } finally {
-          linkedinCycleInFlight = false;
-        }
-      }
-
-      /* ---------------------------------------------
-         404
-      --------------------------------------------- */
       return sendJSON(res, 404, {
         success: false,
+
         error: "Route not found.",
-        availableRoutes: [
-          "GET /",
-          "GET /health",
-          "GET /auth/linkedin",
-          "GET /auth/linkedin/callback",
-          "POST /post",
-          "POST /linkedin/post",
-        ],
+
+        availableRoutes: ["GET /", "GET /health", "POST /post"],
       });
     } catch (error) {
-      console.error("❌ HTTP request error:", error?.stack || error);
+      console.error("❌ HTTP error:", error?.stack || error);
+
       if (!res.headersSent) {
         return sendJSON(res, 500, {
           success: false,
+
           error: "Internal server error.",
         });
       }
+
       res.end();
     }
   });
 
   await new Promise((resolve, reject) => {
     httpServer.once("error", reject);
+
     httpServer.listen(PORT, "0.0.0.0", () => {
-      console.log(`🟢 HTTP server running on port ${PORT}`);
+      console.log(`🟢 Binance server running on port ${PORT}`);
+
       resolve();
     });
   });
@@ -279,17 +237,20 @@ let shuttingDown = false;
 
 async function shutdown(signal) {
   if (shuttingDown) return;
+
   shuttingDown = true;
 
-  console.log(`\n🛑 ${signal} received. Shutting down both bots...`);
+  console.log(`\n🛑 ${signal} received.`);
 
-  await Promise.allSettled([shutdownBinanceBot(), shutdownLinkedInBot()]);
+  await shutdownBinanceBot();
 
   if (httpServer) {
     httpServer.close(() => {
       console.log("👋 HTTP server closed.");
+
       process.exit(0);
     });
+
     setTimeout(() => process.exit(0), 10000).unref();
   } else {
     process.exit(0);
@@ -297,29 +258,35 @@ async function shutdown(signal) {
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
+
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 /* =======================================================
-   STARTUP
+   START
 ======================================================= */
 
 async function start() {
   console.log(`
-╔══════════════════════════════════════════════════╗
-║      COMBINED BOT SERVER (Binance + LinkedIn)     ║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════╗
+║        BINANCE SQUARE AI BOT V11             ║
+║                                              ║
+║        24H MOMENTUM + NEWS ANALYSIS          ║
+╚══════════════════════════════════════════════╝
 `);
 
   await startServer();
 
-  console.log("\n🟢 Waiting for triggers.");
-  console.log("📡 POST /post            -> Binance Square");
-  console.log("📡 POST /linkedin/post   -> LinkedIn");
-  console.log("🔐 GET  /auth/linkedin   -> connect LinkedIn account");
-  console.log("💚 GET  /health          -> combined status for both bots");
+  console.log("\n🟢 Waiting for Binance triggers.");
+
+  console.log("📡 POST /post     -> Binance Square");
+
+  console.log("💚 GET  /health   -> Bot status");
 }
 
 start().catch(async (error) => {
   console.error("💥 Fatal startup error:", error?.stack || error);
+
+  await shutdownBinanceBot();
+
   process.exit(1);
 });
