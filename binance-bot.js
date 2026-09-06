@@ -1,3 +1,27 @@
+// ============================================================
+// BINANCE SQUARE AI BOT V11.1.0
+//
+// FIXES / IMPROVEMENTS:
+// - Removed broken Git merge-conflict markers
+// - Fixed undefined prompt variables
+// - Deterministic market-data-driven title
+// - Title format:
+//   "$COIN is X% bullish today — BUY, HOLD or SELL?"
+// - Honest title variations based on real 24h movement
+// - Beginner-friendly A2/simple English
+// - 500-900 character target for content
+// - Content starts with coin + 24h movement + BUY/HOLD/SELL
+// - AI cannot generate inline hashtags
+// - MAX 2 hashtags enforced everywhere
+// - Title stored separately in MongoDB
+// - Strong final hashtag sanitization
+// - Target/invalidation validation
+// - Safer Groq JSON normalization
+// - Safer Cloudflare image generation
+// - Daily post limit
+// - MongoDB history/state
+// ============================================================
+
 import Groq from "groq-sdk";
 import dotenv from "dotenv";
 import fs from "fs/promises";
@@ -5,67 +29,22 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { MongoClient } from "mongodb";
+import http from "http";
 
 dotenv.config();
 
-/*
-=========================================================
-BINANCE SQUARE AI BOT V11.0.0
-=========================================================
-
-STRATEGY
-
-1. Scan Binance USDT markets
-2. Find the strongest liquid coin over 24h
-3. Fetch coin-specific news
-4. Calculate:
-   - 24h momentum
-   - SMA 9
-   - SMA 21
-   - RSI 14
-5. Determine market bias
-6. Ask Groq to analyze the setup
-7. Generate:
-   - Strong title
-   - BUY / HOLD / SELL conclusion
-   - Evidence-based explanation
-   - Price target / invalidation
-   - Relevant hashtags
-8. Generate a high-impact trading graphic
-9. Publish to Binance Square
-10. Store result in MongoDB
-
-LinkedIn has been completely removed.
-=========================================================
-*/
+// ============================================================
+// PATHS
+// ============================================================
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-/* =======================================================
-   CONFIG
-======================================================= */
+const GENERATED_IMAGES_DIR = path.join(__dirname, "generated-images");
 
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const STATE_FILE = path.join(__dirname, "bot-state.json");
 
-const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
-
-const BINANCE_SQUARE_OPENAPI_KEY = process.env.BINANCE_SQUARE_OPENAPI_KEY;
-
-const POST_TRIGGER_SECRET = process.env.POST_TRIGGER_SECRET;
-
-const MONGODB_URI = process.env.MONGODB_URI;
-
-const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || "binance_square_bot";
-
-const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
-
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
-
-const CLOUDFLARE_IMAGE_MODEL =
-  process.env.CLOUDFLARE_IMAGE_MODEL || "@cf/black-forest-labs/flux-1-schnell";
-
-const GENERATED_IMAGE_DIR = path.join(__dirname, "generated-images");
+const BACKUP_STATE_FILE = path.join(__dirname, "bot-state.backup.json");
 
 const SQUARE_IMAGE_SCRIPT = path.join(
   __dirname,
@@ -76,1323 +55,1211 @@ const SQUARE_IMAGE_SCRIPT = path.join(
   "post-image.mjs",
 );
 
-const MAX_POSTS_PER_DAY = parsePositiveInteger(
-  process.env.MAX_POSTS_PER_DAY,
-  12,
-);
+// ============================================================
+// ENVIRONMENT
+// ============================================================
 
-const MAX_HISTORY = parsePositiveInteger(process.env.MAX_HISTORY, 200);
+const {
+  GROQ_API_KEY,
+  GROQ_MODEL = "openai/gpt-oss-120b",
 
-const REQUEST_TIMEOUT_MS = parsePositiveInteger(
-  process.env.REQUEST_TIMEOUT_MS,
-  30000,
-);
+  BINANCE_SQUARE_OPENAPI_KEY,
+  POST_TRIGGER_SECRET,
 
-const GENERATION_MAX_TOKENS = parsePositiveInteger(
-  process.env.GENERATION_MAX_TOKENS,
-  1800,
-);
+  MONGODB_URI,
+  MONGODB_DB_NAME = "binance-square-bot",
 
-const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
+  CLOUDFLARE_ACCOUNT_ID,
+  CLOUDFLARE_API_TOKEN,
+  CLOUDFLARE_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell",
 
-const BOT_TIMEZONE = process.env.BOT_TIMEZONE || "Asia/Karachi";
+  MAX_POSTS_PER_DAY = "8",
+  MAX_HISTORY = "100",
 
-const MIN_24H_VOLUME_USDT = Number(process.env.MIN_24H_VOLUME_USDT || 500000);
+  REQUEST_TIMEOUT_MS = "30000",
+  GENERATION_MAX_TOKENS = "1200",
 
-const MAX_SCAN_COINS = parsePositiveInteger(process.env.MAX_SCAN_COINS, 50);
+  DRY_RUN = "false",
 
-const NEWS_ITEMS = parsePositiveInteger(process.env.NEWS_ITEMS, 15);
+  BOT_TIMEZONE = "Asia/Karachi",
 
-const SMA_SHORT = 9;
-const SMA_LONG = 21;
-const RSI_PERIOD = 14;
+  MIN_24H_VOLUME_USDT = "1000000",
+  MAX_SCAN_COINS = "30",
 
-/* =======================================================
-   VALIDATION
-======================================================= */
+  NEWS_ITEMS = "5",
+} = process.env;
 
-if (!GROQ_API_KEY) throw new Error("GROQ_API_KEY is missing.");
+// ============================================================
+// VALIDATE ENVIRONMENT
+// ============================================================
 
-if (!BINANCE_SQUARE_OPENAPI_KEY)
-  throw new Error("BINANCE_SQUARE_OPENAPI_KEY is missing.");
+const REQUIRED_ENV = [
+  ["GROQ_API_KEY", GROQ_API_KEY],
+  ["BINANCE_SQUARE_OPENAPI_KEY", BINANCE_SQUARE_OPENAPI_KEY],
+  ["POST_TRIGGER_SECRET", POST_TRIGGER_SECRET],
+  ["MONGODB_URI", MONGODB_URI],
+];
 
-if (!POST_TRIGGER_SECRET) throw new Error("POST_TRIGGER_SECRET is missing.");
+for (const [name, value] of REQUIRED_ENV) {
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+}
 
-if (!MONGODB_URI) throw new Error("MONGODB_URI is missing.");
-
-if (!CLOUDFLARE_ACCOUNT_ID)
-  throw new Error("CLOUDFLARE_ACCOUNT_ID is missing.");
-
-if (!CLOUDFLARE_API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN is missing.");
+// ============================================================
+// CLIENTS
+// ============================================================
 
 const groq = new Groq({
   apiKey: GROQ_API_KEY,
 });
 
-/* =======================================================
-   HELPERS
-======================================================= */
-
-function parsePositiveInteger(value, fallback) {
-  const number = Number(value);
-
-  if (Number.isInteger(number) && number > 0) {
-    return number;
-  }
-
-  return fallback;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function shuffleArray(array) {
-  for (let i = array.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-
-    [array[i], array[j]] = [array[j], array[i]];
-  }
-
-  return array;
-}
-
-function clamp(value, min, max) {
-  return Math.min(Math.max(value, min), max);
-}
-
-/* =======================================================
-   MONGODB
-======================================================= */
-
 let mongoClient = null;
 let db = null;
 
-let postHistoryCollection = null;
-let newsCollection = null;
+// ============================================================
+// CONSTANTS
+// ============================================================
 
-let initialized = false;
+const BINANCE_API = "https://api.binance.com";
 
-async function connectMongo() {
-  if (mongoClient) return;
+// Technical indicators
+const SMA_SHORT = 9;
+const SMA_LONG = 21;
+const SMA_MEDIUM = 50;
+const RSI_PERIOD = 14;
 
-  mongoClient = new MongoClient(MONGODB_URI, {
-    maxPoolSize: 5,
+// Binance Square safety
+// IMPORTANT: keep this at 2.
+const MAX_HASHTAGS = 2;
+
+// Content target
+const MIN_CONTENT_CHARS = 500;
+const MAX_CONTENT_CHARS = 900;
+
+// ============================================================
+// STATE
+// ============================================================
+
+let state = {
+  postsToday: 0,
+  lastPostDate: null,
+  lastCoin: null,
+  lastPostAt: null,
+  totalPosts: 0,
+  totalFailures: 0,
+};
+
+// ============================================================
+// UTILITY
+// ============================================================
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
   });
-
-  await mongoClient.connect();
-
-  db = mongoClient.db(MONGODB_DB_NAME);
-
-  postHistoryCollection = db.collection("post_history");
-
-  newsCollection = db.collection("coin_news");
-
-  await postHistoryCollection.createIndex({
-    publishedAt: -1,
-  });
-
-  await newsCollection.createIndex({
-    fetchedAt: -1,
-  });
-
-  console.log("💾 [Binance] MongoDB connected.");
 }
 
-async function disconnectMongo() {
-  try {
-    if (mongoClient) {
-      await mongoClient.close();
-    }
-
-    mongoClient = null;
-    db = null;
-
-    postHistoryCollection = null;
-    newsCollection = null;
-
-    console.log("💾 [Binance] MongoDB disconnected.");
-  } catch (error) {
-    console.warn("⚠️ MongoDB close warning:", error.message);
-  }
+function now() {
+  return new Date();
 }
 
-/* =======================================================
-   STATE
-======================================================= */
-
-const STATE_FILE = path.join(__dirname, "bot-state.json");
-
-const STATE_BACKUP_FILE = path.join(__dirname, "bot-state.backup.json");
-
-function getLocalDate() {
-  const formatter = new Intl.DateTimeFormat("en-CA", {
+function getDateKey() {
+  return new Intl.DateTimeFormat("en-CA", {
     timeZone: BOT_TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-
-  return formatter.format(new Date());
+  }).format(new Date());
 }
 
-function createDefaultState() {
-  return {
-    date: getLocalDate(),
-    postsToday: 0,
-    totalPosts: 0,
-    totalFailures: 0,
-    totalSkipped: 0,
-    lastPostAt: null,
-    lastTriggerAt: null,
-    lastTriggerResult: null,
-    history: [],
-  };
+function safeNumber(value, fallback = 0) {
+  const number = Number(value);
+
+  return Number.isFinite(number) ? number : fallback;
 }
 
-let state = createDefaultState();
+function round(value, decimals = 4) {
+  const number = safeNumber(value, 0);
 
-function normalizeState() {
-  if (typeof state.date !== "string") {
-    state.date = getLocalDate();
-  }
+  const multiplier = 10 ** decimals;
 
-  if (!Number.isFinite(state.postsToday)) {
-    state.postsToday = 0;
-  }
-
-  if (!Number.isFinite(state.totalPosts)) {
-    state.totalPosts = 0;
-  }
-
-  if (!Number.isFinite(state.totalFailures)) {
-    state.totalFailures = 0;
-  }
-
-  if (!Number.isFinite(state.totalSkipped)) {
-    state.totalSkipped = 0;
-  }
-
-  if (!Array.isArray(state.history)) {
-    state.history = [];
-  }
-
-  if (state.history.length > MAX_HISTORY) {
-    state.history = state.history.slice(-MAX_HISTORY);
-  }
+  return Math.round(number * multiplier) / multiplier;
 }
 
-let stateSaveRunning = Promise.resolve();
+function formatPercent(value) {
+  const number = safeNumber(value);
 
-async function saveState() {
-  stateSaveRunning = stateSaveRunning
-    .catch(() => {})
-    .then(async () => {
-      const tempFile = `${STATE_FILE}.tmp`;
+  const absolute = Math.abs(number);
 
-      await fs.writeFile(tempFile, JSON.stringify(state, null, 2), "utf8");
+  if (absolute >= 100) {
+    return number.toFixed(0);
+  }
 
-      try {
-        await fs.copyFile(STATE_FILE, STATE_BACKUP_FILE);
-      } catch {}
+  if (absolute >= 10) {
+    return number.toFixed(1);
+  }
 
-      await fs.rename(tempFile, STATE_FILE);
-    });
-
-  return stateSaveRunning;
+  return number.toFixed(2);
 }
 
-async function loadState() {
-  let loaded = false;
+function formatPrice(price) {
+  const number = safeNumber(price);
 
-  try {
-    const raw = await fs.readFile(STATE_FILE, "utf8");
-
-    const parsed = JSON.parse(raw);
-
-    if (parsed && typeof parsed === "object") {
-      state = {
-        ...createDefaultState(),
-        ...parsed,
-      };
-
-      loaded = true;
-
-      console.log("💾 State loaded.");
-    }
-  } catch {
-    console.warn("⚠️ Primary state unavailable.");
+  if (number >= 1000) {
+    return number.toFixed(0);
   }
 
-  if (!loaded) {
-    try {
-      const raw = await fs.readFile(STATE_BACKUP_FILE, "utf8");
-
-      const parsed = JSON.parse(raw);
-
-      if (parsed && typeof parsed === "object") {
-        state = {
-          ...createDefaultState(),
-          ...parsed,
-        };
-
-        loaded = true;
-
-        console.log("♻️ Backup state restored.");
-      }
-    } catch {
-      console.log("ℹ️ No existing state.");
-    }
+  if (number >= 100) {
+    return number.toFixed(2);
   }
 
-  normalizeState();
-
-  const today = getLocalDate();
-
-  if (state.date !== today) {
-    state.date = today;
-    state.postsToday = 0;
+  if (number >= 1) {
+    return number.toFixed(3);
   }
 
-  if (!loaded) {
-    await saveState();
+  if (number >= 0.1) {
+    return number.toFixed(4);
   }
+
+  if (number >= 0.01) {
+    return number.toFixed(5);
+  }
+
+  return number.toFixed(8);
 }
 
-/* =======================================================
-   FETCH
-======================================================= */
+// ============================================================
+// HTTP FETCH WITH TIMEOUT
+// ============================================================
 
 async function fetchWithTimeout(
   url,
   options = {},
-  timeout = REQUEST_TIMEOUT_MS,
+  timeout = Number(REQUEST_TIMEOUT_MS),
 ) {
   const controller = new AbortController();
 
-  const timer = setTimeout(() => controller.abort(), timeout);
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, timeout);
 
   try {
-    return await fetch(url, {
+    const response = await fetch(url, {
       ...options,
       signal: controller.signal,
     });
+
+    return response;
   } finally {
     clearTimeout(timer);
   }
 }
 
-/* =======================================================
-   MARKET DATA
-======================================================= */
+// ============================================================
+// STATE MANAGEMENT
+// ============================================================
 
-/*
-Find the strongest liquid coin in the
-last 24 hours.
+async function loadState() {
+  try {
+    const raw = await fs.readFile(STATE_FILE, "utf8");
 
-We don't simply pick a random coin.
+    const parsed = JSON.parse(raw);
 
-Ranking considers:
+    state = {
+      ...state,
+      ...parsed,
+    };
 
-- 24h percentage gain
-- trading volume
-- liquidity
-- recent momentum
-*/
-
-async function getBest24hCoin() {
-  console.log("\n📊 Scanning Binance 24h market...");
-
-  const response = await fetchWithTimeout(
-    "https://api.binance.com/api/v3/ticker/24hr",
-    {},
-    15000,
-  );
-
-  if (!response.ok) {
-    throw new Error(`Binance ticker HTTP ${response.status}`);
+    console.log("📂 State loaded.");
+  } catch {
+    console.log("📂 No existing state found. Starting fresh.");
   }
 
-  const tickers = await response.json();
+  const today = getDateKey();
 
-  const stablecoins = new Set([
-    "USDCUSDT",
-    "FDUSDUSDT",
-    "TUSDUSDT",
-    "DAIUSDT",
-    "USDPUSDT",
-    "BUSDUSDT",
-  ]);
+  if (state.lastPostDate !== today) {
+    state.postsToday = 0;
+    state.lastPostDate = today;
+
+    await saveState();
+  }
+}
+
+async function saveState() {
+  try {
+    await fs.writeFile(
+      BACKUP_STATE_FILE,
+      JSON.stringify(state, null, 2),
+      "utf8",
+    );
+
+    await fs.writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch (error) {
+    console.error("⚠️ Failed to save state:", error.message);
+  }
+}
+
+// ============================================================
+// MONGODB
+// ============================================================
+
+async function connectMongo() {
+  try {
+    mongoClient = new MongoClient(MONGODB_URI);
+
+    await mongoClient.connect();
+
+    db = mongoClient.db(MONGODB_DB_NAME);
+
+    console.log(`🍃 MongoDB connected: ${MONGODB_DB_NAME}`);
+  } catch (error) {
+    console.error("⚠️ MongoDB connection failed:", error.message);
+
+    db = null;
+  }
+}
+
+async function saveHistory(record) {
+  if (!db) return;
+
+  try {
+    await db.collection("post_history").insertOne({
+      ...record,
+      createdAt: new Date(),
+    });
+
+    // Keep recent history only.
+    const maxHistory = Number(MAX_HISTORY);
+
+    const count = await db.collection("post_history").countDocuments();
+
+    if (count > maxHistory) {
+      const excess = count - maxHistory;
+
+      const oldRecords = await db
+        .collection("post_history")
+        .find({})
+        .sort({
+          createdAt: 1,
+        })
+        .limit(excess)
+        .project({
+          _id: 1,
+        })
+        .toArray();
+
+      if (oldRecords.length) {
+        await db.collection("post_history").deleteMany({
+          _id: {
+            $in: oldRecords.map((item) => item._id),
+          },
+        });
+      }
+    }
+  } catch (error) {
+    console.error("⚠️ Mongo history save failed:", error.message);
+  }
+}
+
+async function saveNews(coin, news) {
+  if (!db || !news?.length) {
+    return;
+  }
+
+  try {
+    await db.collection("coin_news").updateOne(
+      {
+        coin,
+      },
+      {
+        $set: {
+          coin,
+          news,
+          updatedAt: new Date(),
+        },
+      },
+      {
+        upsert: true,
+      },
+    );
+  } catch (error) {
+    console.error("⚠️ Mongo news save failed:", error.message);
+  }
+}
+
+// ============================================================
+// BINANCE MARKET DATA
+// ============================================================
+
+async function fetch24hTickers() {
+  const url = `${BINANCE_API}/api/v3/ticker/24hr`;
+
+  const response = await fetchWithTimeout(url);
+
+  if (!response.ok) {
+    throw new Error(`Binance ticker API failed: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function fetchKlines(symbol) {
+  const url =
+    `${BINANCE_API}/api/v3/klines` +
+    `?symbol=${encodeURIComponent(symbol)}` +
+    `&interval=1h` +
+    `&limit=100`;
+
+  const response = await fetchWithTimeout(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `Binance klines API failed for ${symbol}: ${response.status}`,
+    );
+  }
+
+  return response.json();
+}
+
+// ============================================================
+// SELECT STRONGEST COIN
+// ============================================================
+
+async function selectStrongestCoin() {
+  console.log("🔎 Scanning Binance USDT markets...");
+
+  const tickers = await fetch24hTickers();
+
+  const minVolume = Number(MIN_24H_VOLUME_USDT);
 
   const candidates = tickers
     .filter((ticker) => {
-      if (!ticker.symbol.endsWith("USDT")) {
-        return false;
-      }
+      const symbol = String(ticker.symbol || "").toUpperCase();
 
-      if (stablecoins.has(ticker.symbol)) {
-        return false;
-      }
+      const priceChange = safeNumber(ticker.priceChangePercent);
 
-      const volume = Number(ticker.quoteVolume);
-
-      const change = Number(ticker.priceChangePercent);
-
-      const price = Number(ticker.lastPrice);
+      const volume = safeNumber(ticker.quoteVolume);
 
       return (
-        Number.isFinite(volume) &&
-        Number.isFinite(change) &&
-        Number.isFinite(price) &&
-        volume >= MIN_24H_VOLUME_USDT
+        symbol.endsWith("USDT") &&
+        !symbol.includes("UPUSDT") &&
+        !symbol.includes("DOWNUSDT") &&
+        !symbol.includes("BULLUSDT") &&
+        !symbol.includes("BEARUSDT") &&
+        volume >= minVolume &&
+        priceChange > 0
       );
     })
     .sort(
-      (a, b) => Number(b.priceChangePercent) - Number(a.priceChangePercent),
-    );
+      (a, b) =>
+        safeNumber(b.priceChangePercent) - safeNumber(a.priceChangePercent),
+    )
+    .slice(0, Number(MAX_SCAN_COINS));
 
   if (!candidates.length) {
-    throw new Error("No liquid USDT markets found.");
+    throw new Error("No suitable Binance USDT market found.");
   }
 
-  /*
-  Avoid extremely illiquid/obscure
-  pumps dominating the selection.
+  const selected = candidates[0];
 
-  First take top candidates by
-  percentage gain, then rank them
-  using volume + momentum.
-  */
+  const coin = selected.symbol.replace(/USDT$/i, "");
 
-  const topCandidates = candidates.slice(0, MAX_SCAN_COINS);
-
-  const scored = topCandidates.map((ticker) => {
-    const change = Number(ticker.priceChangePercent);
-
-    const volume = Number(ticker.quoteVolume);
-
-    const volumeScore = Math.log10(Math.max(volume, 1));
-
-    const momentumScore = clamp(change, -100, 100);
-
-    const score = momentumScore * 3 + volumeScore;
-
-    return {
-      ticker,
-      score,
-    };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-
-  const selected = scored[0].ticker;
-
-  const symbol = selected.symbol;
-
-  const baseAsset = symbol.replace("USDT", "");
-
-  console.log(`🔥 BEST 24H COIN: ${symbol}`);
-
-  console.log(`📈 24h: ${selected.priceChangePercent}%`);
-
-  console.log(`💰 Volume: $${Number(selected.quoteVolume).toLocaleString()}`);
-
-  const marketData = await enrichMarketData(selected);
-
-  return {
-    ...marketData,
-    baseAsset,
-  };
-}
-
-/* =======================================================
-   KLINES + INDICATORS
-======================================================= */
-
-async function enrichMarketData(ticker) {
-  const symbol = ticker.symbol;
-
-  const response = await fetchWithTimeout(
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1h&limit=100`,
-    {},
-    15000,
+  console.log(
+    `🏆 Selected ${coin} | ` +
+      `24h: ${formatPercent(selected.priceChangePercent)}% | ` +
+      `Volume: $${Number(selected.quoteVolume).toLocaleString()}`,
   );
 
-  if (!response.ok) {
-    throw new Error(`Klines HTTP ${response.status}`);
-  }
-
-  const klines = await response.json();
-
-  const closes = klines.map((candle) => Number(candle[4]));
-
-  const smaShort = movingAverage(closes, SMA_SHORT);
-
-  const smaLong = movingAverage(closes, SMA_LONG);
-
-  const rsi = computeRSI(closes, RSI_PERIOD);
-
-  const lastPrice = Number(ticker.lastPrice);
-
-  const change = Number(ticker.priceChangePercent);
-
-  const currentSMA9 = smaShort.at(-1);
-
-  const currentSMA21 = smaLong.at(-1);
-
-  const currentRSI = rsi.at(-1);
-
-  const signal = generateSignal({
-    price: lastPrice,
-    change,
-    sma9: currentSMA9,
-    sma21: currentSMA21,
-    rsi: currentRSI,
-  });
-
   return {
-    symbol,
-    lastPrice,
-    priceChangePercent: change,
-    volume: Number(ticker.quoteVolume),
-    high: Number(ticker.highPrice),
-    low: Number(ticker.lowPrice),
-    sma9: currentSMA9,
-    sma21: currentSMA21,
-    rsi: currentRSI,
-    signal,
+    symbol: selected.symbol,
+    coin,
+    price: safeNumber(selected.lastPrice),
+    priceChange24h: safeNumber(selected.priceChangePercent),
+    volume24h: safeNumber(selected.quoteVolume),
   };
 }
 
-function movingAverage(data, period) {
-  const result = [];
+// ============================================================
+// TECHNICAL INDICATORS
+// ============================================================
 
-  for (let i = 0; i < data.length; i++) {
-    if (i < period - 1) {
-      result.push(null);
-      continue;
-    }
-
-    const slice = data.slice(i - period + 1, i + 1);
-
-    const sum = slice.reduce((a, b) => a + b, 0);
-
-    result.push(sum / period);
+function calculateSMA(values, period) {
+  if (values.length < period) {
+    return null;
   }
 
-  return result;
+  const slice = values.slice(-period);
+
+  const sum = slice.reduce((total, value) => total + value, 0);
+
+  return sum / period;
 }
 
-function computeRSI(data, period = 14) {
-  if (data.length < period + 1) {
-    return data.map(() => 50);
+function calculateRSI(values, period = RSI_PERIOD) {
+  if (values.length <= period) {
+    return null;
   }
 
-  const gains = [];
-  const losses = [];
+  let gains = 0;
+  let losses = 0;
 
-  for (let i = 1; i < data.length; i++) {
-    const difference = data[i] - data[i - 1];
+  for (let i = 1; i <= period; i++) {
+    const difference = values[i] - values[i - 1];
 
-    gains.push(difference > 0 ? difference : 0);
-
-    losses.push(difference < 0 ? Math.abs(difference) : 0);
-  }
-
-  const averageGain = movingAverage(gains, period);
-
-  const averageLoss = movingAverage(losses, period);
-
-  const result = [];
-
-  for (let i = 0; i < averageGain.length; i++) {
-    if (averageGain[i] === null || averageLoss[i] === null) {
-      result.push(50);
-      continue;
+    if (difference >= 0) {
+      gains += difference;
+    } else {
+      losses += Math.abs(difference);
     }
-
-    if (averageLoss[i] === 0) {
-      result.push(100);
-      continue;
-    }
-
-    const rs = averageGain[i] / averageLoss[i];
-
-    result.push(100 - 100 / (1 + rs));
   }
 
-  while (result.length < data.length) {
-    result.unshift(50);
+  let averageGain = gains / period;
+
+  let averageLoss = losses / period;
+
+  for (let i = period + 1; i < values.length; i++) {
+    const difference = values[i] - values[i - 1];
+
+    const gain = difference > 0 ? difference : 0;
+
+    const loss = difference < 0 ? Math.abs(difference) : 0;
+
+    averageGain = (averageGain * (period - 1) + gain) / period;
+
+    averageLoss = (averageLoss * (period - 1) + loss) / period;
   }
 
-  return result;
+  if (averageLoss === 0) {
+    return 100;
+  }
+
+  const rs = averageGain / averageLoss;
+
+  return 100 - 100 / (1 + rs);
 }
 
-/* =======================================================
-   SIGNAL
-======================================================= */
+async function calculateIndicators(symbol) {
+  console.log(`📊 Calculating indicators for ${symbol}...`);
 
-function generateSignal({ price, change, sma9, sma21, rsi }) {
-  let bullishPoints = 0;
-  let bearishPoints = 0;
+  const klines = await fetchKlines(symbol);
 
-  const reasons = [];
+  const closes = klines.map((candle) => safeNumber(candle[4]));
 
-  if (sma9 > sma21) {
-    bullishPoints++;
-    reasons.push("SMA 9 is above SMA 21");
-  } else {
-    bearishPoints++;
-    reasons.push("SMA 9 is below SMA 21");
+  const currentPrice = closes[closes.length - 1];
+
+  const sma9 = calculateSMA(closes, SMA_SHORT);
+
+  const sma21 = calculateSMA(closes, SMA_LONG);
+
+  const sma50 = calculateSMA(closes, SMA_MEDIUM);
+
+  const rsi = calculateRSI(closes, RSI_PERIOD);
+
+  let trend = "MIXED";
+
+  if (sma9 !== null && sma21 !== null && sma50 !== null) {
+    if (currentPrice > sma9 && sma9 > sma21 && sma21 > sma50) {
+      trend = "BULLISH";
+    } else if (currentPrice < sma9 && sma9 < sma21 && sma21 < sma50) {
+      trend = "BEARISH";
+    }
   }
 
-  if (change > 0) {
-    bullishPoints++;
-    reasons.push("24h momentum is positive");
-  } else {
-    bearishPoints++;
-    reasons.push("24h momentum is negative");
-  }
-
-  if (rsi >= 50 && rsi <= 70) {
-    bullishPoints++;
-    reasons.push(
-      "RSI shows positive momentum without extreme overbought conditions",
-    );
-  }
-
-  if (rsi > 75) {
-    bearishPoints++;
-    reasons.push("RSI is elevated and warns of overextension");
-  }
-
-  if (rsi < 30) {
-    bullishPoints++;
-    reasons.push("RSI indicates oversold conditions");
-  }
-
-  let direction = "NEUTRAL";
-
-  if (bullishPoints >= bearishPoints + 2) {
-    direction = "BULLISH";
-  } else if (bearishPoints >= bullishPoints + 2) {
-    direction = "BEARISH";
-  }
-
-  let confidence = "LOW";
-
-  const difference = Math.abs(bullishPoints - bearishPoints);
-
-  if (difference >= 3) {
-    confidence = "HIGH";
-  } else if (difference >= 2) {
-    confidence = "MEDIUM";
-  }
-
-  let action = "HOLD";
-
-  if (direction === "BULLISH" && confidence !== "LOW") {
-    action = "BUY";
-  }
-
-  if (direction === "BEARISH" && confidence !== "LOW") {
-    action = "SELL";
-  }
+  console.log(
+    `SMA9=${round(sma9, 6)} | ` +
+      `SMA21=${round(sma21, 6)} | ` +
+      `SMA50=${round(sma50, 6)} | ` +
+      `RSI=${round(rsi, 2)} | ` +
+      `Trend=${trend}`,
+  );
 
   return {
-    direction,
-    confidence,
-    action,
-    reasons,
-    price,
-    change,
-    rsi,
+    currentPrice,
     sma9,
     sma21,
+    sma50,
+    rsi,
+    trend,
   };
 }
 
-/* =======================================================
-   COIN-SPECIFIC NEWS
-======================================================= */
+// ============================================================
+// GOOGLE NEWS
+// ============================================================
 
-async function researchCoinNews(coin) {
-  console.log(`\n🌐 Searching news specifically for ${coin}...`);
+function stripHtml(text) {
+  return String(text || "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+}
 
-  const query = `"${coin}" crypto OR cryptocurrency OR token`;
+async function fetchCoinNews(coin) {
+  console.log(`📰 Fetching news for ${coin}...`);
+
+  const query = encodeURIComponent(`"${coin}" crypto OR cryptocurrency`);
 
   const url =
-    "https://news.google.com/rss/search?q=" +
-    encodeURIComponent(query) +
-    "&hl=en-US&gl=US&ceid=US:en";
+    `https://news.google.com/rss/search?` +
+    `q=${query}&hl=en-US&gl=US&ceid=US:en`;
 
   try {
-    const response = await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0 BinanceSquareAI/11.0",
-          Accept: "application/rss+xml, application/xml, text/xml",
-        },
-      },
-      15000,
-    );
+    const response = await fetchWithTimeout(url);
 
     if (!response.ok) {
-      throw new Error(`Google News HTTP ${response.status}`);
+      console.log("⚠️ Google News unavailable.");
+
+      return [];
     }
 
     const xml = await response.text();
 
-    const matches = [...xml.matchAll(/<item\b[^>]*>([\s\S]*?)<\/item>/gi)];
+    const items = [...xml.matchAll(/<item>([\s\S]*?)<\/item>/gi)];
 
-    const news = [];
+    const news = items
+      .slice(0, Number(NEWS_ITEMS))
+      .map((match) => {
+        const item = match[1];
 
-    for (const match of matches.slice(0, NEWS_ITEMS)) {
-      const item = match[1];
+        const title = item.match(/<title>([\s\S]*?)<\/title>/i)?.[1] || "";
 
-      const title = getXmlTag(item, "title");
+        const link = item.match(/<link>([\s\S]*?)<\/link>/i)?.[1] || "";
 
-      const description = getXmlTag(item, "description");
+        const pubDate =
+          item.match(/<pubDate>([\s\S]*?)<\/pubDate>/i)?.[1] || "";
 
-      const publishedAt = getXmlTag(item, "pubDate");
+        return {
+          title: stripHtml(title),
+          link: link.trim(),
+          pubDate: pubDate.trim(),
+        };
+      })
+      .filter((item) => item.title);
 
-      const source = getXmlTag(item, "source");
+    console.log(`📰 Found ${news.length} news items.`);
 
-      if (!title) continue;
-
-      news.push({
-        title: title.slice(0, 300),
-        description: description.slice(0, 700),
-        publishedAt: publishedAt.slice(0, 100),
-        source: source.slice(0, 150),
-      });
-    }
-
-    shuffleArray(news);
-
-    if (newsCollection && news.length) {
-      await newsCollection.insertMany(
-        news.map((item) => ({
-          coin,
-          ...item,
-          fetchedAt: new Date(),
-        })),
-        {
-          ordered: false,
-        },
-      );
-    }
-
-    console.log(`   📰 ${news.length} news items found.`);
+    await saveNews(coin, news);
 
     return news;
   } catch (error) {
-    console.warn(`⚠️ News research failed: ${error.message}`);
+    console.error("⚠️ News fetch failed:", error.message);
 
     return [];
   }
 }
 
-function decodeXml(value) {
-  return String(value || "")
-    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;/gi, "'")
-    .replace(/&#39;/gi, "'");
+// ============================================================
+// HASHTAG SANITIZATION
+// ============================================================
+
+function sanitizeHashtags(hashtags, coin) {
+  const fallback = [`#${coin}`, "#CryptoAnalysis"];
+
+  if (!Array.isArray(hashtags)) {
+    return fallback;
+  }
+
+  const cleaned = hashtags
+    .map((tag) => String(tag || "").trim())
+    .map((tag) => {
+      if (tag && !tag.startsWith("#")) {
+        return `#${tag}`;
+      }
+
+      return tag;
+    })
+    .filter((tag) => /^#[A-Za-z0-9_]+$/.test(tag));
+
+  const unique = [...new Set(cleaned)];
+
+  if (!unique.length) {
+    return fallback;
+  }
+
+  return unique.slice(0, MAX_HASHTAGS);
 }
 
-function stripHtml(value) {
-  return String(value || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
+// ============================================================
+// REMOVE INLINE HASHTAGS
+// ============================================================
+
+function removeInlineHashtags(content) {
+  if (!content) {
+    return "";
+  }
+
+  return String(content)
+    .replace(/(^|\s)#[A-Za-z0-9_]+/g, "$1")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-function getXmlTag(xml, tag) {
-  const regex = new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i");
+// ============================================================
+// TITLE GENERATOR
+//
+// IMPORTANT:
+// The title is generated locally from REAL market data.
+// This prevents Groq from changing the percentage,
+// coin name, or BUY/HOLD/SELL wording.
+// ============================================================
 
-  const match = xml.match(regex);
+function generateTitle(market) {
+  const coin = market.coin;
 
-  if (!match) return "";
+  const change = safeNumber(market.priceChange24h);
 
-  return decodeXml(stripHtml(match[1])).trim();
+  const percentage = formatPercent(change);
+
+  // Strong positive move
+  if (change >= 10) {
+    return `🚨 $${coin} IS ${percentage}% BULLISH TODAY — BUY, HOLD OR SELL?`;
+  }
+
+  // Moderate positive move
+  if (change > 1) {
+    return `📈 $${coin} IS ${percentage}% UP TODAY — BUY, HOLD OR SELL?`;
+  }
+
+  // Nearly flat
+  if (change >= -1 && change <= 1) {
+    return `⚠️ $${coin} IS AT A CRITICAL LEVEL — BUY, HOLD OR SELL?`;
+  }
+
+  // Negative move
+  return `🔻 $${coin} IS ${percentage}% DOWN TODAY — BUY, HOLD OR SELL?`;
 }
 
-/* =======================================================
-   GROQ SCHEMA
-======================================================= */
+// ============================================================
+// CONTENT OPENING GENERATOR
+//
+// Gives Groq a guaranteed structure for the first lines.
+// ============================================================
 
-const POST_SCHEMA = {
-  type: "object",
+function generateOpening(market) {
+  const coin = market.coin;
 
-  properties: {
-    title: {
-      type: "string",
-    },
+  const change = safeNumber(market.priceChange24h);
 
-    content: {
-      type: "string",
-    },
+  const percentage = formatPercent(Math.abs(change));
 
-    action: {
-      type: "string",
-      enum: ["BUY", "HOLD", "SELL"],
-    },
+  if (change > 1) {
+    return `$${coin} is ${percentage}% up today. The big question is simple: BUY, HOLD or SELL?`;
+  }
 
-    direction: {
-      type: "string",
-      enum: ["BULLISH", "BEARISH", "NEUTRAL"],
-    },
+  if (change < -1) {
+    return `$${coin} is ${percentage}% down today. The big question is simple: BUY, HOLD or SELL?`;
+  }
 
-    confidence: {
-      type: "string",
-      enum: ["LOW", "MEDIUM", "HIGH"],
-    },
+  return `$${coin} is moving around a key level today. The big question is simple: BUY, HOLD or SELL?`;
+}
 
-    qualityScore: {
-      type: "number",
-    },
+// ============================================================
+// FINAL CONTENT BUILDER
+// ============================================================
 
-    targetPrice: {
-      type: "number",
-    },
+function buildFinalContent(title, content, hashtags, coin) {
+  const cleanTitle = String(title || "")
+    .replace(/#[A-Za-z0-9_]+/g, "")
+    .trim();
 
-    invalidationPrice: {
-      type: "number",
-    },
+  const cleanContent = removeInlineHashtags(content);
 
-    newsUsed: {
-      type: "boolean",
-    },
+  const safeHashtags = sanitizeHashtags(hashtags, coin);
 
-    hashtags: {
-      type: "array",
-      items: {
-        type: "string",
-      },
-    },
-  },
+  return (
+    `${cleanTitle}\n\n` +
+    `${cleanContent}\n\n` +
+    `${safeHashtags.join(" ")}`
+  ).trim();
+}
 
-  required: [
-    "title",
-    "content",
-    "action",
-    "direction",
-    "confidence",
-    "qualityScore",
-    "targetPrice",
-    "invalidationPrice",
-    "newsUsed",
-    "hashtags",
-  ],
+// ============================================================
+// GROQ POST GENERATION
+// ============================================================
 
-  additionalProperties: false,
-};
+async function generatePost({ market, indicators, news }) {
+  console.log("🤖 Generating AI market analysis...");
 
-/* =======================================================
-   GROQ GENERATION
-======================================================= */
+  const title = generateTitle(market);
 
-async function generatePost(marketData, news) {
-  const coin = marketData.symbol.replace("USDT", "");
+  const opening = generateOpening(market);
 
-  const newsBlock = news.length
-    ? news
-        .slice(0, 8)
-        .map(
-          (item, index) => `${index + 1}. ${item.title}\n${item.description}`,
-        )
-        .join("\n\n")
-    : "No reliable recent news was found.";
-
-  const marketBlock = `
-COIN: ${coin}
-
-CURRENT PRICE:
-$${marketData.lastPrice}
-
-24H CHANGE:
-${marketData.priceChangePercent}%
-
-24H HIGH:
-$${marketData.high}
-
-24H LOW:
-$${marketData.low}
-
-24H VOLUME:
-$${marketData.volume}
-
-SMA 9:
-${marketData.sma9}
-
-SMA 21:
-${marketData.sma21}
-
-RSI 14:
-${marketData.rsi}
-
-TECHNICAL SIGNAL:
-${marketData.signal.direction}
-
-SIGNAL CONFIDENCE:
-${marketData.signal.confidence}
-
-PRELIMINARY ACTION:
-${marketData.signal.action}
-
-SIGNAL REASONS:
-${marketData.signal.reasons.join("; ")}
-`;
+  const newsText = news.length
+    ? news.map((item, index) => `${index + 1}. ${item.title}`).join("\n")
+    : "No recent reliable news available.";
 
   const prompt = `
-You are an experienced crypto market analyst writing for Binance Square.
+You are an expert crypto market analyst writing a Binance Square post.
 
-Your job is to analyze ONE coin using the provided real market data and recent news.
+The reader is a normal crypto user, not a professional trader.
 
-Do not fabricate news.
+Your job is to explain the market clearly using simple English.
 
-Do not invent prices.
+============================================================
+MARKET DATA
+============================================================
 
-Do not claim certainty.
+COIN:
+${market.coin}
 
-Do not promise profit.
+SYMBOL:
+${market.symbol}
 
-Do not use fake urgency such as:
-"buy now or regret it"
-"guaranteed"
-"100% going up"
-"can't lose"
+CURRENT PRICE:
+$${formatPrice(market.price)}
 
-The post should nevertheless be highly engaging, confident and easy to understand.
+24H CHANGE:
+${formatPercent(market.priceChange24h)}%
+
+24H VOLUME:
+$${Number(market.volume24h).toLocaleString()}
+
+============================================================
+TECHNICAL DATA
+============================================================
+
+SMA 9:
+${formatPrice(indicators.sma9)}
+
+SMA 21:
+${formatPrice(indicators.sma21)}
+
+SMA 50:
+${formatPrice(indicators.sma50)}
+
+RSI:
+${round(indicators.rsi, 2)}
+
+TREND:
+${indicators.trend}
+
+============================================================
+REQUIRED TITLE
+============================================================
+
+The title has already been generated from real market data.
 
 TITLE:
+${title}
 
-The title is extremely important.
+Do NOT create another title.
 
-It must make the reader immediately want to open the post.
+Do NOT change the title.
 
-Use this style:
+============================================================
+REQUIRED FIRST LINE IDEA
+============================================================
 
-"$${coin} is ${marketData.priceChangePercent}% bullish today — BUY, HOLD or SELL?"
+The post must begin with this idea:
 
-However, adapt the wording honestly to the market direction.
-
-If the 24H change is strongly positive:
-
-"🚨 $${coin} IS ${marketData.priceChangePercent}% BULLISH TODAY — BUY, HOLD OR SELL?"
-
-If the 24H change is moderately positive:
-
-"📈 $${coin} IS ${marketData.priceChangePercent}% UP TODAY — BUY, HOLD OR SELL?"
-
-If the 24H change is negative:
-
-"🔻 $${coin} IS ${Math.abs(marketData.priceChangePercent)}% DOWN TODAY — BUY, HOLD OR SELL?"
-
-If the market is nearly flat:
-
-"⚠️ $${coin} IS AT A CRITICAL LEVEL — BUY, HOLD OR SELL?"
-
-The title must:
-
-- Mention the exact coin.
-- Mention the real 24H percentage when useful.
-- Ask BUY, HOLD or SELL.
-- Be short.
-- Be easy to understand.
-- Create curiosity without fake hype.
-- Never promise profit.
-- Never use "100%", "guaranteed", "can't lose", or similar claims.
-- Never exaggerate the market data.
-
-Do NOT make the title complicated.
-
-Use simple English that a beginner crypto user can understand immediately.
-
-CONTENT:
-
-Start the post with the same idea as the title.
+${opening}
 
 The first 1-2 lines must immediately tell the reader:
 
 1. Which coin we are discussing.
-2. How much it moved today.
+2. How much it moved today or that it is at a key level.
 3. The main question: BUY, HOLD or SELL?
+
+============================================================
+CONTENT STYLE
+============================================================
 
 Use very simple English.
 
-The English should be easy for a beginner to understand,
-but still sound professional.
+Aim for A2-B1 level English.
 
-Avoid complicated trading words unless they are explained simply.
+Write like:
 
-Explain:
+"An experienced trader explaining the market to a normal person."
 
-1. What happened in the last 24 hours.
-2. Why the coin may be moving.
-3. What SMA 9 and SMA 21 show.
-4. What RSI shows.
-5. What the latest relevant news says, if reliable news exists.
-6. What could happen next.
-7. What the reader should consider doing:
-   BUY, HOLD or SELL.
-8. Give a realistic target price.
-9. Give an invalidation price.
-10. End with a simple question that encourages comments.
+Do NOT sound like a textbook.
+
+Do NOT use complicated English.
+
+Do NOT use unnecessary technical jargon.
+
+If you use a trading term, explain it simply.
 
 Use short paragraphs.
 
-Use simple sentences.
+Keep the tone professional but easy to read.
 
-Make the post feel like:
-"An experienced trader explaining the market to a normal person."
-
-Do not sound like a textbook.
-
-Do not use difficult English.
-
-Do not use unnecessary technical jargon.
-
-Do not use fake urgency.
+Do not create fake urgency.
 
 Do not promise profit.
 
-Keep approximately 500-900 characters.
+Do not claim certainty.
 
-Use 3-5 relevant hashtags.
+Do not say:
+- guaranteed
+- guaranteed profit
+- can't lose
+- risk-free
+- 100% sure
+- easy money
 
-MARKET DATA:
+============================================================
+EXPLAIN THESE POINTS
+============================================================
 
-${marketBlock}
+1. What happened to ${market.coin} during the last 24 hours.
 
-RECENT NEWS:
+2. Why the coin may be moving.
 
-${newsBlock}
+3. What SMA 9 shows in simple language.
+
+4. What SMA 21 shows in simple language.
+
+5. What RSI shows.
+
+6. Explain whether RSI suggests:
+   - normal momentum
+   - strong momentum
+   - overbought
+   - oversold
+
+7. Mention the latest relevant news only if it appears useful and reliable.
+
+8. Explain what could happen next.
+
+9. Choose one action:
+   BUY
+   HOLD
+   SELL
+
+10. Give a realistic target price.
+
+11. Give an invalidation price.
+
+12. End with a simple question that encourages comments.
+
+============================================================
+TRADING LOGIC
+============================================================
+
+Do not choose BUY only because the coin is green.
+
+Do not choose SELL only because the coin is red.
+
+Consider together:
+
+- 24h movement
+- SMA 9
+- SMA 21
+- SMA 50
+- RSI
+- overall trend
+- recent news
+
+If the signals are mixed, HOLD is acceptable.
+
+Targets and invalidation levels must be realistic relative to the current price.
+
+Do not invent extreme targets.
+
+============================================================
+CONTENT LENGTH
+============================================================
+
+The body content should be approximately:
+
+500-900 characters.
+
+Do not make it extremely short.
+
+Do not make it unnecessarily long.
+
+============================================================
+HASHTAGS
+============================================================
+
+Return at most TWO hashtags.
+
+Do not put hashtags inside the content.
+
+Use relevant hashtags such as:
+
+#${market.coin}
+#CryptoAnalysis
+
+============================================================
+NEWS
+============================================================
+
+${newsText}
+
+============================================================
+OUTPUT
+============================================================
+
+Return ONLY valid JSON.
+
+Use exactly this structure:
+
+{
+  "content": "complete Binance Square body",
+  "action": "BUY | HOLD | SELL",
+  "targetPrice": 0,
+  "invalidationPrice": 0,
+  "confidence": "LOW | MEDIUM | HIGH",
+  "qualityScore": 0,
+  "hashtags": [
+    "#${market.coin}",
+    "#CryptoAnalysis"
+  ],
+  "newsUsed": true
+}
+
+IMPORTANT:
+
+- Do not include the title in content.
+- Do not create a title.
+- Do not use hashtags inside content.
+- Return at most 2 hashtags.
+- Use the real market data.
+- Never promise profit.
+- Never claim certainty.
 `;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      console.log(`🧠 Groq analysis ${attempt}/3...`);
+  const completion = await groq.chat.completions.create({
+    model: GROQ_MODEL,
 
-      const response = await groq.chat.completions.create({
-        model: GROQ_MODEL,
+    temperature: 0.65,
 
-        messages: [
-          {
-            role: "user",
-            content: prompt,
-          },
-        ],
+    max_tokens: Number(GENERATION_MAX_TOKENS),
 
-        temperature: 0.7,
+    response_format: {
+      type: "json_object",
+    },
 
-        max_completion_tokens: GENERATION_MAX_TOKENS,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are a professional crypto market analyst. Return only valid JSON. Use simple beginner-friendly English.",
+      },
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
 
-        reasoning_effort: "low",
+  const raw = completion.choices?.[0]?.message?.content;
 
-        reasoning_format: "hidden",
-
-        response_format: {
-          type: "json_schema",
-
-          json_schema: {
-            name: "binance_market_analysis",
-
-            strict: true,
-
-            schema: POST_SCHEMA,
-          },
-        },
-      });
-
-      const raw = response?.choices?.[0]?.message?.content;
-
-      if (!raw) {
-        throw new Error("Groq returned empty content.");
-      }
-
-      const parsed = JSON.parse(raw);
-
-      return normalizePost(parsed, marketData, coin);
-    } catch (error) {
-      console.warn(`⚠️ Groq attempt failed: ${error.message}`);
-
-      if (attempt === 3) {
-        throw error;
-      }
-
-      await sleep(attempt * 1500);
-    }
+  if (!raw) {
+    throw new Error("Groq returned empty response.");
   }
+
+  let parsed;
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    console.error("❌ Invalid Groq JSON:", raw);
+
+    throw new Error("Groq returned invalid JSON.");
+  }
+
+  return normalizePost(parsed, market, title);
 }
 
-/* =======================================================
-   NORMALIZE POST
-======================================================= */
+// ============================================================
+// NORMALIZE AI POST
+// ============================================================
 
-function normalizePost(post, marketData, coin) {
-  const target = Number(post.targetPrice);
+function normalizePost(post, market, title) {
+  const action = ["BUY", "HOLD", "SELL"].includes(
+    String(post.action || "").toUpperCase(),
+  )
+    ? String(post.action).toUpperCase()
+    : "HOLD";
 
-  const invalidation = Number(post.invalidationPrice);
+  const confidence = ["LOW", "MEDIUM", "HIGH"].includes(
+    String(post.confidence || "").toUpperCase(),
+  )
+    ? String(post.confidence).toUpperCase()
+    : "MEDIUM";
 
-  const normalized = {
-    title: String(post.title || `$${coin} — what to expect next?`)
-      .trim()
-      .slice(0, 150),
+  let content = String(post.content || "").trim();
 
-    content: String(post.content || "").trim(),
-
-    action: ["BUY", "HOLD", "SELL"].includes(post.action)
-      ? post.action
-      : marketData.signal.action,
-
-    direction: ["BULLISH", "BEARISH", "NEUTRAL"].includes(post.direction)
-      ? post.direction
-      : marketData.signal.direction,
-
-    confidence: ["LOW", "MEDIUM", "HIGH"].includes(post.confidence)
-      ? post.confidence
-      : "MEDIUM",
-
-    qualityScore: Number.isFinite(Number(post.qualityScore))
-      ? Number(post.qualityScore)
-      : 8,
-
-    targetPrice: Number.isFinite(target) ? target : marketData.lastPrice,
-
-    invalidationPrice: Number.isFinite(invalidation)
-      ? invalidation
-      : marketData.low,
-
-    newsUsed: Boolean(post.newsUsed),
-
-    hashtags: Array.isArray(post.hashtags)
-      ? post.hashtags.slice(0, 5).map((tag) => String(tag).trim())
-      : [`#${coin}`, "#MarketAnalysis", "#Trading"],
-  };
-
-  return normalized;
-}
-
-/* =======================================================
-   VALIDATION
-======================================================= */
-
-function validatePost(post, marketData) {
-  const reasons = [];
-
-  if (!post) {
-    reasons.push("empty post");
+  // Remove accidental title duplication.
+  if (content.toLowerCase().startsWith(title.toLowerCase())) {
+    content = content.slice(title.length).trim();
   }
 
-  if (!post.content || post.content.length < 100) {
-    reasons.push("post too short");
-  }
+  content = removeInlineHashtags(content);
 
-  if (post.content.length > 3000) {
-    reasons.push("post too long");
-  }
+  const hashtags = sanitizeHashtags(post.hashtags, market.coin);
 
-  const lower = post.content.toLowerCase();
+  let targetPrice = safeNumber(post.targetPrice);
 
-  const forbidden = [
-    "guaranteed profit",
-    "guaranteed return",
-    "risk free",
-    "zero risk",
-    "100% profit",
-    "can't lose",
-    "cannot lose",
-    "guaranteed gains",
-  ];
+  let invalidationPrice = safeNumber(post.invalidationPrice);
 
-  for (const phrase of forbidden) {
-    if (lower.includes(phrase)) {
-      reasons.push(`forbidden phrase: ${phrase}`);
+  // ----------------------------------------------------------
+  // Safety fallback for invalid AI prices
+  // ----------------------------------------------------------
+
+  const currentPrice = safeNumber(market.price);
+
+  if (targetPrice <= 0) {
+    if (action === "BUY") {
+      targetPrice = currentPrice * 1.08;
+    } else if (action === "SELL") {
+      targetPrice = currentPrice * 0.92;
+    } else {
+      targetPrice = currentPrice * 1.05;
     }
   }
 
-  const coin = marketData.symbol.replace("USDT", "");
-
-  /*
-  Prevent Groq accidentally
-  discussing unrelated coins.
-  */
-
-  const forbiddenCoins = [
-    "bitcoin",
-    "ethereum",
-    "solana",
-    "dogecoin",
-    "cardano",
-    "xrp",
-  ].filter((name) => name !== coin.toLowerCase());
-
-  for (const otherCoin of forbiddenCoins) {
-    if (lower.includes(otherCoin)) {
-      reasons.push(`unrelated coin mentioned: ${otherCoin}`);
+  if (invalidationPrice <= 0) {
+    if (action === "BUY") {
+      invalidationPrice = currentPrice * 0.95;
+    } else if (action === "SELL") {
+      invalidationPrice = currentPrice * 1.05;
+    } else {
+      invalidationPrice = currentPrice * 0.95;
     }
   }
 
   return {
-    valid: reasons.length === 0,
-    reasons,
+    title,
+
+    content,
+
+    action,
+
+    targetPrice: round(targetPrice, 8),
+
+    invalidationPrice: round(invalidationPrice, 8),
+
+    confidence,
+
+    qualityScore: Math.min(10, Math.max(0, safeNumber(post.qualityScore, 5))),
+
+    hashtags,
+
+    newsUsed: Boolean(post.newsUsed),
   };
 }
 
-/* =======================================================
-   IMAGE PROMPT
-======================================================= */
+// ============================================================
+// CONTENT VALIDATION
+// ============================================================
 
-function buildImagePrompt(marketData, post) {
-  const coin = marketData.symbol.replace("USDT", "");
+function validatePost(post) {
+  const warnings = [];
 
-  const direction = post.direction;
+  const contentLength = post.content.length;
 
-  const action = post.action;
+  if (contentLength < MIN_CONTENT_CHARS) {
+    warnings.push(`Content is shorter than ${MIN_CONTENT_CHARS} characters.`);
+  }
 
-  const arrow =
-    direction === "BULLISH"
-      ? "UPWARD"
-      : direction === "BEARISH"
-        ? "DOWNWARD"
-        : "SIDEWAYS";
+  if (contentLength > MAX_CONTENT_CHARS) {
+    warnings.push(`Content is longer than ${MAX_CONTENT_CHARS} characters.`);
+  }
 
-  /*
-  We intentionally make the
-  visual exciting and premium,
-  but not deceptive.
-  */
+  if (!post.title) {
+    warnings.push("Missing title.");
+  }
 
-  return `
-Create a premium 1:1 crypto trading
-social-media graphic.
+  if (!post.content) {
+    warnings.push("Missing content.");
+  }
 
-VISUAL STYLE:
+  if (!["BUY", "HOLD", "SELL"].includes(post.action)) {
+    warnings.push("Invalid action.");
+  }
 
-Dark luxury trading aesthetic.
+  if (post.hashtags.length > MAX_HASHTAGS) {
+    warnings.push("Too many hashtags.");
+  }
 
-Black and deep charcoal background.
+  if (post.targetPrice <= 0) {
+    warnings.push("Invalid target price.");
+  }
 
-High contrast neon financial-chart
-elements.
+  if (post.invalidationPrice <= 0) {
+    warnings.push("Invalid invalidation price.");
+  }
 
-Glowing candlestick chart.
+  return {
+    valid: warnings.length === 0,
 
-Strong directional momentum.
-
-Professional exchange-style interface.
-
-Cinematic lighting.
-
-Subtle metallic reflections.
-
-Powerful depth.
-
-Premium financial advertisement
-aesthetic.
-
-The visual should immediately
-communicate market movement and
-opportunity without making fake
-profit promises.
-
-MAIN COIN:
-
-$${coin}
-
-ACTION:
-
-${action}
-
-MARKET DIRECTION:
-
-${direction}
-
-CURRENT PRICE:
-
-$${marketData.lastPrice.toFixed(6)}
-
-24H CHANGE:
-
-${marketData.priceChangePercent.toFixed(2)}%
-
-RSI:
-
-${marketData.rsi.toFixed(1)}
-
-TARGET:
-
-$${Number(post.targetPrice).toFixed(6)}
-
-INVALIDATION:
-
-$${Number(post.invalidationPrice).toFixed(6)}
-
-COMPOSITION:
-
-Large $${coin} ticker at the top.
-
-Huge glowing market-direction
-visual in the center.
-
-Use a realistic candlestick chart
-behind the main information.
-
-Make the latest candles visually
-prominent.
-
-Show:
-
-$${coin}
-
-${action}
-
-24H ${marketData.priceChangePercent.toFixed(2)}%
-
-Target $${Number(post.targetPrice).toFixed(6)}
-
-Do not add random prices.
-
-Do not add random coins.
-
-Do not invent statistics.
-
-Do not show casino machines,
-slot machines, gambling tables,
-jackpots, fake money or luxury cars.
-
-Do not use human faces.
-
-Do not create fake Binance UI.
-
-Do not claim guaranteed profit.
-
-Make the graphic feel exciting,
-premium, modern and highly clickable.
-
-Square 1:1 composition.
-Minimal text.
-Perfect typography.
-No spelling errors.
-`;
+    warnings,
+  };
 }
 
-/* =======================================================
-   IMAGE GENERATION
-======================================================= */
+// ============================================================
+// IMAGE GENERATION
+// ============================================================
 
-async function generateImage(marketData, post) {
-  console.log("\n🎨 Generating trading graphic...");
+async function generateTradingGraphic({ market, indicators, post }) {
+  console.log("🎨 Generating trading graphic...");
 
-  const prompt = buildImagePrompt(marketData, post);
+  if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
+    throw new Error("Cloudflare credentials missing.");
+  }
 
-  const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${CLOUDFLARE_IMAGE_MODEL}`;
+  await fs.mkdir(GENERATED_IMAGES_DIR, {
+    recursive: true,
+  });
+
+  const imagePrompt = `
+Create a professional cryptocurrency trading graphic for Binance Square.
+
+Coin: ${market.coin}
+
+Current Price:
+$${formatPrice(market.price)}
+
+24h Change:
+${formatPercent(market.priceChange24h)}%
+
+Action:
+${post.action}
+
+Target:
+$${formatPrice(post.targetPrice)}
+
+Invalidation:
+$${formatPrice(post.invalidationPrice)}
+
+RSI:
+${round(indicators.rsi, 2)}
+
+Trend:
+${indicators.trend}
+
+Style:
+
+- premium financial news graphic
+- professional crypto trading analysis
+- modern trading terminal aesthetic
+- dark sophisticated background
+- large readable ${market.coin} ticker
+- current price clearly visible
+- realistic technical chart visual
+- clear bullish or bearish visual depending on action
+- professional financial presentation
+- clean composition
+- high contrast
+- no fake exchange logos
+- no fake Binance logo
+- no extra hashtags
+- no watermark
+- no unnecessary text
+- no fake statistics
+`;
+
+  const endpoint =
+    `https://api.cloudflare.com/client/v4/accounts/` +
+    `${CLOUDFLARE_ACCOUNT_ID}/ai/run/` +
+    `${CLOUDFLARE_IMAGE_MODEL}`;
 
   const response = await fetchWithTimeout(
     endpoint,
@@ -1406,293 +1273,196 @@ async function generateImage(marketData, post) {
       },
 
       body: JSON.stringify({
-        prompt,
+        prompt: imagePrompt,
       }),
     },
     120000,
   );
 
   if (!response.ok) {
-    const error = await response.text();
+    const errorText = await response.text();
 
-    throw new Error(`Cloudflare ${response.status}: ${error}`);
+    throw new Error(
+      `Cloudflare image API failed: ${response.status} ${errorText}`,
+    );
   }
 
   const contentType = response.headers.get("content-type") || "";
 
-  let imageBuffer;
+  const filename = `coin-${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 9)}.png`;
+
+  const imagePath = path.join(GENERATED_IMAGES_DIR, filename);
 
   if (contentType.includes("application/json")) {
     const json = await response.json();
 
-    let image =
-      json?.result?.image ||
-      json?.result?.output ||
-      json?.image ||
-      json?.output;
+    let imageBuffer;
 
-    if (Array.isArray(image)) {
-      image = image[0];
+    if (json.result?.image) {
+      imageBuffer = Buffer.from(json.result.image, "base64");
+    } else if (json.result?.image_base64) {
+      imageBuffer = Buffer.from(json.result.image_base64, "base64");
+    } else {
+      throw new Error("Cloudflare returned JSON but no image data.");
     }
 
-    if (typeof image !== "string") {
-      throw new Error("Cloudflare returned no image.");
-    }
-
-    image = image.replace(/^data:image\/[^;]+;base64,/i, "");
-
-    imageBuffer = Buffer.from(image, "base64");
+    await fs.writeFile(imagePath, imageBuffer);
   } else {
-    imageBuffer = Buffer.from(await response.arrayBuffer());
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    await fs.writeFile(imagePath, buffer);
   }
-
-  if (!imageBuffer || imageBuffer.length < 1000) {
-    throw new Error("Invalid generated image.");
-  }
-
-  await fs.mkdir(GENERATED_IMAGE_DIR, {
-    recursive: true,
-  });
-
-  const filename = `coin-${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2, 8)}.png`;
-
-  const imagePath = path.join(GENERATED_IMAGE_DIR, filename);
-
-  await fs.writeFile(imagePath, imageBuffer);
 
   console.log(`✅ Image saved: ${imagePath}`);
 
   return imagePath;
 }
 
-/* =======================================================
-   CLEANUP
-======================================================= */
+// ============================================================
+// PUBLISH TO BINANCE SQUARE
+// ============================================================
 
-async function cleanupImage(imagePath) {
-  if (!imagePath) return;
-
-  try {
-    await fs.unlink(imagePath);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.warn("⚠️ Image cleanup failed:", error.message);
-    }
-  }
-}
-
-/* =======================================================
-   PUBLISH
-======================================================= */
-
-function publishImage(content, imagePath) {
+function publishToBinanceSquare(content, imagePath, coin) {
   return new Promise((resolve, reject) => {
-    console.log("\n📡 Publishing to Binance Square...");
+    console.log("📡 Publishing to Binance Square...");
 
-    if (DRY_RUN) {
-      console.log("\n========== DRY RUN ==========\n");
+    // ------------------------------------------------------
+    // FINAL DEFENSIVE HASHTAG CLEANUP
+    // ------------------------------------------------------
 
-      console.log(content);
+    const cleanContent = removeInlineHashtags(content);
 
-      console.log("\nIMAGE:", imagePath);
+    // ------------------------------------------------------
+    // Remove ALL hashtags from content
+    // ------------------------------------------------------
 
-      console.log("\n==============================\n");
+    const contentWithoutHashtags = cleanContent
+      .replace(/(^|\s)#[A-Za-z0-9_]+/g, "$1")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim();
 
-      resolve({
-        success: true,
-        dryRun: true,
-        id: null,
-        link: null,
-      });
+    // ------------------------------------------------------
+    // ALWAYS use controlled hashtags.
+    //
+    // We don't trust AI hashtags at publication time.
+    // ------------------------------------------------------
 
-      return;
+    const safeHashtags = sanitizeHashtags(
+      [`#${coin}`, "#CryptoAnalysis"],
+      coin,
+    );
+
+    const finalContent =
+      `${contentWithoutHashtags}\n\n` + `${safeHashtags.join(" ")}`;
+
+    console.log("🏷️ Publishing with hashtags:", safeHashtags.join(" "));
+
+    console.log(`🏷️ Hashtag count: ${safeHashtags.length}`);
+
+    if (safeHashtags.length > MAX_HASHTAGS) {
+      return reject(
+        new Error("Internal safety check: hashtag limit exceeded."),
+      );
     }
 
-    fs.access(SQUARE_IMAGE_SCRIPT)
-      .then(() => {
-        const child = spawn(
-          "node",
-          [SQUARE_IMAGE_SCRIPT, "--text", content, "--images", imagePath],
-          {
-            cwd: path.join(__dirname, ".agents", "skills", "square-post"),
+    const args = [
+      SQUARE_IMAGE_SCRIPT,
 
-            env: {
-              ...process.env,
-              BINANCE_SQUARE_OPENAPI_KEY,
-            },
+      "--text",
+      finalContent,
 
-            shell: false,
+      "--images",
+      imagePath,
+    ];
 
-            windowsHide: true,
-          },
+    const child = spawn(process.execPath, args, {
+      cwd: path.dirname(SQUARE_IMAGE_SCRIPT),
+
+      env: {
+        ...process.env,
+
+        BINANCE_SQUARE_OPENAPI_KEY,
+      },
+
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (data) => {
+      const text = data.toString();
+
+      stdout += text;
+
+      process.stdout.write(text);
+    });
+
+    child.stderr.on("data", (data) => {
+      const text = data.toString();
+
+      stderr += text;
+
+      process.stderr.write(text);
+    });
+
+    child.on("error", (error) => {
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve({
+          success: true,
+          stdout,
+          stderr,
+          finalContent,
+          hashtags: safeHashtags,
+        });
+      } else {
+        reject(
+          new Error(
+            `Square publisher exited with code ${code}\n` +
+              `${stderr || stdout}`,
+          ),
         );
-
-        let stdout = "";
-        let stderr = "";
-        let settled = false;
-
-        const rejectOnce = (error) => {
-          if (settled) return;
-
-          settled = true;
-          reject(error);
-        };
-
-        const resolveOnce = (value) => {
-          if (settled) return;
-
-          settled = true;
-          resolve(value);
-        };
-
-        child.stdout.on("data", (data) => {
-          const text = data.toString();
-
-          stdout += text;
-
-          process.stdout.write(text);
-        });
-
-        child.stderr.on("data", (data) => {
-          const text = data.toString();
-
-          stderr += text;
-
-          process.stderr.write(text);
-        });
-
-        child.on("error", rejectOnce);
-
-        child.on("close", (code) => {
-          if (code !== 0) {
-            rejectOnce(
-              new Error(`Square publisher exited with code ${code}\n${stderr}`),
-            );
-
-            return;
-          }
-
-          const id = stdout.match(/ID:\s*(.+)/i)?.[1]?.trim() || null;
-
-          const link = stdout.match(/Link:\s*(.+)/i)?.[1]?.trim() || null;
-
-          resolveOnce({
-            success: true,
-            dryRun: false,
-            id,
-            link,
-            stdout,
-          });
-        });
-      })
-      .catch(reject);
+      }
+    });
   });
 }
 
-/* =======================================================
-   SAVE HISTORY
-======================================================= */
+// ============================================================
+// POST LIMIT
+// ============================================================
 
-async function savePost(post, marketData, news, result) {
-  state.history.push({
-    id: result?.id || null,
+function canPostToday() {
+  const today = getDateKey();
 
-    coin: marketData.symbol,
-
-    title: post.title,
-
-    text: post.content,
-
-    action: post.action,
-
-    direction: post.direction,
-
-    confidence: post.confidence,
-
-    qualityScore: post.qualityScore,
-
-    targetPrice: post.targetPrice,
-
-    invalidationPrice: post.invalidationPrice,
-
-    currentPrice: marketData.lastPrice,
-
-    priceChange24h: marketData.priceChangePercent,
-
-    rsi: marketData.rsi,
-
-    sma9: marketData.sma9,
-
-    sma21: marketData.sma21,
-
-    newsUsed: post.newsUsed,
-
-    newsCount: news.length,
-
-    publishedAt: new Date().toISOString(),
-
-    dryRun: Boolean(result?.dryRun),
-  });
-
-  if (state.history.length > MAX_HISTORY) {
-    state.history = state.history.slice(-MAX_HISTORY);
+  if (state.lastPostDate !== today) {
+    state.postsToday = 0;
+    state.lastPostDate = today;
   }
 
-  if (!result?.dryRun) {
-    state.postsToday++;
-    state.totalPosts++;
-    state.lastPostAt = new Date().toISOString();
-  }
-
-  await saveState();
-
-  if (postHistoryCollection) {
-    try {
-      await postHistoryCollection.insertOne({
-        ...state.history.at(-1),
-      });
-    } catch (error) {
-      console.warn("⚠️ History MongoDB save failed:", error.message);
-    }
-  }
+  return state.postsToday < Number(MAX_POSTS_PER_DAY);
 }
 
-/* =======================================================
-   MAIN CYCLE
-======================================================= */
-
-let cycleRunning = false;
+// ============================================================
+// MAIN BOT CYCLE
+// ============================================================
 
 async function runCycle() {
-  const today = getLocalDate();
+  console.log("\n============================================================");
 
-  if (state.date !== today) {
-    state.date = today;
-    state.postsToday = 0;
+  console.log("🚀 BINANCE SQUARE AI BOT CYCLE");
 
-    await saveState();
-  }
+  console.log("============================================================\n");
 
-  console.log("\n================================================");
-
-  console.log("🚀 BINANCE SQUARE AI BOT V11.0.0");
-
-  console.log("================================================");
-
-  console.log(
-    `🕐 ${new Date().toLocaleString("en-US", {
-      timeZone: BOT_TIMEZONE,
-    })}`,
-  );
-
-  console.log(`📅 Posts: ${state.postsToday}/${MAX_POSTS_PER_DAY}`);
-
-  if (state.postsToday >= MAX_POSTS_PER_DAY) {
-    state.totalSkipped++;
-
-    await saveState();
+  if (!canPostToday()) {
+    console.log(
+      `⛔ Daily post limit reached: ${state.postsToday}/${MAX_POSTS_PER_DAY}`,
+    );
 
     return {
       success: false,
@@ -1701,305 +1471,522 @@ async function runCycle() {
     };
   }
 
+  let market = null;
+  let indicators = null;
+  let news = [];
+  let post = null;
+  let imagePath = null;
+
   try {
-    /*
-    STEP 1
-    Find best 24h coin
-    */
+    // --------------------------------------------------------
+    // 1. SELECT COIN
+    // --------------------------------------------------------
 
-    const marketData = await getBest24hCoin();
+    market = await selectStrongestCoin();
 
-    const coin = marketData.symbol.replace("USDT", "");
+    // --------------------------------------------------------
+    // 2. TECHNICAL ANALYSIS
+    // --------------------------------------------------------
 
-    /*
-    STEP 2
-    Research that exact coin
-    */
+    indicators = await calculateIndicators(market.symbol);
 
-    const news = await researchCoinNews(coin);
+    // --------------------------------------------------------
+    // 3. NEWS
+    // --------------------------------------------------------
 
-    /*
-    STEP 3
-    AI analysis
-    */
+    news = await fetchCoinNews(market.coin);
 
-    const post = await generatePost(marketData, news);
+    // --------------------------------------------------------
+    // 4. AI POST
+    // --------------------------------------------------------
 
-    /*
-    STEP 4
-    Validate
-    */
+    post = await generatePost({
+      market,
+      indicators,
+      news,
+    });
 
-    const validation = validatePost(post, marketData);
+    // --------------------------------------------------------
+    // 5. VALIDATION
+    // --------------------------------------------------------
+
+    const validation = validatePost(post);
 
     if (!validation.valid) {
-      console.error("❌ Post rejected:");
+      console.log("⚠️ Content validation warnings:");
 
-      for (const reason of validation.reasons) {
-        console.error(` • ${reason}`);
+      for (const warning of validation.warnings) {
+        console.log(`   - ${warning}`);
       }
-
-      state.totalSkipped++;
-
-      await saveState();
-
-      return {
-        success: false,
-        skipped: true,
-        reason: "validation_failed",
-        validation: validation.reasons,
-      };
+    } else {
+      console.log("✅ Content validation passed.");
     }
 
-    /*
-    STEP 5
-    Show analysis
-    */
+    // --------------------------------------------------------
+    // 6. BUILD FINAL CONTENT
+    // --------------------------------------------------------
 
-    console.log("\n================ ANALYSIS ================");
+    const finalContent = buildFinalContent(
+      post.title,
+      post.content,
+      post.hashtags,
+      market.coin,
+    );
 
-    console.log(`🪙 Coin: ${coin}`);
+    console.log("\n📝 FINAL POST:");
 
-    console.log(`💵 Price: $${marketData.lastPrice}`);
+    console.log("------------------------------------------------------------");
 
-    console.log(`📈 24H: ${marketData.priceChangePercent}%`);
+    console.log(finalContent);
 
-    console.log(`📊 RSI: ${marketData.rsi.toFixed(2)}`);
+    console.log("------------------------------------------------------------");
 
-    console.log(`📈 SMA9: ${marketData.sma9}`);
+    console.log(`Title: ${post.title}`);
 
-    console.log(`📈 SMA21: ${marketData.sma21}`);
+    console.log(`Action: ${post.action}`);
 
-    console.log(`🎯 Direction: ${post.direction}`);
+    console.log(`Target Price: $${formatPrice(post.targetPrice)}`);
 
-    console.log(`🎯 Action: ${post.action}`);
+    console.log(`Invalidation Price: $${formatPrice(post.invalidationPrice)}`);
 
-    console.log(`⭐ Confidence: ${post.confidence}`);
+    console.log(`Confidence: ${post.confidence}`);
 
-    console.log(`🎯 Target: $${post.targetPrice}`);
+    console.log(`newsUsed: ${post.newsUsed}`);
 
-    console.log(`🛑 Invalidation: $${post.invalidationPrice}`);
+    console.log(`qualityScore: ${post.qualityScore}`);
 
-    console.log("\n📝 TITLE:");
+    console.log(`hashtags: ${post.hashtags.join(" ")}`);
 
-    console.log(post.title);
+    console.log(`Content chars: ${post.content.length}`);
 
-    console.log("\n📝 CONTENT:");
+    // --------------------------------------------------------
+    // 7. IMAGE
+    // --------------------------------------------------------
 
-    console.log(post.content);
+    imagePath = await generateTradingGraphic({
+      market,
+      indicators,
+      post,
+    });
 
-    /*
-    STEP 6
-    Generate image
-    */
+    // --------------------------------------------------------
+    // 8. DRY RUN
+    // --------------------------------------------------------
 
-    let imagePath = null;
+    if (String(DRY_RUN).toLowerCase() === "true") {
+      console.log("\n🧪 DRY_RUN enabled.");
 
-    try {
-      imagePath = await generateImage(marketData, post);
+      console.log("⏭️ Skipping Binance Square publication.");
 
-      /*
-      Add hashtags to final
-      */
+      await saveHistory({
+        success: true,
 
-      const hashtags = post.hashtags.join(" ");
+        dryRun: true,
 
-      const finalContent = `${post.content}\n\n${hashtags}`;
+        coin: market.coin,
 
-      /*
-      STEP 7
-      Publish
-      */
+        symbol: market.symbol,
 
-      const result = await publishImage(finalContent, imagePath);
+        title: post.title,
 
-      await savePost(post, marketData, news, result);
+        action: post.action,
 
-      console.log("\n╔══════════════════════════════════════╗");
+        targetPrice: post.targetPrice,
 
-      console.log("║       ✅ CYCLE COMPLETED             ║");
+        invalidationPrice: post.invalidationPrice,
 
-      console.log("╚══════════════════════════════════════╝");
+        confidence: post.confidence,
 
-      if (result.id) {
-        console.log(`🆔 ID: ${result.id}`);
-      }
+        qualityScore: post.qualityScore,
 
-      if (result.link) {
-        console.log(`🔗 ${result.link}`);
-      }
+        newsUsed: post.newsUsed,
+
+        content: finalContent,
+
+        hashtags: post.hashtags,
+
+        imagePath,
+      });
 
       return {
         success: true,
-        id: result.id || null,
-        link: result.link || null,
-        dryRun: Boolean(result.dryRun),
-        coin,
-        action: post.action,
-        direction: post.direction,
-        imageGenerated: true,
+        dryRun: true,
+        coin: market.coin,
+        title: post.title,
       };
-    } finally {
-      await cleanupImage(imagePath);
     }
-  } catch (error) {
-    state.totalFailures++;
+
+    // --------------------------------------------------------
+    // 9. PUBLISH
+    // --------------------------------------------------------
+
+    const publication = await publishToBinanceSquare(
+      finalContent,
+      imagePath,
+      market.coin,
+    );
+
+    // --------------------------------------------------------
+    // 10. UPDATE STATE
+    // --------------------------------------------------------
+
+    state.postsToday += 1;
+
+    state.totalPosts += 1;
+
+    state.lastCoin = market.coin;
+
+    state.lastPostAt = new Date().toISOString();
+
+    state.lastPostDate = getDateKey();
 
     await saveState();
+
+    // --------------------------------------------------------
+    // 11. SAVE HISTORY
+    // --------------------------------------------------------
+
+    await saveHistory({
+      success: true,
+
+      coin: market.coin,
+
+      symbol: market.symbol,
+
+      title: post.title,
+
+      action: post.action,
+
+      targetPrice: post.targetPrice,
+
+      invalidationPrice: post.invalidationPrice,
+
+      confidence: post.confidence,
+
+      qualityScore: post.qualityScore,
+
+      newsUsed: post.newsUsed,
+
+      hashtags: post.hashtags,
+
+      content: finalContent,
+
+      imagePath,
+
+      publication,
+    });
+
+    console.log(
+      "\n============================================================",
+    );
+
+    console.log("🎉 BINANCE SQUARE POST PUBLISHED SUCCESSFULLY");
+
+    console.log("============================================================");
+
+    return {
+      success: true,
+
+      coin: market.coin,
+
+      title: post.title,
+
+      action: post.action,
+
+      targetPrice: post.targetPrice,
+
+      invalidationPrice: post.invalidationPrice,
+
+      confidence: post.confidence,
+
+      hashtags: post.hashtags,
+    };
+  } catch (error) {
+    state.totalFailures += 1;
+
+    await saveState();
+
+    await saveHistory({
+      success: false,
+
+      coin: market?.coin || null,
+
+      symbol: market?.symbol || null,
+
+      title: post?.title || null,
+
+      error: error.message,
+
+      createdAt: new Date(),
+    });
 
     console.error("\n❌ Cycle failed:");
 
-    console.error(error?.stack || error?.message || error);
+    console.error(error);
 
     return {
       success: false,
-      error: error?.message || "Unknown error",
+
+      error: error.message,
     };
   }
 }
 
-/* =======================================================
-   SAFE RUN
-======================================================= */
+// ============================================================
+// HTTP SERVER
+// ============================================================
 
-async function safeRunCycle() {
-  if (cycleRunning) {
-    return {
+const PORT = Number(process.env.PORT) || 3000;
+
+const server = http.createServer(async (req, res) => {
+  // ------------------------------------------------------
+  // CORS
+  // ------------------------------------------------------
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Post-Secret",
+  );
+
+  // ------------------------------------------------------
+  // OPTIONS
+  // ------------------------------------------------------
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+
+    res.end();
+
+    return;
+  }
+
+  // ------------------------------------------------------
+  // GET /
+  // ------------------------------------------------------
+
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        success: true,
+
+        service: "Binance Square AI Bot",
+
+        version: "11.1.0",
+
+        status: "online",
+
+        postsToday: state.postsToday,
+
+        maxPostsPerDay: Number(MAX_POSTS_PER_DAY),
+
+        totalPosts: state.totalPosts,
+
+        totalFailures: state.totalFailures,
+
+        hashtagLimit: MAX_HASHTAGS,
+
+        timezone: BOT_TIMEZONE,
+
+        contentTarget: `${MIN_CONTENT_CHARS}-${MAX_CONTENT_CHARS} characters`,
+      }),
+    );
+
+    return;
+  }
+
+  // ------------------------------------------------------
+  // GET /health
+  // ------------------------------------------------------
+
+  if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        success: true,
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+      }),
+    );
+
+    return;
+  }
+
+  // ------------------------------------------------------
+  // POST /post
+  // POST /binance/post
+  // ------------------------------------------------------
+
+  if (
+    req.method === "POST" &&
+    (req.url === "/post" || req.url === "/binance/post")
+  ) {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", async () => {
+      try {
+        let parsed = {};
+
+        if (body.trim()) {
+          try {
+            parsed = JSON.parse(body);
+          } catch {
+            parsed = {};
+          }
+        }
+
+        const providedSecret =
+          req.headers["x-post-secret"] ||
+          req.headers["authorization"]?.replace(/^Bearer\s+/i, "") ||
+          parsed.secret;
+
+        if (providedSecret !== POST_TRIGGER_SECRET) {
+          res.writeHead(401, {
+            "Content-Type": "application/json",
+          });
+
+          res.end(
+            JSON.stringify({
+              success: false,
+
+              error: "Unauthorized",
+            }),
+          );
+
+          return;
+        }
+
+        const result = await runCycle();
+
+        res.writeHead(result.success ? 200 : 500, {
+          "Content-Type": "application/json",
+        });
+
+        res.end(JSON.stringify(result, null, 2));
+      } catch (error) {
+        res.writeHead(500, {
+          "Content-Type": "application/json",
+        });
+
+        res.end(
+          JSON.stringify({
+            success: false,
+
+            error: error.message,
+          }),
+        );
+      }
+    });
+
+    return;
+  }
+
+  // ------------------------------------------------------
+  // 404
+  // ------------------------------------------------------
+
+  res.writeHead(404, {
+    "Content-Type": "application/json",
+  });
+
+  res.end(
+    JSON.stringify({
       success: false,
-      error: "A Binance cycle is already running.",
-    };
-  }
+      error: "Not found",
+    }),
+  );
+});
 
-  cycleRunning = true;
+// ============================================================
+// STARTUP
+// ============================================================
 
-  try {
-    return await runCycle();
-  } finally {
-    cycleRunning = false;
-  }
-}
+async function start() {
+  console.log("\n============================================================");
 
-/* =======================================================
-   INITIALIZATION
-======================================================= */
+  console.log("🤖 BINANCE SQUARE AI BOT V11.1.0");
 
-async function initializeBinanceBot() {
-  if (initialized) return;
+  console.log("============================================================");
 
-  console.log("\n==============================================");
+  console.log(`🌎 Timezone: ${BOT_TIMEZONE}`);
 
-  console.log("🤖 INITIALIZING BINANCE BOT V11");
+  console.log(`🏷️ Max hashtags: ${MAX_HASHTAGS}`);
 
-  console.log("==============================================");
+  console.log(
+    `📝 Content target: ${MIN_CONTENT_CHARS}-${MAX_CONTENT_CHARS} chars`,
+  );
 
-  await connectMongo();
+  console.log(`🤖 Groq model: ${GROQ_MODEL}`);
 
-  await loadState();
-
-  console.log(`🧠 Groq: ${GROQ_MODEL}`);
-
-  console.log("📊 Strategy: Best 24H liquid performer");
-
-  console.log("🌐 Research: Coin-specific Google News");
-
-  console.log("📈 Indicators: SMA 9 / SMA 21 / RSI 14");
-
-  console.log("🎯 Decision: BUY / HOLD / SELL");
-
-  console.log("🎨 Image: Cloudflare Workers AI");
-
-  console.log(`🧪 Dry run: ${DRY_RUN ? "YES" : "NO"}`);
-
-  initialized = true;
-
-  console.log("✅ Binance bot initialized.");
-}
-
-async function runBinanceBot() {
-  await initializeBinanceBot();
-
-  return safeRunCycle();
-}
-
-/* =======================================================
-   STATUS
-======================================================= */
-
-function getBinanceStatus() {
-  const today = getLocalDate();
-
-  if (state.date !== today) {
-    state.date = today;
-    state.postsToday = 0;
-  }
-
-  return {
-    service: "binance-square-ai-bot",
-
-    version: "11.0.0",
-
-    timezone: BOT_TIMEZONE,
-
-    localDate: today,
-
-    postsToday: state.postsToday,
-
-    maxPostsPerDay: MAX_POSTS_PER_DAY,
-
-    totalPosts: state.totalPosts,
-
-    totalFailures: state.totalFailures,
-
-    totalSkipped: state.totalSkipped,
-
-    lastPostAt: state.lastPostAt,
-
-    lastTriggerAt: state.lastTriggerAt,
-
-    lastTriggerResult: state.lastTriggerResult,
-
-    cycleRunning,
-
-    dryRun: DRY_RUN,
-
-    mongoConnected: Boolean(mongoClient),
-
-    imageGeneration: "Cloudflare",
-
-    imageModel: CLOUDFLARE_IMAGE_MODEL,
-  };
-}
-
-/* =======================================================
-   SHUTDOWN
-======================================================= */
-
-async function shutdownBinanceBot() {
-  console.log("🛑 Shutting down Binance bot...");
+  console.log(`🎨 Cloudflare model: ${CLOUDFLARE_IMAGE_MODEL}`);
 
   try {
-    await saveState();
+    await loadState();
+
+    await connectMongo();
+
+    server.listen(PORT, () => {
+      console.log(`🌐 Server running on port ${PORT}`);
+
+      console.log(`📡 POST endpoint: /post`);
+
+      console.log(`📡 POST endpoint: /binance/post`);
+
+      console.log(`❤️ Health endpoint: /health`);
+
+      console.log(
+        `📊 Current posts today: ${state.postsToday}/${MAX_POSTS_PER_DAY}`,
+      );
+    });
   } catch (error) {
-    console.error("⚠️ Final state save failed:", error.message);
+    console.error("❌ Startup failed:", error);
+
+    process.exit(1);
   }
-
-  await disconnectMongo();
-
-  initialized = false;
-
-  console.log("👋 Binance bot shutdown complete.");
 }
 
-/* =======================================================
-   EXPORT
-======================================================= */
+// ============================================================
+// GRACEFUL SHUTDOWN
+// ============================================================
 
-export {
-  runBinanceBot,
-  safeRunCycle,
-  runCycle,
-  initializeBinanceBot,
-  getBinanceStatus,
-  shutdownBinanceBot,
-  POST_TRIGGER_SECRET,
-};
+async function shutdown(signal) {
+  console.log(`\n🛑 Received ${signal}. Shutting down...`);
+
+  try {
+    server.close();
+
+    if (mongoClient) {
+      await mongoClient.close();
+
+      console.log("🍃 MongoDB connection closed.");
+    }
+  } catch (error) {
+    console.error("⚠️ Shutdown error:", error.message);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+// ============================================================
+// START
+// ============================================================
+
+start();
