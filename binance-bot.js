@@ -972,50 +972,97 @@ The post should nevertheless be highly engaging, confident and easy to understan
 
 TITLE:
 
-Create a title in this general style:
+The title is extremely important.
 
-"$${coin} is extremely bullish — what to expect next?"
+It must make the reader immediately want to open the post.
 
-If the data is bearish or neutral, adapt the title honestly.
+Use this style:
 
-Examples:
+"$${coin} is ${marketData.priceChangePercent}% bullish today — BUY, HOLD or SELL?"
 
-"$COIN is extremely bullish — what to expect next?"
+However, adapt the wording honestly to the market direction.
 
-"$COIN is losing momentum — what happens next?"
+If the 24H change is strongly positive:
 
-"$COIN is at a critical level — BUY, HOLD or SELL?"
+"🚨 $${coin} IS ${marketData.priceChangePercent}% BULLISH TODAY — BUY, HOLD OR SELL?"
+
+If the 24H change is moderately positive:
+
+"📈 $${coin} IS ${marketData.priceChangePercent}% UP TODAY — BUY, HOLD OR SELL?"
+
+If the 24H change is negative:
+
+"🔻 $${coin} IS ${Math.abs(marketData.priceChangePercent)}% DOWN TODAY — BUY, HOLD OR SELL?"
+
+If the market is nearly flat:
+
+"⚠️ $${coin} IS AT A CRITICAL LEVEL — BUY, HOLD OR SELL?"
+
+The title must:
+
+- Mention the exact coin.
+- Mention the real 24H percentage when useful.
+- Ask BUY, HOLD or SELL.
+- Be short.
+- Be easy to understand.
+- Create curiosity without fake hype.
+- Never promise profit.
+- Never use "100%", "guaranteed", "can't lose", or similar claims.
+- Never exaggerate the market data.
+
+Do NOT make the title complicated.
+
+Use simple English that a beginner crypto user can understand immediately.
 
 CONTENT:
 
-Start with a strong hook.
+Start the post with the same idea as the title.
+
+The first 1-2 lines must immediately tell the reader:
+
+1. Which coin we are discussing.
+2. How much it moved today.
+3. The main question: BUY, HOLD or SELL?
+
+Use very simple English.
+
+The English should be easy for a beginner to understand,
+but still sound professional.
+
+Avoid complicated trading words unless they are explained simply.
 
 Explain:
 
-1. What happened during the last 24 hours.
-2. Why the coin is moving.
-3. What the technical indicators show.
-4. What the latest relevant news says.
-5. What could happen next.
-6. Give a clear action view:
+1. What happened in the last 24 hours.
+2. Why the coin may be moving.
+3. What SMA 9 and SMA 21 show.
+4. What RSI shows.
+5. What the latest relevant news says, if reliable news exists.
+6. What could happen next.
+7. What the reader should consider doing:
    BUY, HOLD or SELL.
-7. Give a realistic target.
-8. Give an invalidation level.
-9. End with a question encouraging discussion.
-
-The recommendation must follow the evidence.
-
-IMPORTANT:
-
-Only discuss ${coin}.
-
-Do not mention Bitcoin or another cryptocurrency.
+8. Give a realistic target price.
+9. Give an invalidation price.
+10. End with a simple question that encourages comments.
 
 Use short paragraphs.
 
-Make the post feel like a professional trader's market breakdown.
+Use simple sentences.
 
-Keep it approximately 500-900 characters.
+Make the post feel like:
+"An experienced trader explaining the market to a normal person."
+
+Do not sound like a textbook.
+
+Do not use difficult English.
+
+Do not use unnecessary technical jargon.
+
+Do not use fake urgency.
+
+Do not promise profit.
+
+Keep approximately 500-900 characters.
 
 Use 3-5 relevant hashtags.
 
