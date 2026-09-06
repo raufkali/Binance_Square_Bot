@@ -47,7 +47,7 @@ jobs:
             --show-error \
             --output response.json \
             --write-out "%{http_code}" \
-            "https://binance-square-bot-loi6.onrender.com/post")
+            "https://binance-square-bot-ucyv.onrender.com/post")   # <-- NEW URL
 
           echo ""
           echo "📡 HTTP Status: $HTTP_CODE"
