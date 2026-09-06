@@ -1,23 +1,31 @@
 // ============================================================
-// BINANCE SQUARE AI BOT V11.1.0
+// BINANCE SQUARE AI BOT V11.2.0
 //
-// FIXES / IMPROVEMENTS:
-// - Removed broken Git merge-conflict markers
-// - Fixed undefined prompt variables
+// API RESILIENCE EDITION
+//
+// FIXES:
+// - Binance REST API endpoint fallback
+// - Handles HTTP 418 IP bans
+// - Handles HTTP 429 rate limits
+// - Respects Retry-After
+// - Endpoint-specific cooldowns
+// - Exponential backoff
+// - Handles Binance 403 WAF responses
+// - Handles Binance 5xx responses
+// - Handles network failures
+// - Prevents hammering Binance after 418/429
+// - One HTTP server only in index.js
+// - Bot engine exports public functions
+// - No server.listen() here
+//
+// CONTENT:
 // - Deterministic market-data-driven title
-// - Title format:
-//   "$COIN is X% bullish today — BUY, HOLD or SELL?"
-// - Honest title variations based on real 24h movement
-// - Beginner-friendly A2/simple English
-// - 500-900 character target for content
-// - Content starts with coin + 24h movement + BUY/HOLD/SELL
-// - AI cannot generate inline hashtags
-// - MAX 2 hashtags enforced everywhere
-// - Title stored separately in MongoDB
-// - Strong final hashtag sanitization
+// - Beginner-friendly A2-B1 English
+// - 500-900 character target
+// - Max 2 hashtags
 // - Target/invalidation validation
-// - Safer Groq JSON normalization
-// - Safer Cloudflare image generation
+// - Groq JSON normalization
+// - Cloudflare image generation
 // - Daily post limit
 // - MongoDB history/state
 // ============================================================
@@ -29,7 +37,6 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { MongoClient } from "mongodb";
-import http from "http";
 
 dotenv.config();
 
@@ -38,6 +45,7 @@ dotenv.config();
 // ============================================================
 
 const __filename = fileURLToPath(import.meta.url);
+
 const __dirname = path.dirname(__filename);
 
 const GENERATED_IMAGES_DIR = path.join(__dirname, "generated-images");
@@ -61,22 +69,29 @@ const SQUARE_IMAGE_SCRIPT = path.join(
 
 const {
   GROQ_API_KEY,
+
   GROQ_MODEL = "openai/gpt-oss-120b",
 
   BINANCE_SQUARE_OPENAPI_KEY,
+
   POST_TRIGGER_SECRET,
 
   MONGODB_URI,
+
   MONGODB_DB_NAME = "binance-square-bot",
 
   CLOUDFLARE_ACCOUNT_ID,
+
   CLOUDFLARE_API_TOKEN,
+
   CLOUDFLARE_IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell",
 
   MAX_POSTS_PER_DAY = "8",
+
   MAX_HISTORY = "100",
 
   REQUEST_TIMEOUT_MS = "30000",
+
   GENERATION_MAX_TOKENS = "1200",
 
   DRY_RUN = "false",
@@ -84,19 +99,43 @@ const {
   BOT_TIMEZONE = "Asia/Karachi",
 
   MIN_24H_VOLUME_USDT = "1000000",
+
   MAX_SCAN_COINS = "30",
 
   NEWS_ITEMS = "5",
+
+  // Binance resilience settings
+
+  BINANCE_MAX_ENDPOINT_ATTEMPTS = "6",
+
+  BINANCE_MAX_RETRIES_PER_ENDPOINT = "2",
+
+  BINANCE_BASE_BACKOFF_MS = "1500",
+
+  BINANCE_MAX_BACKOFF_MS = "30000",
+
+  BINANCE_DEFAULT_429_COOLDOWN_MS = "60000",
+
+  BINANCE_DEFAULT_418_COOLDOWN_MS = "300000",
+
+  BINANCE_DEFAULT_403_COOLDOWN_MS = "120000",
+
+  BINANCE_DEFAULT_5XX_COOLDOWN_MS = "10000",
+
+  BINANCE_ENDPOINT_TIMEOUT_MS = "20000",
 } = process.env;
 
 // ============================================================
-// VALIDATE ENVIRONMENT
+// REQUIRED ENV
 // ============================================================
 
 const REQUIRED_ENV = [
   ["GROQ_API_KEY", GROQ_API_KEY],
+
   ["BINANCE_SQUARE_OPENAPI_KEY", BINANCE_SQUARE_OPENAPI_KEY],
+
   ["POST_TRIGGER_SECRET", POST_TRIGGER_SECRET],
+
   ["MONGODB_URI", MONGODB_URI],
 ];
 
@@ -115,38 +154,96 @@ const groq = new Groq({
 });
 
 let mongoClient = null;
+
 let db = null;
 
 // ============================================================
 // CONSTANTS
 // ============================================================
 
-const BINANCE_API = "https://api.binance.com";
+/*
+ * Binance officially documents these Spot REST API
+ * base endpoints.
+ *
+ * api1-api4 may have better performance but less stability.
+ */
+const BINANCE_API_ENDPOINTS = [
+  "https://api.binance.com",
+
+  "https://api-gcp.binance.com",
+
+  "https://api1.binance.com",
+
+  "https://api2.binance.com",
+
+  "https://api3.binance.com",
+
+  "https://api4.binance.com",
+];
 
 // Technical indicators
+
 const SMA_SHORT = 9;
+
 const SMA_LONG = 21;
+
 const SMA_MEDIUM = 50;
+
 const RSI_PERIOD = 14;
 
 // Binance Square safety
-// IMPORTANT: keep this at 2.
+
 const MAX_HASHTAGS = 2;
 
 // Content target
+
 const MIN_CONTENT_CHARS = 500;
+
 const MAX_CONTENT_CHARS = 900;
 
 // ============================================================
-// STATE
+// BINANCE API RUNTIME STATE
+// ============================================================
+
+const binanceEndpointState = new Map();
+
+for (const endpoint of BINANCE_API_ENDPOINTS) {
+  binanceEndpointState.set(endpoint, {
+    cooldownUntil: 0,
+
+    failures: 0,
+
+    lastStatus: null,
+
+    lastError: null,
+
+    lastUsedAt: null,
+
+    totalRequests: 0,
+  });
+}
+
+let preferredBinanceEndpointIndex = 0;
+
+// Global cooldown is only used when Binance is
+// clearly rate limiting the Render IP.
+let binanceGlobalCooldownUntil = 0;
+
+// ============================================================
+// BOT STATE
 // ============================================================
 
 let state = {
   postsToday: 0,
+
   lastPostDate: null,
+
   lastCoin: null,
+
   lastPostAt: null,
+
   totalPosts: 0,
+
   totalFailures: 0,
 };
 
@@ -227,7 +324,7 @@ function formatPrice(price) {
 }
 
 // ============================================================
-// HTTP FETCH WITH TIMEOUT
+// GENERIC HTTP FETCH
 // ============================================================
 
 async function fetchWithTimeout(
@@ -242,15 +339,544 @@ async function fetchWithTimeout(
   }, timeout);
 
   try {
-    const response = await fetch(url, {
+    return await fetch(url, {
       ...options,
+
       signal: controller.signal,
     });
-
-    return response;
   } finally {
     clearTimeout(timer);
   }
+}
+
+// ============================================================
+// BINANCE RETRY HELPERS
+// ============================================================
+
+function parseRetryAfterMs(response, fallbackMs) {
+  const retryAfter = response.headers.get("retry-after");
+
+  if (!retryAfter) {
+    return fallbackMs;
+  }
+
+  const numeric = Number(retryAfter);
+
+  if (Number.isFinite(numeric) && numeric >= 0) {
+    // Retry-After is normally seconds.
+    return Math.max(1000, numeric * 1000);
+  }
+
+  const retryDate = Date.parse(retryAfter);
+
+  if (Number.isFinite(retryDate)) {
+    return Math.max(1000, retryDate - Date.now());
+  }
+
+  return fallbackMs;
+}
+
+function calculateBackoffMs(attempt) {
+  const base = Number(BINANCE_BASE_BACKOFF_MS);
+
+  const max = Number(BINANCE_MAX_BACKOFF_MS);
+
+  const exponential = Math.min(max, base * 2 ** attempt);
+
+  // Small jitter prevents synchronized retries.
+  const jitter = Math.floor(Math.random() * Math.max(250, base));
+
+  return Math.min(max, exponential + jitter);
+}
+
+function getEndpointState(endpoint) {
+  return (
+    binanceEndpointState.get(endpoint) || {
+      cooldownUntil: 0,
+
+      failures: 0,
+
+      lastStatus: null,
+
+      lastError: null,
+
+      lastUsedAt: null,
+
+      totalRequests: 0,
+    }
+  );
+}
+
+function setEndpointCooldown(endpoint, cooldownMs, reason) {
+  const info = getEndpointState(endpoint);
+
+  info.cooldownUntil = Date.now() + Math.max(1000, cooldownMs);
+
+  info.lastError = reason;
+
+  binanceEndpointState.set(endpoint, info);
+
+  console.warn(`⏸️ Binance endpoint cooldown: ${endpoint}`);
+
+  console.warn(`   Reason: ${reason}`);
+
+  console.warn(`   Cooldown: ${Math.ceil(cooldownMs / 1000)}s`);
+}
+
+function isEndpointAvailable(endpoint) {
+  const info = getEndpointState(endpoint);
+
+  return Date.now() >= info.cooldownUntil;
+}
+
+function rotatePreferredEndpoint() {
+  preferredBinanceEndpointIndex =
+    (preferredBinanceEndpointIndex + 1) % BINANCE_API_ENDPOINTS.length;
+}
+
+function getOrderedBinanceEndpoints() {
+  const endpoints = [];
+
+  for (let i = 0; i < BINANCE_API_ENDPOINTS.length; i += 1) {
+    const index =
+      (preferredBinanceEndpointIndex + i) % BINANCE_API_ENDPOINTS.length;
+
+    endpoints.push(BINANCE_API_ENDPOINTS[index]);
+  }
+
+  return endpoints;
+}
+
+function getEarliestEndpointCooldown() {
+  let earliest = Infinity;
+
+  for (const endpoint of BINANCE_API_ENDPOINTS) {
+    const info = getEndpointState(endpoint);
+
+    if (info.cooldownUntil < earliest) {
+      earliest = info.cooldownUntil;
+    }
+  }
+
+  return earliest;
+}
+
+// ============================================================
+// BINANCE API ERROR
+// ============================================================
+
+class BinanceApiError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+
+    this.name = "BinanceApiError";
+
+    Object.assign(this, details);
+  }
+}
+
+// ============================================================
+// BINANCE REQUEST
+// ============================================================
+
+async function requestBinance(apiPath, options = {}) {
+  const endpoints = getOrderedBinanceEndpoints();
+
+  const maxAttempts = Math.min(
+    Number(BINANCE_MAX_ENDPOINT_ATTEMPTS) || endpoints.length,
+
+    endpoints.length,
+  );
+
+  const maxRetriesPerEndpoint = Math.max(
+    0,
+    Number(BINANCE_MAX_RETRIES_PER_ENDPOINT) || 0,
+  );
+
+  // ----------------------------------------------------------
+  // GLOBAL COOLDOWN
+  // ----------------------------------------------------------
+
+  if (Date.now() < binanceGlobalCooldownUntil) {
+    const remaining = binanceGlobalCooldownUntil - Date.now();
+
+    console.warn(
+      `⏸️ Binance global cooldown active: ${Math.ceil(
+        remaining / 1000,
+      )}s remaining.`,
+    );
+
+    throw new BinanceApiError(
+      `Binance API is rate limited. Global cooldown active for approximately ${Math.ceil(
+        remaining / 1000,
+      )} seconds.`,
+      {
+        status: 429,
+
+        globalCooldown: true,
+
+        retryAfterMs: remaining,
+
+        path: apiPath,
+      },
+    );
+  }
+
+  let lastError = null;
+
+  let attempted = 0;
+
+  for (const endpoint of endpoints) {
+    if (attempted >= maxAttempts) {
+      break;
+    }
+
+    if (!isEndpointAvailable(endpoint)) {
+      const info = getEndpointState(endpoint);
+
+      console.log(
+        `⏭️ Skipping cooled Binance endpoint: ${endpoint} (${Math.ceil(
+          Math.max(0, info.cooldownUntil - Date.now()) / 1000,
+        )}s)`,
+      );
+
+      continue;
+    }
+
+    attempted += 1;
+
+    const url = `${endpoint}${apiPath}`;
+
+    let retries = 0;
+
+    while (retries <= maxRetriesPerEndpoint) {
+      const info = getEndpointState(endpoint);
+
+      info.totalRequests += 1;
+
+      info.lastUsedAt = new Date().toISOString();
+
+      binanceEndpointState.set(endpoint, info);
+
+      try {
+        console.log(`🌐 Binance request: ${url}`);
+
+        const response = await fetchWithTimeout(
+          url,
+          {
+            ...options,
+
+            headers: {
+              Accept: "application/json",
+
+              "User-Agent": "BinanceSquareAIBot/11.2",
+
+              ...(options.headers || {}),
+            },
+          },
+          Number(BINANCE_ENDPOINT_TIMEOUT_MS),
+        );
+
+        // ------------------------------------------------------
+        // SUCCESS
+        // ------------------------------------------------------
+
+        if (response.ok) {
+          const data = await response.json();
+
+          info.failures = 0;
+
+          info.lastStatus = response.status;
+
+          info.lastError = null;
+
+          binanceEndpointState.set(endpoint, info);
+
+          // Keep this endpoint preferred if it worked.
+          const endpointIndex = BINANCE_API_ENDPOINTS.indexOf(endpoint);
+
+          if (endpointIndex >= 0) {
+            preferredBinanceEndpointIndex = endpointIndex;
+          }
+
+          console.log(`✅ Binance API success: ${endpoint}`);
+
+          return data;
+        }
+
+        const status = response.status;
+
+        info.lastStatus = status;
+
+        let responseText = "";
+
+        try {
+          responseText = await response.text();
+        } catch {
+          responseText = "";
+        }
+
+        // ------------------------------------------------------
+        // 418 - IP AUTO BAN
+        // ------------------------------------------------------
+
+        if (status === 418) {
+          const cooldownMs = parseRetryAfterMs(
+            response,
+            Number(BINANCE_DEFAULT_418_COOLDOWN_MS),
+          );
+
+          info.failures += 1;
+
+          info.lastError = responseText || "HTTP 418 IP auto-ban";
+
+          binanceEndpointState.set(endpoint, info);
+
+          setEndpointCooldown(
+            endpoint,
+            cooldownMs,
+            `HTTP 418 - Binance IP auto-ban. ${
+              responseText || "No response body."
+            }`,
+          );
+
+          // Do NOT retry the same endpoint.
+          // Move immediately to the next endpoint.
+          rotatePreferredEndpoint();
+
+          lastError = new BinanceApiError(
+            `Binance returned HTTP 418 for ${endpoint}.`,
+            {
+              status,
+
+              endpoint,
+
+              responseText,
+
+              retryAfterMs: cooldownMs,
+            },
+          );
+
+          break;
+        }
+
+        // ------------------------------------------------------
+        // 429 - RATE LIMIT
+        // ------------------------------------------------------
+
+        if (status === 429) {
+          const cooldownMs = parseRetryAfterMs(
+            response,
+            Number(BINANCE_DEFAULT_429_COOLDOWN_MS),
+          );
+
+          info.failures += 1;
+
+          info.lastError = responseText || "HTTP 429 rate limit";
+
+          binanceEndpointState.set(endpoint, info);
+
+          setEndpointCooldown(
+            endpoint,
+            cooldownMs,
+            `HTTP 429 - Binance rate limit. ${
+              responseText || "No response body."
+            }`,
+          );
+
+          // Move to another endpoint rather than hammering
+          // the rate-limited endpoint.
+          rotatePreferredEndpoint();
+
+          lastError = new BinanceApiError(
+            `Binance rate limited endpoint ${endpoint}.`,
+            {
+              status,
+
+              endpoint,
+
+              responseText,
+
+              retryAfterMs: cooldownMs,
+            },
+          );
+
+          break;
+        }
+
+        // ------------------------------------------------------
+        // 403 - WAF
+        // ------------------------------------------------------
+
+        if (status === 403) {
+          const cooldownMs = Number(BINANCE_DEFAULT_403_COOLDOWN_MS);
+
+          info.failures += 1;
+
+          info.lastError = responseText || "HTTP 403 WAF rejection";
+
+          binanceEndpointState.set(endpoint, info);
+
+          setEndpointCooldown(
+            endpoint,
+            cooldownMs,
+            `HTTP 403 - Binance WAF rejection. ${
+              responseText || "No response body."
+            }`,
+          );
+
+          rotatePreferredEndpoint();
+
+          lastError = new BinanceApiError(
+            `Binance rejected ${endpoint} with HTTP 403.`,
+            {
+              status,
+
+              endpoint,
+
+              responseText,
+
+              retryAfterMs: cooldownMs,
+            },
+          );
+
+          break;
+        }
+
+        // ------------------------------------------------------
+        // 5XX - SERVER ERROR
+        // ------------------------------------------------------
+
+        if (status >= 500 && status <= 599) {
+          info.failures += 1;
+
+          info.lastError = responseText || `HTTP ${status}`;
+
+          binanceEndpointState.set(endpoint, info);
+
+          if (retries < maxRetriesPerEndpoint) {
+            const backoff = calculateBackoffMs(retries);
+
+            console.warn(
+              `⚠️ Binance ${status} on ${endpoint}. Retrying in ${Math.ceil(
+                backoff / 1000,
+              )}s...`,
+            );
+
+            await sleep(backoff);
+
+            retries += 1;
+
+            continue;
+          }
+
+          setEndpointCooldown(
+            endpoint,
+            Number(BINANCE_DEFAULT_5XX_COOLDOWN_MS),
+            `HTTP ${status}`,
+          );
+
+          rotatePreferredEndpoint();
+
+          lastError = new BinanceApiError(`Binance server error ${status}.`, {
+            status,
+
+            endpoint,
+
+            responseText,
+          });
+
+          break;
+        }
+
+        // ------------------------------------------------------
+        // OTHER 4XX
+        // ------------------------------------------------------
+
+        info.failures += 1;
+
+        info.lastError = responseText || `HTTP ${status}`;
+
+        binanceEndpointState.set(endpoint, info);
+
+        lastError = new BinanceApiError(`Binance API failed: HTTP ${status}`, {
+          status,
+
+          endpoint,
+
+          responseText,
+        });
+
+        // Don't hammer a malformed/request error.
+        break;
+      } catch (error) {
+        info.failures += 1;
+
+        info.lastError = error?.message || String(error);
+
+        binanceEndpointState.set(endpoint, info);
+
+        lastError = error;
+
+        console.warn(
+          `⚠️ Binance network error on ${endpoint}: ${error?.message || error}`,
+        );
+
+        if (retries < maxRetriesPerEndpoint) {
+          const backoff = calculateBackoffMs(retries);
+
+          console.log(
+            `🔁 Retrying Binance endpoint in ${Math.ceil(backoff / 1000)}s...`,
+          );
+
+          await sleep(backoff);
+
+          retries += 1;
+
+          continue;
+        }
+
+        // Move to another endpoint.
+        rotatePreferredEndpoint();
+
+        break;
+      }
+    }
+  }
+
+  // ----------------------------------------------------------
+  // ALL ENDPOINTS FAILED
+  // ----------------------------------------------------------
+
+  const earliest = getEarliestEndpointCooldown();
+
+  let retryAfterMs = Number(BINANCE_DEFAULT_429_COOLDOWN_MS);
+
+  if (Number.isFinite(earliest) && earliest > Date.now()) {
+    retryAfterMs = Math.max(retryAfterMs, earliest - Date.now());
+  }
+
+  // If every endpoint was rate-limited/banned, create a
+  // global cooldown so the next bot call doesn't immediately
+  // hammer Binance again.
+  binanceGlobalCooldownUntil = Math.max(
+    binanceGlobalCooldownUntil,
+    Date.now() +
+      Math.min(retryAfterMs, Number(BINANCE_DEFAULT_418_COOLDOWN_MS)),
+  );
+
+  throw new BinanceApiError(
+    `Binance API unavailable after trying ${attempted} endpoint(s). Last error: ${
+      lastError?.message || String(lastError)
+    }`,
+    {
+      attemptedEndpoints: attempted,
+
+      retryAfterMs,
+
+      cause: lastError,
+    },
+  );
 }
 
 // ============================================================
@@ -277,6 +903,7 @@ async function loadState() {
 
   if (state.lastPostDate !== today) {
     state.postsToday = 0;
+
     state.lastPostDate = today;
 
     await saveState();
@@ -318,15 +945,17 @@ async function connectMongo() {
 }
 
 async function saveHistory(record) {
-  if (!db) return;
+  if (!db) {
+    return;
+  }
 
   try {
     await db.collection("post_history").insertOne({
       ...record,
+
       createdAt: new Date(),
     });
 
-    // Keep recent history only.
     const maxHistory = Number(MAX_HISTORY);
 
     const count = await db.collection("post_history").countDocuments();
@@ -372,7 +1001,9 @@ async function saveNews(coin, news) {
       {
         $set: {
           coin,
+
           news,
+
           updatedAt: new Date(),
         },
       },
@@ -390,33 +1021,19 @@ async function saveNews(coin, news) {
 // ============================================================
 
 async function fetch24hTickers() {
-  const url = `${BINANCE_API}/api/v3/ticker/24hr`;
-
-  const response = await fetchWithTimeout(url);
-
-  if (!response.ok) {
-    throw new Error(`Binance ticker API failed: ${response.status}`);
-  }
-
-  return response.json();
+  return requestBinance("/api/v3/ticker/24hr");
 }
 
 async function fetchKlines(symbol) {
-  const url =
-    `${BINANCE_API}/api/v3/klines` +
-    `?symbol=${encodeURIComponent(symbol)}` +
-    `&interval=1h` +
-    `&limit=100`;
+  const query = new URLSearchParams({
+    symbol,
 
-  const response = await fetchWithTimeout(url);
+    interval: "1h",
 
-  if (!response.ok) {
-    throw new Error(
-      `Binance klines API failed for ${symbol}: ${response.status}`,
-    );
-  }
+    limit: "100",
+  });
 
-  return response.json();
+  return requestBinance(`/api/v3/klines?${query.toString()}`);
 }
 
 // ============================================================
@@ -427,6 +1044,10 @@ async function selectStrongestCoin() {
   console.log("🔎 Scanning Binance USDT markets...");
 
   const tickers = await fetch24hTickers();
+
+  if (!Array.isArray(tickers)) {
+    throw new Error("Binance ticker API returned unexpected data.");
+  }
 
   const minVolume = Number(MIN_24H_VOLUME_USDT);
 
@@ -463,16 +1084,20 @@ async function selectStrongestCoin() {
   const coin = selected.symbol.replace(/USDT$/i, "");
 
   console.log(
-    `🏆 Selected ${coin} | ` +
-      `24h: ${formatPercent(selected.priceChangePercent)}% | ` +
-      `Volume: $${Number(selected.quoteVolume).toLocaleString()}`,
+    `🏆 Selected ${coin} | 24h: ${formatPercent(
+      selected.priceChangePercent,
+    )}% | Volume: $${Number(selected.quoteVolume).toLocaleString()}`,
   );
 
   return {
     symbol: selected.symbol,
+
     coin,
+
     price: safeNumber(selected.lastPrice),
+
     priceChange24h: safeNumber(selected.priceChangePercent),
+
     volume24h: safeNumber(selected.quoteVolume),
   };
 }
@@ -499,6 +1124,7 @@ function calculateRSI(values, period = RSI_PERIOD) {
   }
 
   let gains = 0;
+
   let losses = 0;
 
   for (let i = 1; i <= period; i++) {
@@ -564,19 +1190,23 @@ async function calculateIndicators(symbol) {
   }
 
   console.log(
-    `SMA9=${round(sma9, 6)} | ` +
-      `SMA21=${round(sma21, 6)} | ` +
-      `SMA50=${round(sma50, 6)} | ` +
-      `RSI=${round(rsi, 2)} | ` +
-      `Trend=${trend}`,
+    `SMA9=${round(sma9, 6)} | SMA21=${round(sma21, 6)} | SMA50=${round(
+      sma50,
+      6,
+    )} | RSI=${round(rsi, 2)} | Trend=${trend}`,
   );
 
   return {
     currentPrice,
+
     sma9,
+
     sma21,
+
     sma50,
+
     rsi,
+
     trend,
   };
 }
@@ -632,7 +1262,9 @@ async function fetchCoinNews(coin) {
 
         return {
           title: stripHtml(title),
+
           link: link.trim(),
+
           pubDate: pubDate.trim(),
         };
       })
@@ -698,12 +1330,7 @@ function removeInlineHashtags(content) {
 }
 
 // ============================================================
-// TITLE GENERATOR
-//
-// IMPORTANT:
-// The title is generated locally from REAL market data.
-// This prevents Groq from changing the percentage,
-// coin name, or BUY/HOLD/SELL wording.
+// TITLE
 // ============================================================
 
 function generateTitle(market) {
@@ -713,29 +1340,23 @@ function generateTitle(market) {
 
   const percentage = formatPercent(change);
 
-  // Strong positive move
   if (change >= 10) {
     return `🚨 $${coin} IS ${percentage}% BULLISH TODAY — BUY, HOLD OR SELL?`;
   }
 
-  // Moderate positive move
   if (change > 1) {
     return `📈 $${coin} IS ${percentage}% UP TODAY — BUY, HOLD OR SELL?`;
   }
 
-  // Nearly flat
   if (change >= -1 && change <= 1) {
     return `⚠️ $${coin} IS AT A CRITICAL LEVEL — BUY, HOLD OR SELL?`;
   }
 
-  // Negative move
   return `🔻 $${coin} IS ${percentage}% DOWN TODAY — BUY, HOLD OR SELL?`;
 }
 
 // ============================================================
-// CONTENT OPENING GENERATOR
-//
-// Gives Groq a guaranteed structure for the first lines.
+// CONTENT OPENING
 // ============================================================
 
 function generateOpening(market) {
@@ -757,7 +1378,7 @@ function generateOpening(market) {
 }
 
 // ============================================================
-// FINAL CONTENT BUILDER
+// FINAL CONTENT
 // ============================================================
 
 function buildFinalContent(title, content, hashtags, coin) {
@@ -777,7 +1398,7 @@ function buildFinalContent(title, content, hashtags, coin) {
 }
 
 // ============================================================
-// GROQ POST GENERATION
+// GROQ
 // ============================================================
 
 async function generatePost({ market, indicators, news }) {
@@ -1038,11 +1659,14 @@ IMPORTANT:
     messages: [
       {
         role: "system",
+
         content:
           "You are a professional crypto market analyst. Return only valid JSON. Use simple beginner-friendly English.",
       },
+
       {
         role: "user",
+
         content: prompt,
       },
     ],
@@ -1086,7 +1710,6 @@ function normalizePost(post, market, title) {
 
   let content = String(post.content || "").trim();
 
-  // Remove accidental title duplication.
   if (content.toLowerCase().startsWith(title.toLowerCase())) {
     content = content.slice(title.length).trim();
   }
@@ -1098,10 +1721,6 @@ function normalizePost(post, market, title) {
   let targetPrice = safeNumber(post.targetPrice);
 
   let invalidationPrice = safeNumber(post.invalidationPrice);
-
-  // ----------------------------------------------------------
-  // Safety fallback for invalid AI prices
-  // ----------------------------------------------------------
 
   const currentPrice = safeNumber(market.price);
 
@@ -1328,26 +1947,12 @@ function publishToBinanceSquare(content, imagePath, coin) {
   return new Promise((resolve, reject) => {
     console.log("📡 Publishing to Binance Square...");
 
-    // ------------------------------------------------------
-    // FINAL DEFENSIVE HASHTAG CLEANUP
-    // ------------------------------------------------------
-
     const cleanContent = removeInlineHashtags(content);
-
-    // ------------------------------------------------------
-    // Remove ALL hashtags from content
-    // ------------------------------------------------------
 
     const contentWithoutHashtags = cleanContent
       .replace(/(^|\s)#[A-Za-z0-9_]+/g, "$1")
       .replace(/[ \t]{2,}/g, " ")
       .trim();
-
-    // ------------------------------------------------------
-    // ALWAYS use controlled hashtags.
-    //
-    // We don't trust AI hashtags at publication time.
-    // ------------------------------------------------------
 
     const safeHashtags = sanitizeHashtags(
       [`#${coin}`, "#CryptoAnalysis"],
@@ -1390,6 +1995,7 @@ function publishToBinanceSquare(content, imagePath, coin) {
     });
 
     let stdout = "";
+
     let stderr = "";
 
     child.stdout.on("data", (data) => {
@@ -1416,9 +2022,13 @@ function publishToBinanceSquare(content, imagePath, coin) {
       if (code === 0) {
         resolve({
           success: true,
+
           stdout,
+
           stderr,
+
           finalContent,
+
           hashtags: safeHashtags,
         });
       } else {
@@ -1442,6 +2052,7 @@ function canPostToday() {
 
   if (state.lastPostDate !== today) {
     state.postsToday = 0;
+
     state.lastPostDate = today;
   }
 
@@ -1466,49 +2077,37 @@ async function runCycle() {
 
     return {
       success: false,
+
       skipped: true,
+
       reason: "daily_limit",
     };
   }
 
   let market = null;
+
   let indicators = null;
+
   let news = [];
+
   let post = null;
+
   let imagePath = null;
 
   try {
-    // --------------------------------------------------------
-    // 1. SELECT COIN
-    // --------------------------------------------------------
-
     market = await selectStrongestCoin();
-
-    // --------------------------------------------------------
-    // 2. TECHNICAL ANALYSIS
-    // --------------------------------------------------------
 
     indicators = await calculateIndicators(market.symbol);
 
-    // --------------------------------------------------------
-    // 3. NEWS
-    // --------------------------------------------------------
-
     news = await fetchCoinNews(market.coin);
-
-    // --------------------------------------------------------
-    // 4. AI POST
-    // --------------------------------------------------------
 
     post = await generatePost({
       market,
+
       indicators,
+
       news,
     });
-
-    // --------------------------------------------------------
-    // 5. VALIDATION
-    // --------------------------------------------------------
 
     const validation = validatePost(post);
 
@@ -1521,10 +2120,6 @@ async function runCycle() {
     } else {
       console.log("✅ Content validation passed.");
     }
-
-    // --------------------------------------------------------
-    // 6. BUILD FINAL CONTENT
-    // --------------------------------------------------------
 
     const finalContent = buildFinalContent(
       post.title,
@@ -1559,19 +2154,13 @@ async function runCycle() {
 
     console.log(`Content chars: ${post.content.length}`);
 
-    // --------------------------------------------------------
-    // 7. IMAGE
-    // --------------------------------------------------------
-
     imagePath = await generateTradingGraphic({
       market,
+
       indicators,
+
       post,
     });
-
-    // --------------------------------------------------------
-    // 8. DRY RUN
-    // --------------------------------------------------------
 
     if (String(DRY_RUN).toLowerCase() === "true") {
       console.log("\n🧪 DRY_RUN enabled.");
@@ -1610,25 +2199,22 @@ async function runCycle() {
 
       return {
         success: true,
+
         dryRun: true,
+
         coin: market.coin,
+
         title: post.title,
       };
     }
 
-    // --------------------------------------------------------
-    // 9. PUBLISH
-    // --------------------------------------------------------
-
     const publication = await publishToBinanceSquare(
       finalContent,
+
       imagePath,
+
       market.coin,
     );
-
-    // --------------------------------------------------------
-    // 10. UPDATE STATE
-    // --------------------------------------------------------
 
     state.postsToday += 1;
 
@@ -1641,10 +2227,6 @@ async function runCycle() {
     state.lastPostDate = getDateKey();
 
     await saveState();
-
-    // --------------------------------------------------------
-    // 11. SAVE HISTORY
-    // --------------------------------------------------------
 
     await saveHistory({
       success: true,
@@ -1728,265 +2310,155 @@ async function runCycle() {
       success: false,
 
       error: error.message,
+
+      retryAfterMs: error?.retryAfterMs || null,
     };
   }
 }
 
 // ============================================================
-// HTTP SERVER
+// BOT INITIALIZATION
 // ============================================================
 
-const PORT = Number(process.env.PORT) || 3000;
+let botInitialized = false;
 
-const server = http.createServer(async (req, res) => {
-  // ------------------------------------------------------
-  // CORS
-  // ------------------------------------------------------
+let botInitializing = null;
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, Authorization, X-Post-Secret",
-  );
-
-  // ------------------------------------------------------
-  // OPTIONS
-  // ------------------------------------------------------
-
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-
-    res.end();
-
+async function initializeBinanceBot() {
+  if (botInitialized) {
     return;
   }
 
-  // ------------------------------------------------------
-  // GET /
-  // ------------------------------------------------------
-
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-    });
-
-    res.end(
-      JSON.stringify({
-        success: true,
-
-        service: "Binance Square AI Bot",
-
-        version: "11.1.0",
-
-        status: "online",
-
-        postsToday: state.postsToday,
-
-        maxPostsPerDay: Number(MAX_POSTS_PER_DAY),
-
-        totalPosts: state.totalPosts,
-
-        totalFailures: state.totalFailures,
-
-        hashtagLimit: MAX_HASHTAGS,
-
-        timezone: BOT_TIMEZONE,
-
-        contentTarget: `${MIN_CONTENT_CHARS}-${MAX_CONTENT_CHARS} characters`,
-      }),
-    );
-
-    return;
+  if (botInitializing) {
+    return botInitializing;
   }
 
-  // ------------------------------------------------------
-  // GET /health
-  // ------------------------------------------------------
+  botInitializing = (async () => {
+    console.log("⚙️ Initializing Binance bot...");
 
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
-    });
-
-    res.end(
-      JSON.stringify({
-        success: true,
-        status: "healthy",
-        timestamp: new Date().toISOString(),
-      }),
-    );
-
-    return;
-  }
-
-  // ------------------------------------------------------
-  // POST /post
-  // POST /binance/post
-  // ------------------------------------------------------
-
-  if (
-    req.method === "POST" &&
-    (req.url === "/post" || req.url === "/binance/post")
-  ) {
-    let body = "";
-
-    req.on("data", (chunk) => {
-      body += chunk.toString();
-    });
-
-    req.on("end", async () => {
-      try {
-        let parsed = {};
-
-        if (body.trim()) {
-          try {
-            parsed = JSON.parse(body);
-          } catch {
-            parsed = {};
-          }
-        }
-
-        const providedSecret =
-          req.headers["x-post-secret"] ||
-          req.headers["authorization"]?.replace(/^Bearer\s+/i, "") ||
-          parsed.secret;
-
-        if (providedSecret !== POST_TRIGGER_SECRET) {
-          res.writeHead(401, {
-            "Content-Type": "application/json",
-          });
-
-          res.end(
-            JSON.stringify({
-              success: false,
-
-              error: "Unauthorized",
-            }),
-          );
-
-          return;
-        }
-
-        const result = await runCycle();
-
-        res.writeHead(result.success ? 200 : 500, {
-          "Content-Type": "application/json",
-        });
-
-        res.end(JSON.stringify(result, null, 2));
-      } catch (error) {
-        res.writeHead(500, {
-          "Content-Type": "application/json",
-        });
-
-        res.end(
-          JSON.stringify({
-            success: false,
-
-            error: error.message,
-          }),
-        );
-      }
-    });
-
-    return;
-  }
-
-  // ------------------------------------------------------
-  // 404
-  // ------------------------------------------------------
-
-  res.writeHead(404, {
-    "Content-Type": "application/json",
-  });
-
-  res.end(
-    JSON.stringify({
-      success: false,
-      error: "Not found",
-    }),
-  );
-});
-
-// ============================================================
-// STARTUP
-// ============================================================
-
-async function start() {
-  console.log("\n============================================================");
-
-  console.log("🤖 BINANCE SQUARE AI BOT V11.1.0");
-
-  console.log("============================================================");
-
-  console.log(`🌎 Timezone: ${BOT_TIMEZONE}`);
-
-  console.log(`🏷️ Max hashtags: ${MAX_HASHTAGS}`);
-
-  console.log(
-    `📝 Content target: ${MIN_CONTENT_CHARS}-${MAX_CONTENT_CHARS} chars`,
-  );
-
-  console.log(`🤖 Groq model: ${GROQ_MODEL}`);
-
-  console.log(`🎨 Cloudflare model: ${CLOUDFLARE_IMAGE_MODEL}`);
-
-  try {
     await loadState();
 
     await connectMongo();
 
-    server.listen(PORT, () => {
-      console.log(`🌐 Server running on port ${PORT}`);
+    botInitialized = true;
 
-      console.log(`📡 POST endpoint: /post`);
+    console.log("✅ Binance bot initialized.");
+  })();
 
-      console.log(`📡 POST endpoint: /binance/post`);
-
-      console.log(`❤️ Health endpoint: /health`);
-
-      console.log(
-        `📊 Current posts today: ${state.postsToday}/${MAX_POSTS_PER_DAY}`,
-      );
-    });
-  } catch (error) {
-    console.error("❌ Startup failed:", error);
-
-    process.exit(1);
+  try {
+    await botInitializing;
+  } finally {
+    botInitializing = null;
   }
 }
 
 // ============================================================
-// GRACEFUL SHUTDOWN
+// PUBLIC BOT RUNNER
 // ============================================================
 
-async function shutdown(signal) {
-  console.log(`\n🛑 Received ${signal}. Shutting down...`);
+async function runBinanceBot() {
+  await initializeBinanceBot();
+
+  return await runCycle();
+}
+
+// ============================================================
+// PUBLIC STATUS
+// ============================================================
+
+function getBinanceStatus() {
+  const endpointStatus = BINANCE_API_ENDPOINTS.map((endpoint) => {
+    const info = getEndpointState(endpoint);
+
+    return {
+      endpoint,
+
+      available: Date.now() >= info.cooldownUntil,
+
+      cooldownUntil: info.cooldownUntil
+        ? new Date(info.cooldownUntil).toISOString()
+        : null,
+
+      lastStatus: info.lastStatus,
+
+      failures: info.failures,
+
+      totalRequests: info.totalRequests,
+
+      lastUsedAt: info.lastUsedAt,
+    };
+  });
+
+  return {
+    version: "11.2.0",
+
+    initialized: botInitialized,
+
+    postsToday: state.postsToday,
+
+    maxPostsPerDay: Number(MAX_POSTS_PER_DAY),
+
+    totalPosts: state.totalPosts,
+
+    totalFailures: state.totalFailures,
+
+    lastCoin: state.lastCoin,
+
+    lastPostAt: state.lastPostAt,
+
+    lastPostDate: state.lastPostDate,
+
+    timezone: BOT_TIMEZONE,
+
+    hashtagLimit: MAX_HASHTAGS,
+
+    contentTarget: `${MIN_CONTENT_CHARS}-${MAX_CONTENT_CHARS}`,
+
+    mongoConnected: Boolean(db),
+
+    dryRun: String(DRY_RUN).toLowerCase() === "true",
+
+    binance: {
+      preferredEndpoint: BINANCE_API_ENDPOINTS[preferredBinanceEndpointIndex],
+
+      globalCooldownUntil:
+        binanceGlobalCooldownUntil > Date.now()
+          ? new Date(binanceGlobalCooldownUntil).toISOString()
+          : null,
+
+      endpoints: endpointStatus,
+    },
+  };
+}
+
+// ============================================================
+// PUBLIC SHUTDOWN
+// ============================================================
+
+async function shutdownBinanceBot() {
+  console.log("🛑 Shutting down Binance bot...");
 
   try {
-    server.close();
-
     if (mongoClient) {
       await mongoClient.close();
+
+      mongoClient = null;
+
+      db = null;
 
       console.log("🍃 MongoDB connection closed.");
     }
   } catch (error) {
-    console.error("⚠️ Shutdown error:", error.message);
+    console.error("⚠️ MongoDB shutdown error:", error?.message || error);
   }
 
-  process.exit(0);
+  botInitialized = false;
+
+  console.log("✅ Binance bot shutdown complete.");
 }
 
-process.on("SIGINT", () => shutdown("SIGINT"));
-
-process.on("SIGTERM", () => shutdown("SIGTERM"));
-
 // ============================================================
-// START
+// EXPORTS
 // ============================================================
 
-start();
+export { runBinanceBot, getBinanceStatus, shutdownBinanceBot };
